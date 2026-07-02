@@ -55,6 +55,11 @@ CUTOFF_MARKERS = [
     "Las respuestas de la IA pueden contener errores",
     "Les réponses de l'IA peuvent contenir des erreurs",
     "Le risposte dell'IA possono contenere errori",
+    # Google AI Mode post-answer UI noise
+    "Good response", "Bad response",
+    "Share public link", "This public link shares",
+    "Thanks for letting us know", "A copy of this chat",
+    "Make a legal removal request",
 ]
 
 CAPTCHA_INDICATORS = [
