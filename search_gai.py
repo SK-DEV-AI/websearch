@@ -132,27 +132,34 @@ async def _shutdown():
         _pw = None
 
 async def _create_hidden_page(ctx):
-    """Create a page not visible in the tab strip, without stealing focus.
+    """Create a hidden page via CDP Target.createTarget, waiting for Playwright
+    to discover the target before returning the page object.
 
-    Uses CDP Target.createTarget(hidden=True) — the tab never appears
-    in the Helium tab strip. Falls back to ctx.new_page() on failure.
+    Falls back to ctx.new_page() if CDP target creation fails.
     """
     try:
-        cdp = await ctx.new_cdp_session(ctx.pages[0] if ctx.pages else await ctx.new_page())
+        existing = ctx.pages[0] if ctx.pages else None
+        cdp = await ctx.new_cdp_session(existing or await ctx.new_page())
         result = await cdp.send("Target.createTarget",
                                 {"url": "about:blank", "hidden": True, "focus": False})
         target_id = result.get("targetId")
-        for _ in range(20):
-            await asyncio.sleep(0.05)
-            for p in ctx.pages:
-                try:
-                    if p.url == "about:blank":
-                        return p
-                except Exception:
-                    pass
+        await cdp.detach()
+        # Wait for Playwright to discover the hidden target
         if target_id:
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                for p in ctx.pages:
+                    try:
+                        url = p.url
+                        if url == "about:blank":
+                            return p
+                    except Exception:
+                        pass
+            # Target wasn't discovered — clean up
             try:
-                await cdp.send("Target.closeTarget", {"targetId": target_id})
+                cdp2 = await ctx.new_cdp_session(ctx.pages[0])
+                await cdp2.send("Target.closeTarget", {"targetId": target_id})
+                await cdp2.detach()
             except Exception:
                 pass
     except Exception:
@@ -599,7 +606,7 @@ _gaiclient: GoogleAIClient | None = None
 _gai_lock = asyncio.Lock()
 
 async def get_gai_client(cdp_url: str | None = None) -> GoogleAIClient | None:
-    """Get or create the singleton GAI client."""
+    """Get or create the singleton GAI client. No availability check — handled by search()."""
     global _gaiclient
     if _gaiclient is not None:
         return _gaiclient
@@ -609,31 +616,21 @@ async def get_gai_client(cdp_url: str | None = None) -> GoogleAIClient | None:
         url = cdp_url or HELIUM_CDP
         if not url:
             return None
-        c = GoogleAIClient(cdp_url=url)
-        # Quick check: can we connect to CDP and does GAI Mode respond?
+        # Quick liveness check — connect to CDP, create one page, close it
         try:
             b = await _get_browser()
             ctx = b.contexts[0]
             p = await _create_hidden_page(ctx)
             try:
                 await p.add_init_script(ANTI_DETECT_JS)
-                await p.goto(f"{GOOGLE_AI_URL}?q=test&udm=50&hl=en",
-                            wait_until="commit", timeout=15000,
-                            referer="https://www.google.com/")
-                await p.wait_for_load_state("domcontentloaded", timeout=10000)
-                blocked = await c._detect_captcha(p)
-                if blocked is not None:
-                    logger.warning("GAI blocked: %s", blocked)
-                    await p.close()
-                    return None
+                await p.goto("about:blank", timeout=10000)
             finally:
                 await p.close()
                 asyncio.ensure_future(_cleanup_orphan_tabs())
-            _gaiclient = c
+            _gaiclient = GoogleAIClient(cdp_url=url)
             return _gaiclient
         except Exception as e:
-            logger.warning("GAI check failed: %s", e)
-            await c.close()
+            logger.warning("GAI CDP check failed: %s", e)
             return None
 
 async def gai_shutdown():
