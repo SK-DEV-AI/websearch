@@ -451,7 +451,7 @@ class GoogleAIClient:
     # ── CAPTCHA detection ─────────────────────────────────────────
 
     async def _detect_captcha(self, p) -> str | None:
-        """Returns a reason string if CAPTCHA is detected, None otherwise."""
+        """Returns a reason string if CAPTCHA or blocking is detected, None otherwise."""
         try:
             if any(i in p.url.lower() for i in CAPTCHA_INDICATORS):
                 return "CAPTCHA URL"
@@ -460,8 +460,6 @@ class GoogleAIClient:
                 return "AI Mode blocked in this region/language"
             if any(i in body for i in CAPTCHA_INDICATORS):
                 return "CAPTCHA detected"
-            if len(body) < 600 and "search" not in body:
-                return "Suspiciously short page"
         except Exception:
             pass
         return None
