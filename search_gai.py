@@ -132,38 +132,13 @@ async def _shutdown():
         _pw = None
 
 async def _create_hidden_page(ctx):
-    """Create a hidden page via CDP Target.createTarget, waiting for Playwright
-    to discover the target before returning the page object.
+    """Create a page without stealing focus.
 
-    Falls back to ctx.new_page() if CDP target creation fails.
+    Uses ctx.new_page() — same approach as the reference implementation.
+    Pages are closed after use; with hidden-target CDP being unreliable
+    (Playwright doesn't discover hidden CDP targets as Page objects),
+    a normal new page is simpler and always works.
     """
-    try:
-        existing = ctx.pages[0] if ctx.pages else None
-        cdp = await ctx.new_cdp_session(existing or await ctx.new_page())
-        result = await cdp.send("Target.createTarget",
-                                {"url": "about:blank", "hidden": True, "focus": False})
-        target_id = result.get("targetId")
-        await cdp.detach()
-        # Wait for Playwright to discover the hidden target
-        if target_id:
-            for _ in range(50):
-                await asyncio.sleep(0.1)
-                for p in ctx.pages:
-                    try:
-                        url = p.url
-                        if url == "about:blank":
-                            return p
-                    except Exception:
-                        pass
-            # Target wasn't discovered — clean up
-            try:
-                cdp2 = await ctx.new_cdp_session(ctx.pages[0])
-                await cdp2.send("Target.closeTarget", {"targetId": target_id})
-                await cdp2.detach()
-            except Exception:
-                pass
-    except Exception:
-        pass
     return await ctx.new_page()
 
 async def _cleanup_orphan_tabs(exclude_page=None):
@@ -251,9 +226,9 @@ class GoogleAIClient:
                 for k, v in [("hl", hl), ("gl", gl), ("tbs", tbs), ("pws", pws)]:
                     if v:
                         bare_url += f"&{k}={v}"
-                await p.goto(bare_url, wait_until="commit", timeout=20000,
+                await p.goto(bare_url, wait_until="domcontentloaded", timeout=20000,
                              referer="https://www.google.com/")
-                await p.wait_for_load_state("domcontentloaded", timeout=10000)
+                await p.wait_for_load_state("networkidle", timeout=15000)
                 cap = await self._detect_captcha(p)
                 if cap:
                     return {"success": False, "error": cap}
@@ -276,9 +251,8 @@ class GoogleAIClient:
                     if v:
                         params.append(f"{k}={v}")
                 url = f"{GOOGLE_AI_URL}?{'&'.join(params)}"
-                await p.goto(url, wait_until="commit", timeout=20000,
+                await p.goto(url, wait_until="domcontentloaded", timeout=20000,
                              referer="https://www.google.com/")
-                await p.wait_for_load_state("domcontentloaded", timeout=10000)
                 cap = await self._detect_captcha(p)
                 if cap:
                     return {"success": False, "error": cap}
