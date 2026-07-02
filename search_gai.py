@@ -55,12 +55,14 @@ CUTOFF_MARKERS = [
     "Las respuestas de la IA pueden contener errores",
     "Les réponses de l'IA peuvent contenir des erreurs",
     "Le risposte dell'IA possono contenere errori",
-    # Google AI Mode post-answer UI noise
+    # Google AI Mode post-answer UI noise (matched in body text)
     "Good response", "Bad response",
     "Share public link", "This public link shares",
     "Thanks for letting us know", "A copy of this chat",
     "Make a legal removal request",
 ]
+
+CUTOFF_MARKERS_LOWER = [m.lower() for m in CUTOFF_MARKERS]
 
 CAPTCHA_INDICATORS = [
     "/sorry/index", "unusual traffic", "captcha", "recaptcha",
@@ -442,11 +444,39 @@ class GoogleAIClient:
             md = re.sub(r'==+([^=]+)==+', r'\1', md)
             md = re.sub(r'!\[[^\]]*\]\(data:image\/[^)]+\)', '', md)
             md = re.sub(r'\[\]\([^)]*\)', '', md)
-            for marker in CUTOFF_MARKERS:
-                idx = md.find(marker)
-                if idx >= 0:
-                    md = md[:idx].strip()
+            # Split off the Sources section so we don't cut it with noise
+            body = md
+            sources = ""
+            si = md.rfind("## Sources")
+            if si >= 0:
+                body = md[:si].strip()
+                sources = md[si:]
+            # Line-based cutoff: find first noise line and cut there
+            lines = body.split("\n")
+            cut_idx = None
+            for i, line in enumerate(lines):
+                sl = line.strip().lower()
+                if any(m in sl for m in CUTOFF_MARKERS_LOWER):
+                    cut_idx = i
                     break
+            if cut_idx is not None:
+                lines = lines[:cut_idx]
+            # Strip trailing standalone noise lines (buttons, share UI)
+            noise_lines = {
+                "Copy", "# Share public link", "Share public link",
+                "Good response", "Bad response", "More",
+                "Share", "Facebook", "Gmail", "X", "Reddit", "WhatsApp",
+                "Thanks for letting us know",
+            }
+            while lines and (lines[-1].strip() in noise_lines or not lines[-1].strip()):
+                lines.pop()
+            while lines and any(lines[-1].strip().startswith(p) for p in
+                ["This public link shares", "A copy of this chat",
+                 "Google may use account", "Can't copy the link",
+                 "Make a legal removal"]):
+                lines.pop()
+            body = "\n".join(lines).strip()
+            md = body + "\n\n" + sources if sources else body
             md = re.sub(r'(?<![.!?\n])\n(?![*\-#\d\n])', ' ', md)
             md = re.sub(r'\n{3,}', '\n\n', md)
             return md.strip()
