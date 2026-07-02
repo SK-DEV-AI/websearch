@@ -5,4 +5,4 @@ export GROQ_API_KEYS="gsk-YOUR_KEY"
 export TAVILY_KEYS="tvly-dev-YOUR_KEY"
 
 export RERANKER_MODEL="Alibaba-NLP/gte-reranker-modernbert-base"
-exec /home/sk/.local/share/venvs/mcp/bin/python3 /home/sk/.config/opencode/mcp-servers/free-websearch/server.py "$@"
+exec /home/sk/.local/share/venvs/mcp/bin/python3 /home/sk/.config/opencode/mcp-servers/websearch/server.py "$@"

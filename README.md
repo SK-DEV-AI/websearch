@@ -1,4 +1,4 @@
-# free-websearch MCP Server
+# websearch MCP Server
 
 Multi-engine web search MCP server for OpenCode. Searches DuckDuckGo, Google AI Mode (udm=50), Tavily, Wikipedia, arXiv, and AnySearch in parallel with embedding dedup + cross-encoder reranking.
 

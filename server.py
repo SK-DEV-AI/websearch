@@ -29,7 +29,7 @@ from arxiv import search_arxiv
 from site_mapper import map_site
 from research import search_multi, enrich
 
-server = Server("free-websearch")
+server = Server("websearch")
 
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
