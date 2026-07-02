@@ -40,8 +40,10 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                        layout: str = "", license_image: str = "",
                        resolution: str = "", duration: str = "",
                        license_videos: str = "",
-                       start_date: str = "", end_date: str = "",
-                       exact_phrase: bool = False) -> dict:
+                        start_date: str = "", end_date: str = "",
+                        exact_phrase: bool = False,
+                        anysearch_tag: str = "", anysearch_zone: str = "",
+                        anysearch_language: str = "", anysearch_params: dict | None = None) -> dict:
     engines_used: list[str] = []
     results: list[dict] = []
     ai_answer = ""
@@ -110,7 +112,9 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 country=country, include_domains=include_domains, exclude_domains=exclude_domains)),
             "wiki": asyncio.create_task(search_wikipedia(query, count=min(count, 5), language=language)),
             "arxiv": asyncio.create_task(search_arxiv(query, count=min(count, 3))),
-            "anysearch": asyncio.create_task(search_anysearch(query, count=min(count, 5), domain=domain)),
+            "anysearch": asyncio.create_task(search_anysearch(query, count=min(count, 5), domain=domain,
+                tag=anysearch_tag, zone=anysearch_zone, language=anysearch_language,
+                params=anysearch_params)),
             "tinyfish": asyncio.create_task(tinyfish_search(query, count=min(count, 5))),
             **ddg_tasks,
         }

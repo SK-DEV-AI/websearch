@@ -34,14 +34,24 @@ def _detect_domain(query: str) -> str:
     return ""
 
 
-async def search_anysearch(query: str, count: int = 10, domain: str = "") -> list[dict]:
+async def search_anysearch(query: str, count: int = 10, domain: str = "",
+                          tag: str = "", zone: str = "", language: str = "",
+                          params: dict | None = None) -> list[dict]:
     if not ANYSEARCH_KEY:
         return []
-    if not domain:
-        domain = _detect_domain(query)
-    body: dict[str, Any] = {"query": query, "count": min(max(count, 1), 10)}
-    if domain:
-        body["domain"] = domain
+    body: dict[str, Any] = {"query": query, "count": min(max(count, 1), 20)}
+    if domain or (not tag):
+        d = domain or _detect_domain(query)
+        if d:
+            body["domain"] = d
+    if tag:
+        body["tag"] = tag
+    if zone in ("cn", "intl"):
+        body["zone"] = zone
+    if language:
+        body["language"] = language
+    if params:
+        body["params"] = params
     try:
         c = get_http_client()
         r = await c.post(
@@ -51,7 +61,7 @@ async def search_anysearch(query: str, count: int = 10, domain: str = "") -> lis
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {ANYSEARCH_KEY}",
             },
-            timeout=10,
+            timeout=15,
         )
         if r.status_code != 200:
             return []
@@ -73,5 +83,28 @@ async def search_anysearch(query: str, count: int = 10, domain: str = "") -> lis
                 entry["content"] = content[:3000]
             results.append(entry)
         return results
+    except (httpx.HTTPError, ValueError, KeyError):
+        return []
+
+
+async def get_anysearch_sub_domains(domain: str) -> list[str]:
+    """Discover valid sub_domains for a given domain via the directory endpoint."""
+    if not ANYSEARCH_KEY or not domain:
+        return []
+    try:
+        c = get_http_client()
+        r = await c.post(
+            "https://api.anysearch.com/v1/get_sub_domains",
+            json={"domain": domain},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {ANYSEARCH_KEY}",
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return data.get("data", {}).get("sub_domains", []) or []
     except (httpx.HTTPError, ValueError, KeyError):
         return []

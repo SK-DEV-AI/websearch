@@ -111,7 +111,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                         content = trafilatura.extract(
                             html_c, output_format='markdown', include_links=include_links,
                             include_images=include_images, include_tables=include_tables,
-                            deduplicate=deduplicate, fast=True,
+                            deduplicate=deduplicate, fast=True, url=url,
                         ) or await page.evaluate("document.body.innerText || ''")
                     if isinstance(content, bytes):
                         content = content.decode("utf-8", errors="replace")
@@ -172,9 +172,10 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     "content": content[:max_chars] + ("\n[...truncated]" if len(content) > max_chars else "")}
         kw: dict[str, Any] = {
             "output_format": output_format, "with_metadata": True,
-                        "include_links": include_links, "include_tables": include_tables,
+            "include_links": include_links, "include_tables": include_tables,
             "include_images": include_images, "include_comments": include_comments,
             "include_formatting": include_formatting, "deduplicate": deduplicate,
+            "url": url,
         }
         if target_language:
             kw["target_language"] = target_language
@@ -200,7 +201,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             content = result or ''
         if not content:
             content = trafilatura.extract(raw_html, output_format='txt',
-                                          with_metadata=False) or ''
+                                          with_metadata=False, url=url) or ''
         if not content.strip():
             try:
                 content = (resp.get_all_text() or '').strip()
@@ -216,14 +217,16 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         if min_output_size and len(clean) < min_output_size:
             return {"success": False, "url": url, "error": f"Content too short ({len(clean)} < {min_output_size} chars)"}
         meta_str = trafilatura.extract(raw_html, output_format='json', with_metadata=True,
-                                       include_links=False, include_tables=False) if clean else None
+                                       include_links=False, include_tables=False,
+                                       url=url) if clean else None
         meta = {}
         if isinstance(meta_str, str) and meta_str.startswith('{'):
             try:
                 meta = json.loads(meta_str).get("metadata", {})
             except Exception:
                 pass
-        return {"success": True, "url": url, "title": title or meta.get("title", ""),
+        return {"success": True, "url": url, "status": resp.status,
+                "title": title or meta.get("title", ""),
                 "content": clean, "metadata": {k: v for k, v in meta.items() if v}}
     except Exception as e:
         return {"success": False, "url": url, "error": str(e)}
@@ -252,7 +255,7 @@ async def _cdp_extract_content(page, css_selector: str | None, extraction_type: 
         if text and text.strip():
             return text.strip()
         html_c = await page.evaluate("document.documentElement.outerHTML")
-        content = trafilatura.extract(html_c, output_format='markdown', fast=True)
+        content = trafilatura.extract(html_c, output_format='markdown', fast=True, url=url)
         return content or await page.evaluate("document.body.innerText || ''")
     return await page.evaluate("document.body.innerText || ''")
 
@@ -399,7 +402,7 @@ async def scrapling_stealthy_fetch(
                 elif extraction_type == "markdown":
                     content = p.get_all_text()
                     html_c = p.body if isinstance(p.body, str) else p.body.decode("utf-8", errors="replace")
-                    content = trafilatura.extract(html_c, output_format='markdown', fast=True) or content
+                    content = trafilatura.extract(html_c, output_format='markdown', fast=True, url=url) or content
                 else:
                     content = p.get_all_text()
             if isinstance(content, bytes):

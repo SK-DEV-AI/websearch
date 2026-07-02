@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-from config import TINYFISH_KEYS as _TINYFISH_KEYS
+from config import TINYFISH_KEYS as _TINYFISH_KEYS, get_http_client
 
 _TINYFISH_IDX = 0
 
@@ -28,6 +28,7 @@ async def tinyfish_search(
     recency_minutes: int = 0,
     after_date: str = "",
     before_date: str = "",
+    page: int = 0,
 ) -> list[dict]:
     """Search via TinyFish API. Returns list of {title, url, snippet, source}."""
     key = _next_key()
@@ -47,9 +48,11 @@ async def tinyfish_search(
         params["after_date"] = after_date
     if before_date:
         params["before_date"] = before_date
+    if page > 0:
+        params["page"] = min(page, 10)
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get("https://api.search.tinyfish.ai", headers=headers, params=params)
+        c = get_http_client()
+        resp = await c.get("https://api.search.tinyfish.ai", headers=headers, params=params)
         if resp.status_code != 200:
             return []
         data = resp.json()
@@ -58,36 +61,18 @@ async def tinyfish_search(
             url = item.get("url", "")
             if not url:
                 continue
-            results.append({
+            r: dict[str, Any] = {
                 "title": item.get("title", ""),
                 "url": url,
                 "snippet": item.get("description", item.get("snippet", "")),
-                "source": httpx.URL(url).host or "",
-            })
+            }
+            if domain_type == "research_paper":
+                r["authors"] = item.get("author", [])
+                r["venue"] = item.get("venue", "")
+                r["year"] = item.get("year", "")
+                r["citations"] = item.get("citation_count", 0)
+                r["pdf_url"] = item.get("pdf_url", "")
+            results.append(r)
         return results[:count]
     except Exception:
         return []
-
-
-async def tinyfish_fetch(url: str, format: str = "markdown") -> dict | None:
-    """Fetch and extract content from a URL via TinyFish."""
-    key = _next_key()
-    if not key:
-        return None
-    headers = {"X-API-Key": key, "Content-Type": "application/json"}
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.fetch.tinyfish.ai",
-                headers=headers,
-                json={"url": url, "format": format},
-            )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        text = data.get("text", "")
-        if not text:
-            return None
-        return {"success": True, "content": text, "format": format}
-    except Exception:
-        return None

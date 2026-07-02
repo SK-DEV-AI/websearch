@@ -47,7 +47,11 @@ async def handle_list_tools() -> list[Tool]:
                 "start_date": {"type": "string", "description": "Tavily date filter start (YYYY-MM-DD)"},
                 "end_date": {"type": "string", "description": "Tavily date filter end (YYYY-MM-DD)"},
                 "synthesize": {"type": "boolean", "default": True, "description": "Groq-synthesize top results into a concise answer with citations"},
-                "domain": {"type": "string", "description": "AnySearch vertical: finance, code, academic, health, travel, legal, security. Guessed from query via simple heuristic — may be wrong, omit for general search."}},
+                "domain": {"type": "string", "description": "AnySearch vertical: finance, code, academic, health, travel, legal, security. Guessed from query via simple heuristic — may be wrong, omit for general search."},
+                "anysearch_tag": {"type": "string", "description": "AnySearch precise sub-domain tag in {domain}.{sub_domain} format (e.g. code.doc, finance.us_stock). Overrides domain."},
+                "anysearch_zone": {"type": "string", "enum": ["", "cn", "intl"], "description": "AnySearch geo zone (cn or intl)"},
+                "anysearch_language": {"type": "string", "description": "AnySearch content language (e.g. en, zh-CN)"},
+                "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"}},
                 "required": ["query"]}),
         Tool(name="fetch",
             description="URL to markdown/text. Use stealth=True for Cloudflare sites (CDP via Helium). Supports PDF, EPUB, DOCX (default path only). Default: fast (domcontentloaded only). Use network_idle=True for JS-heavy pages. Use start_line/end_line for range reads instead of guessing max_chars.",
@@ -78,19 +82,39 @@ async def handle_list_tools() -> list[Tool]:
                 "strategy": {"type": "string", "enum": ["bfs","dfs"], "default": "bfs"},
                 "exclude_domains": {"type": "array", "items": {"type": "string"}},
                 "content_filter": {"type": "string", "enum": ["","pruning","bm25","bm25_hq","cosine"]},
-                "filter_query": {"type": "string"}},
+                "filter_query": {"type": "string"},
+                "page_timeout": {"type": "integer", "default": 60000, "description": "Page load timeout in ms"},
+                "check_robots_txt": {"type": "boolean", "default": False},
+                "capture_console_messages": {"type": "boolean", "default": False, "description": "Capture console.log output"},
+                "capture_network_requests": {"type": "boolean", "default": False},
+                "css_selector": {"type": "string", "description": "CSS selector to target specific content"},
+                "bypass_cache": {"type": "boolean", "default": False, "description": "Force fresh crawl, skip cache"},
+                "exclude_all_images": {"type": "boolean", "default": False},
+                "exclude_external_images": {"type": "boolean", "default": False}},
                 "required": ["url"]}),
-        Tool(name="screenshot",
+         Tool(name="screenshot",
             description="CDP screenshot or ARIA accessibility snapshot (AI-optimized for LLMs). Use start_line/end_line for snapshot text range reads.",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "full_page": {"type": "boolean", "default": True},
                 "type": {"type": "string", "enum": ["screenshot","snapshot","both"]},
                 "max_chars": {"type": "integer", "default": 10000},
                 "quality": {"type": "integer", "description": "JPEG quality 1-100"},
+                "image_type": {"type": "string", "enum": ["png", "jpeg"], "default": "png", "description": "Screenshot image format"},
+                "clip_x": {"type": "number", "description": "Clip region X offset for screenshot"},
+                "clip_y": {"type": "number", "description": "Clip region Y offset for screenshot"},
+                "clip_width": {"type": "number", "description": "Clip region width for screenshot"},
+                "clip_height": {"type": "number", "description": "Clip region height for screenshot"},
+                "scale": {"type": "string", "enum": ["css", "device"], "default": "css", "description": "Screenshot scale: css (default DPR) or device (device DPR)"},
+                "animations": {"type": "string", "enum": ["allow", "disabled"], "default": "allow", "description": "Whether to animate elements in screenshot"},
+                "omit_background": {"type": "boolean", "default": False, "description": "Transparent background (PNG only)"},
+                "caret": {"type": "string", "enum": ["hide", "initial"], "default": "initial", "description": "Whether to hide the caret before screenshot"},
+                "depth": {"type": "integer", "description": "ARIA snapshot tree depth limit"},
+                "boxes": {"type": "boolean", "default": False, "description": "Include bounding boxes in ARIA snapshot"},
+                "verbose": {"type": "boolean", "default": False, "description": "Show all ARIA roles (not just interactive)"},
                 "start_line": {"type": "integer", "description": "1-based start line for snapshot text range"},
                 "end_line": {"type": "integer", "description": "1-based end line (inclusive) for snapshot text range"}},
                 "required": ["url"]}),
-        Tool(name="wikipedia",
+         Tool(name="wikipedia",
             description="Search Wikipedia: articles, summaries, geosearch, random. Actions: search, summary (REST API v1 fast), summary_action (Action API with images/sections), categories, links, extlinks, categorymembers, pageviews, revisions, backlinks, recentchanges.",
             inputSchema={"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["search","summary","summary_action","geosearch","random","categories","links","extlinks","categorymembers","pageviews","revisions","backlinks","recentchanges","langlinks","allpages"], "default": "search"},
@@ -98,7 +122,12 @@ async def handle_list_tools() -> list[Tool]:
                 "count": {"type": "integer", "default": 3},
                 "language": {"type": "string", "default": "en"},
                 "lat": {"type": "number"}, "lon": {"type": "number"},
-                "category": {"type": "string", "description": "Category name for categorymembers action (without Category: prefix)"}},
+                "category": {"type": "string", "description": "Category name for categorymembers action (without Category: prefix)"},
+                "namespace": {"type": "integer", "default": 0, "description": "Namespace filter (0=articles, 14=categories). Applies to search/links/allpages/random actions."},
+                "days": {"type": "integer", "default": 30, "description": "Days of pageview history (pageviews action)"},
+                "type_filter": {"type": "string", "description": "Change type filter for recentchanges: edit/new/move/log/categorize"},
+                "include_images": {"type": "boolean", "default": False, "description": "Include thumbnail images in summary_action"},
+                "distance": {"type": "integer", "default": 1000, "description": "Search radius in meters for geosearch"}},
                 "required": []}),
         Tool(name="arxiv",
             description="Search arXiv academic papers. Use raw_query for boolean operators (AND, OR, ANDNOT), phrase search (ti:\"exact phrase\"), wildcards (au:smith*).",
@@ -128,7 +157,7 @@ async def handle_list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "extract_type": {"type": "string", "enum": ["markdown","text_plain","raw"], "default": "markdown"}},
                 "required": ["url"]}),
-        Tool(name="pdf_extract",
+         Tool(name="pdf_extract",
             description="PDF to structured data via opendataloader-pdf. Extracts text, tables, formulas, images with bounding boxes. Supports scanned PDFs (OCR), complex tables, and accessibility tagging.",
             inputSchema={"type": "object", "properties": {
                 "input_path": {"type": "array", "items": {"type": "string"}, "description": "PDF file paths or URLs (local files, http/https, file://)"},
@@ -139,7 +168,22 @@ async def handle_list_tools() -> list[Tool]:
                 "hybrid_mode": {"type": "string", "enum": ["", "full"], "description": "full enables formula/picture enrichment (requires hybrid)"},
                 "force_ocr": {"type": "boolean", "description": "Enable OCR for scanned/image-based PDFs (requires --hybrid docling-fast)"},
                 "enrich_formula": {"type": "boolean", "description": "Extract mathematical formulas as LaTeX (requires hybrid_mode=full)"},
-                "enrich_picture": {"type": "boolean", "description": "Generate AI descriptions for charts/images (requires hybrid_mode=full)"}},
+                "enrich_picture": {"type": "boolean", "description": "Generate AI descriptions for charts/images (requires hybrid_mode=full)"},
+                "sanitize": {"type": "boolean", "default": False, "description": "Sanitize sensitive data (emails, phones, IPs, credit cards, URLs)"},
+                "keep_line_breaks": {"type": "boolean", "default": False},
+                "include_header_footer": {"type": "boolean", "default": False},
+                "detect_strikethrough": {"type": "boolean", "default": False, "description": "Wrap strikethrough text with ~~ in markdown (experimental)"},
+                "markdown_with_html": {"type": "boolean", "default": False, "description": "Allow HTML tags inside markdown for complex tables"},
+                "use_struct_tree": {"type": "boolean", "default": False, "description": "Use PDF structure tree (tagged PDF) for reading order"},
+                "content_safety_off": {"type": "string", "enum": ["", "all", "hidden-text", "off-page", "tiny", "hidden-ocg"], "description": "Disable content safety filters"},
+                "threads": {"type": "string", "description": "Worker threads for parallel per-page processing (experimental, e.g. '4')"},
+                "replace_invalid_chars": {"type": "string", "description": "Replacement char for invalid/unrecognized characters (default: space)"},
+                "table_method": {"type": "string", "enum": ["", "default", "cluster"], "description": "Table detection method"},
+                "reading_order": {"type": "string", "enum": ["", "off", "xycut"], "description": "Reading order algorithm"},
+                "image_output": {"type": "string", "enum": ["", "off", "embedded", "external"], "description": "Image output mode in extracted content"},
+                "image_format": {"type": "string", "enum": ["", "png", "jpeg"], "description": "Output format for extracted images"},
+                "hybrid_url": {"type": "string", "description": "Hybrid backend server URL (overrides default)"},
+                "hybrid_timeout": {"type": "string", "description": "Hybrid backend request timeout in ms"}},
                 "required": ["input_path"]}),
     ]
 
@@ -201,6 +245,9 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                 end_date=str(arguments.get("end_date","")),
                 exact_phrase=bool(arguments.get("exact_phrase",False)),
                 domain=str(arguments.get("domain","")),
+                anysearch_tag=str(arguments.get("anysearch_tag","")),
+                anysearch_zone=str(arguments.get("anysearch_zone","")),
+                anysearch_language=str(arguments.get("anysearch_language","")),
                 cdp_url=HELIUM_CDP)
             if r.get("success") and depth >= 2 and r.get("results"):
                 fetched = await enrich(r["results"], query, depth=depth,
@@ -299,7 +346,14 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                 exclude_domains=arguments.get("exclude_domains"),
                 content_filter=str(arguments.get("content_filter","")),
                 filter_query=str(arguments.get("filter_query","")),
-                css_extract=arguments.get("css_extract"))
+                css_extract=arguments.get("css_extract"),
+                page_timeout=safe_int(arguments.get("page_timeout",60000)),
+                check_robots_txt=bool(arguments.get("check_robots_txt",False)),
+                capture_console_messages=bool(arguments.get("capture_console_messages",False)),
+                capture_network_requests=bool(arguments.get("capture_network_requests",False)),
+                bypass_cache=bool(arguments.get("bypass_cache",False)),
+                exclude_all_images=bool(arguments.get("exclude_all_images",False)),
+                exclude_external_images=bool(arguments.get("exclude_external_images",False)))
             return _res(r)
         elif name == "screenshot":
             url = arguments["url"]
@@ -321,7 +375,9 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                     scale=str(arguments.get("scale","css")),
                     animations=str(arguments.get("animations","allow")),
                     quality=arguments.get("quality"),
-                    image_type=str(arguments.get("image_type","png")))
+                    image_type=str(arguments.get("image_type","png")),
+                    omit_background=bool(arguments.get("omit_background",False)),
+                    caret=str(arguments.get("caret","initial")))
             if cap_type == "snapshot":
                 r = snap
             elif cap_type == "both":
@@ -449,7 +505,13 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                 image_format=str(arguments.get("image_format", "")),
                 sanitize=bool(arguments.get("sanitize", False)),
                 keep_line_breaks=bool(arguments.get("keep_line_breaks", False)),
-                markdown_with_html=bool(arguments.get("markdown_with_html", False)))
+                markdown_with_html=bool(arguments.get("markdown_with_html", False)),
+                include_header_footer=bool(arguments.get("include_header_footer", False)),
+                detect_strikethrough=bool(arguments.get("detect_strikethrough", False)),
+                use_struct_tree=bool(arguments.get("use_struct_tree", False)),
+                content_safety_off=str(arguments.get("content_safety_off", "")),
+                threads=str(arguments.get("threads", "")),
+                replace_invalid_chars=str(arguments.get("replace_invalid_chars", "")))
             return _res(r)
         elif name == "map_site":
             r = await map_site(url=str(arguments.get("url","")),

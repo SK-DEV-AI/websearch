@@ -10,8 +10,9 @@ TAVILY_SEARCH = "https://api.tavily.com/search"
 
 
 async def search_tavily(query: str, n: int = 10, topic: str = "general",
-                        time_range: str = "", include_raw_content: bool = False,
-                        search_depth: str = "basic", include_answer: bool = True,
+                        time_range: str = "", include_raw_content: bool = True,
+                        search_depth: str = "advanced", include_answer: bool = True,
+                        include_images: bool = True, auto_parameters: bool = True,
                         include_domains: list | None = None,
                         exclude_domains: list | None = None,
                         country: str = "",
@@ -25,7 +26,9 @@ async def search_tavily(query: str, n: int = 10, topic: str = "general",
     body: dict[str, Any] = {"query": query, "search_depth": search_depth,
                             "max_results": min(n, 10), "include_answer": include_answer,
                             "include_raw_content": include_raw_content,
-                            "topic": topic}
+                            "topic": topic, "auto_parameters": auto_parameters}
+    if include_images:
+        body["include_images"] = True
     if start_date:
         body["start_date"] = start_date
     if end_date:

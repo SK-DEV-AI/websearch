@@ -56,7 +56,9 @@ async def screenshot_cdp(url: str, full_page: bool = True,
                          clip_width: float = 0, clip_height: float = 0,
                          scale: str = "css", animations: str = "allow",
                          quality: int | None = None,
-                         image_type: str = "png") -> dict:
+                         image_type: str = "png",
+                         omit_background: bool = False,
+                         caret: str = "initial") -> dict:
     try:
         page = await _get_optimized_page(block_resources=True)
         try:
@@ -64,6 +66,10 @@ async def screenshot_cdp(url: str, full_page: bool = True,
             await page.wait_for_load_state("domcontentloaded", timeout=10000)
             await asyncio.sleep(0.3)
             ss_kwargs: dict = {"full_page": full_page, "type": image_type, "timeout": 30000}
+            if omit_background:
+                ss_kwargs["omit_background"] = True
+            if caret in ("hide", "initial"):
+                ss_kwargs["caret"] = caret
             if clip_width > 0 and clip_height > 0:
                 ss_kwargs["clip"] = {"x": clip_x, "y": clip_y,
                                      "width": clip_width, "height": clip_height}

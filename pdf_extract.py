@@ -40,6 +40,10 @@ async def extract_pdf(
     include_header_footer: bool = False,
     detect_strikethrough: bool = False,
     markdown_with_html: bool = False,
+    use_struct_tree: bool = False,
+    content_safety_off: str = "",
+    threads: str = "",
+    replace_invalid_chars: str = "",
 ) -> dict[str, Any]:
     sources = [input_path] if isinstance(input_path, str) else input_path
     local_files: list[str] = []
@@ -106,6 +110,14 @@ async def extract_pdf(
             kwargs["detect_strikethrough"] = True
         if markdown_with_html:
             kwargs["markdown_with_html"] = True
+        if use_struct_tree:
+            kwargs["use_struct_tree"] = True
+        if content_safety_off:
+            kwargs["content_safety_off"] = content_safety_off
+        if threads:
+            kwargs["threads"] = threads
+        if replace_invalid_chars:
+            kwargs["replace_invalid_chars"] = replace_invalid_chars
 
         opendataloader_pdf.convert(**kwargs)
 

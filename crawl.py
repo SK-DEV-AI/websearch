@@ -38,6 +38,9 @@ async def crawl_url(
     log_console: bool = False,
     content_filter: str = "", filter_query: str = "",
     css_extract: dict | None = None,
+    bypass_cache: bool = False,
+    exclude_all_images: bool = False,
+    exclude_external_images: bool = False,
 ) -> dict:
     browser_kw: dict[str, Any] = {
         "headless": True, "verbose": False, "ignore_https_errors": True,
@@ -135,6 +138,12 @@ async def crawl_url(
         run_kw["adjust_viewport_to_content"] = True
     if log_console:
         run_kw["log_console"] = True
+    if bypass_cache:
+        run_kw["bypass_cache"] = True
+    if exclude_all_images:
+        run_kw["exclude_all_images"] = True
+    if exclude_external_images:
+        run_kw["exclude_external_images"] = True
     run_config = CrawlerRunConfig(**run_kw)
     async with AsyncWebCrawler(config=cfg) as crawler:
         results = await crawler.arun(url, config=run_config)
