@@ -57,9 +57,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 timeout=300)
             if r.get("success"):
                 return r
-        except asyncio.TimeoutError:
-            pass
-        except Exception:
+        except (asyncio.TimeoutError, Exception):
             pass
         return None
 
