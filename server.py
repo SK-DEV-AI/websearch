@@ -295,15 +295,23 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                     prune_xpath=str(arguments.get("prune_xpath","")),
                     url_blacklist=str(arguments.get("url_blacklist","")),
                     author_blacklist=str(arguments.get("author_blacklist","")),
-                    cdp_url=HELIUM_CDP or "",
                     min_output_size=safe_int(arguments.get("min_output_size", 0)),
                     raw=bool(arguments.get("raw", False)))
-            # Auto-fallback: if Cloudflare or empty content, retry via CDP
-            content = r.get("content", "") or ""
+            # Auto-fallback: if Cloudflare/403/blocked/empty content, retry via CDP
+            content = (r.get("content", "") or "").strip()
+            status = r.get("status", 0)
+            r_error = (r.get("error", "") or "").lower()
+            content_lower = content.lower()
             should_retry = (
-                not r.get("success") and "cloudflare" in (r.get("error", "") or "").lower()
+                not r.get("success") and "cloudflare" in r_error
+            ) or status in (403, 429, 503) or (
+                len(content) < 300 and (
+                    "blocked" in content_lower or "access denied" in content_lower
+                    or "network security" in content_lower or "rate limit" in content_lower
+                    or "too many requests" in content_lower
+                )
             ) or (
-                r.get("success") and len(content.strip()) < 100
+                len(content) < 100
             )
             if should_retry:
                 r = await scrapling_stealthy_fetch(arguments["url"],
