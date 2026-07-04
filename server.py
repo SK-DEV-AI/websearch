@@ -54,12 +54,11 @@ async def handle_list_tools() -> list[Tool]:
                 "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"}},
                 "required": ["query"]}),
         Tool(name="fetch",
-            description="URL to markdown/text. Use stealth=True for Cloudflare sites (CDP via Helium). Supports PDF, EPUB, DOCX (default path only). Default: fast (domcontentloaded only). Use network_idle=True for JS-heavy pages. Use start_line/end_line for range reads instead of guessing max_chars.",
+            description="URL to markdown/text. Auto-fallback: fast httpx+trafilatura first, then CDP for Cloudflare/JS-heavy pages. Supports PDF, EPUB, DOCX (default path only). Default: fast (domcontentloaded only). Use network_idle=True for JS-heavy pages. Use start_line/end_line for range reads instead of guessing max_chars.",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "max_chars": {"type": "integer", "default": 5000},
                 "css_selector": {"type": "string"},
                 "extraction_type": {"type": "string", "enum": ["markdown","text","html"]},
-                "stealth": {"type": "boolean"},
                 "target_language": {"type": "string"},
                 "output_format": {"type": "string", "enum": ["markdown","txt","json","xml","csv"], "default": "markdown"},
                 "fast": {"type": "boolean"},
@@ -279,30 +278,7 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                     pass
             return _res(r)
         elif name == "fetch":
-            if bool(arguments.get("stealth",False)):
-                r = await scrapling_stealthy_fetch(arguments["url"],
-                    css_selector=arguments.get("css_selector"),
-                    extraction_type=str(arguments.get("extraction_type","markdown")),
-                    cdp_url=HELIUM_CDP, block_webrtc=bool(arguments.get("block_webrtc",False)),
-                    hide_canvas=True, disable_resources=bool(arguments.get("disable_resources",True)),
-                    google_search=True, proxy=str(arguments.get("proxy","")),
-                    locale=str(arguments.get("locale","")), timezone_id=str(arguments.get("timezone_id","")),
-                    network_idle=bool(arguments.get("network_idle",True)),
-                    allow_webgl=bool(arguments.get("allow_webgl",True)),
-                    block_ads=bool(arguments.get("block_ads",True)),
-                    dns_over_https=bool(arguments.get("dns_over_https",True)),
-                    solve_cloudflare=bool(arguments.get("solve_cloudflare",True)),
-                    retries=safe_int(arguments.get("retries",5)),
-                    capture_xhr=str(arguments.get("capture_xhr","")),
-                    wait_selector=str(arguments.get("wait_selector","")),
-                    wait_selector_state=str(arguments.get("wait_selector_state","attached")),
-                    blocked_domains=arguments.get("blocked_domains"),
-                    init_script=str(arguments.get("init_script","")),
-                    extra_headers=arguments.get("extra_headers"),
-                    useragent=str(arguments.get("useragent","")),
-                    load_dom=bool(arguments.get("load_dom",False)))
-            else:
-                r = await fetch_url(arguments["url"],
+            r = await fetch_url(arguments["url"],
                     max_chars=safe_int(arguments.get("max_chars",5000)),
                     main_content_only=bool(arguments.get("main_content_only",True)),
                     target_language=str(arguments.get("target_language","")),
@@ -322,6 +298,18 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                     cdp_url=HELIUM_CDP or "",
                     min_output_size=safe_int(arguments.get("min_output_size", 0)),
                     raw=bool(arguments.get("raw", False)))
+            # Auto-fallback: if Cloudflare or empty content, retry via CDP
+            content = r.get("content", "") or ""
+            should_retry = (
+                not r.get("success") and "cloudflare" in (r.get("error", "") or "").lower()
+            ) or (
+                r.get("success") and len(content.strip()) < 100
+            )
+            if should_retry:
+                r = await scrapling_stealthy_fetch(arguments["url"],
+                    css_selector=arguments.get("css_selector"),
+                    extraction_type=str(arguments.get("extraction_type","markdown")),
+                    cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle",True)))
             # Line range slicing after fetch
             start_line = safe_int(arguments.get("start_line", 0))
             end_line = safe_int(arguments.get("end_line", 0))

@@ -211,7 +211,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         # Cloudflare challenge detection in httpx path
         cf_keywords = ["just a moment", "checking your browser", "cf-challenge", "cloudflare ray id"]
         if clean and sum(1 for kw in cf_keywords if kw in clean[:600].lower()) >= 2:
-            return {"success": False, "url": url, "error": "Cloudflare challenge detected. Use stealth=True to bypass via CDP."}
+            return {"success": False, "url": url, "error": "Cloudflare challenge detected — auto-fallback to CDP in progress."}
         if len(clean) == max_chars:
             clean += "\n[...truncated]"
         if min_output_size and len(clean) < min_output_size:
