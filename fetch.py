@@ -13,6 +13,80 @@ from search_gai import _get_optimized_page, _cleanup_orphan_tabs
 
 AsyncFetcher.configure(huge_tree=True)
 
+# ── Cloudflare challenge detection ──────────────────────────────
+# Covers old interstitial ("Checking your browser"), Managed Challenge
+# (checkbox/Turnstile iframe), and Turnstile widget formats.
+
+_CLOUDFLARE_DETECT_JS = """
+() => {
+    const t = document.title.toLowerCase();
+    if (t.includes('just a moment') || t.includes('attention required') || t.includes('cloudflare')) return true;
+
+    const u = window.location.href;
+    if (u.includes('__cf_chl_') || u.includes('cf_chl_')) return true;
+
+    if (window._cf_chl_opt || window._cf_chl_context || window.turnstile || window.__cfRLUnblockHandlers) return true;
+
+    if (document.getElementById('cf-turnstile') || document.querySelector('.cf-turnstile')) return true;
+    if (document.querySelector('form#challenge-form, [action*=\"__cf_chl_f_tk=\"], input[name=\"cf-turnstile-response\"]')) return true;
+    if (document.querySelector('[id*=\"cf-challenge-\"], #challenge-spinner, #cf-challenge-running, .cf-browser-verification')) return true;
+
+    for (let f of document.querySelectorAll('iframe')) {
+        if (f.src && f.src.includes('challenges.cloudflare.com')) return true;
+    }
+    return false;
+}
+"""
+
+_CLOUDFLARE_RESOLVED_JS = """
+() => {
+    const t = document.title.toLowerCase();
+    if (t.includes('just a moment') || t.includes('attention required') || t.includes('cloudflare')) return false;
+
+    const u = window.location.href;
+    if (u.includes('__cf_chl_') || u.includes('cf_chl_')) return false;
+
+    if (window._cf_chl_opt || window._cf_chl_context) return false;
+
+    if (document.getElementById('cf-turnstile')) return false;
+    if (document.querySelector('form#challenge-form, [action*=\"__cf_chl_f_tk=\"]')) return false;
+
+    for (let f of document.querySelectorAll('iframe')) {
+        if (f.src && f.src.includes('challenges.cloudflare.com')) return false;
+    }
+
+    const text = (document.body ? document.body.innerText || '' : '');
+    if (text.includes('Checking your browser') || text.includes('cf-challenge')) return false;
+
+    return true;
+}
+"""
+
+
+async def _wait_cf_resolution(page, timeout: float = 120):
+    """Detect and wait for Cloudflare challenge to resolve.
+
+    Returns True if the page looks real (no challenge), False if
+    the challenge is still up after *timeout* seconds.
+    """
+    try:
+        cf = await page.evaluate(_CLOUDFLARE_DETECT_JS)
+        if not cf:
+            return True
+    except Exception:
+        return True  # Can't evaluate — assume page is fine
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        await asyncio.sleep(1)
+        try:
+            done = await page.evaluate(_CLOUDFLARE_RESOLVED_JS)
+            if done:
+                return True
+        except Exception:
+            pass
+    return False
+
 
 def _extract_epub(content: bytes, max_chars: int = 50000) -> str:
     try:
@@ -96,14 +170,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                         await page.wait_for_load_state("networkidle", timeout=15)
                     except Exception:
                         pass
-                    # Detect & wait for Cloudflare challenge
-                    cf_detected = await page.evaluate("document.title.includes('Just a moment') || document.body.innerText.includes('Checking your browser') || document.body.innerText.includes('Just a moment') || document.querySelector('#challenge-spinner, #cf-challenge-running, .cf-browser-verification') !== null")
-                    if cf_detected:
-                        for _ in range(120):
-                            await asyncio.sleep(1)
-                            done = await page.evaluate("document.title !== 'Just a moment' && !document.body.innerText.includes('Checking your browser') && !document.body.innerText.includes('Just a moment') && document.querySelector('#challenge-spinner, #cf-challenge-running, .cf-browser-verification') === null")
-                            if done:
-                                break
+                    await _wait_cf_resolution(page)
                     text = await page.evaluate(_CDP_EXTRACT_MARKDOWN_JS)
                     if text and text.strip():
                         content = text.strip()
@@ -210,7 +277,9 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 content = raw_html.strip()
         clean = content.strip()[:max_chars]
         # Cloudflare challenge detection in httpx path
-        cf_keywords = ["just a moment", "checking your browser", "cf-challenge", "cloudflare ray id"]
+        cf_keywords = ["just a moment", "checking your browser", "cf-challenge",
+                        "cloudflare ray id", "__cf_chl_", "cf-turnstile",
+                        "verify you are human", "attention required"]
         if clean and sum(1 for kw in cf_keywords if kw in clean[:600].lower()) >= 2:
             return {"success": False, "url": url, "error": "Cloudflare challenge detected — auto-fallback to CDP in progress."}
         if len(clean) == max_chars:
@@ -311,15 +380,8 @@ async def scrapling_stealthy_fetch(
                         await _cdp_wait_for_selector(page, wait_selector, timeout=10)
                     except Exception:
                         pass
-                # Detect & wait for Cloudflare challenge
                 try:
-                    cf = await page.evaluate("document.title.includes('Just a moment') || document.body.innerText.includes('Checking your browser') || document.body.innerText.includes('Just a moment') || document.querySelector('#challenge-spinner, #cf-challenge-running, .cf-browser-verification') !== null")
-                    if cf:
-                        for _ in range(120):
-                            await asyncio.sleep(1)
-                            done = await page.evaluate("document.title !== 'Just a moment' && !document.body.innerText.includes('Checking your browser') && !document.body.innerText.includes('Just a moment') && document.querySelector('#challenge-spinner, #cf-challenge-running, .cf-browser-verification') === null")
-                            if done:
-                                break
+                    await _wait_cf_resolution(page)
                 except Exception:
                     pass
                 content = await _cdp_extract_content(page, css_selector, extraction_type, page_url=url)
