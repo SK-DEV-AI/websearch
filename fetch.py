@@ -75,6 +75,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             ["https://raw.githubusercontent.com/", "https://raw.github.com/",
              "https://gitlab.com/", "https://bitbucket.org/",
              "https://gist.githubusercontent.com/"]):
+
             try:
                 resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True)
                 content = resp.body if isinstance(resp.body, str) else resp.body.decode("utf-8", errors="replace")
@@ -89,10 +90,10 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             try:
                 page = await _get_optimized_page(block_resources=True)
                 try:
-                    await page.goto(url, wait_until="commit", timeout=15000)
-                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    await page.goto(url, wait_until="commit", timeout=15)
+                    await page.wait_for_load_state("domcontentloaded", timeout=15)
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=15000)
+                        await page.wait_for_load_state("networkidle", timeout=15)
                     except Exception:
                         pass
                     # Detect & wait for Cloudflare challenge
@@ -107,15 +108,15 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     if text and text.strip():
                         content = text.strip()
                     else:
-                        html_c = await page.evaluate("document.documentElement.outerHTML")
+                        html_c = await page.document_html()
                         content = trafilatura.extract(
                             html_c, output_format='markdown', include_links=include_links,
                             include_images=include_images, include_tables=include_tables,
                             deduplicate=deduplicate, fast=True, url=url,
-                        ) or await page.evaluate("document.body.innerText || ''")
+                        ) or await page.inner_text()
                     if isinstance(content, bytes):
                         content = content.decode("utf-8", errors="replace")
-                    title = await page.evaluate("document.title")
+                    title = await page.title()
                     return {"success": True, "url": url, "title": title or "",
                             "content": (content or "")[:max_chars],
                             "method": "cdp"}
@@ -242,22 +243,28 @@ _CDP_EXTRACT_MARKDOWN_JS = """
 """
 
 
-async def _cdp_extract_content(page, css_selector: str | None, extraction_type: str) -> str:
+async def _cdp_extract_content(page, css_selector: str | None, extraction_type: str,
+                               page_url: str = "") -> str:
     if css_selector:
-        el = await page.query_selector(css_selector)
-        if el:
-            return await el.inner_text()
-        return await page.evaluate("document.body.innerText || ''")
+        text = await page.evaluate(f"""
+            (() => {{
+                const el = document.querySelector({json.dumps(css_selector)});
+                return el ? el.innerText : null;
+            }})()
+        """)
+        if text:
+            return text.strip()
+        return await page.inner_text()
     if extraction_type == "html":
-        return await page.evaluate("document.documentElement.outerHTML")
+        return await page.document_html()
     if extraction_type == "markdown":
         text = await page.evaluate(_CDP_EXTRACT_MARKDOWN_JS)
         if text and text.strip():
             return text.strip()
-        html_c = await page.evaluate("document.documentElement.outerHTML")
-        content = trafilatura.extract(html_c, output_format='markdown', fast=True, url=url)
-        return content or await page.evaluate("document.body.innerText || ''")
-    return await page.evaluate("document.body.innerText || ''")
+        html_c = await page.document_html()
+        content = trafilatura.extract(html_c, output_format='markdown', fast=True, url=page_url or None)
+        return content or await page.inner_text()
+    return await page.inner_text()
 
 
 async def scrapling_stealthy_fetch(
@@ -281,10 +288,7 @@ async def scrapling_stealthy_fetch(
                 page = await _get_optimized_page(block_resources=disable_resources)
                 if blocked_domains:
                     try:
-                        cdp_session = await page.context.new_cdp_session(page)
-                        await cdp_session.send("Network.enable")
-                        await cdp_session.send("Network.setBlockedURLs", {"urls": list(blocked_domains)})
-                        await cdp_session.detach()
+                        await page.set_blocked_resources(list(blocked_domains))
                     except Exception:
                         pass
                 if init_script:
@@ -292,24 +296,19 @@ async def scrapling_stealthy_fetch(
                         await page.add_init_script(init_script)
                     except Exception:
                         pass
-                goto_timeout = min(timeout, 15000)
+                goto_timeout = min(timeout, 15000) / 1000
                 await page.goto(url, wait_until="commit", timeout=goto_timeout)
-                dc_timeout = min(timeout, 15000)
+                dc_timeout = min(timeout, 15000) / 1000
                 await page.wait_for_load_state("domcontentloaded", timeout=dc_timeout)
                 if network_idle:
                     try:
-                        ni_timeout = min(timeout, 15000)
+                        ni_timeout = min(timeout, 15000) / 1000
                         await page.wait_for_load_state("networkidle", timeout=ni_timeout)
                     except Exception:
                         pass
                 if wait_selector:
                     try:
-                        state_map = {"attached": "attached", "detached": "detached",
-                                     "visible": "visible", "hidden": "hidden"}
-                        await page.wait_for_selector(
-                            wait_selector,
-                            state=state_map.get(wait_selector_state, "attached"),
-                            timeout=10000)
+                        await _cdp_wait_for_selector(page, wait_selector, timeout=10)
                     except Exception:
                         pass
                 # Detect & wait for Cloudflare challenge
@@ -323,10 +322,10 @@ async def scrapling_stealthy_fetch(
                                 break
                 except Exception:
                     pass
-                content = await _cdp_extract_content(page, css_selector, extraction_type)
+                content = await _cdp_extract_content(page, css_selector, extraction_type, page_url=url)
                 if isinstance(content, bytes):
                     content = content.decode("utf-8", errors="replace")
-                title = await page.evaluate("document.title")
+                title = await page.title()
                 return {"success": True, "url": url, "title": title or "",
                         "content": (content or "")[:50000], "method": "cdp",
                         "attempt": attempt + 1}
@@ -414,3 +413,15 @@ async def scrapling_stealthy_fetch(
             return result
     except Exception as e:
         return {"success": False, "url": url, "error": str(e)}
+
+
+async def _cdp_wait_for_selector(page, css: str, timeout: float = 10):
+    """Poll for a CSS selector to appear in the DOM."""
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        exists = await page.evaluate(f"!!document.querySelector({json.dumps(css)})")
+        if exists:
+            return True
+        await asyncio.sleep(0.1)
+    return False

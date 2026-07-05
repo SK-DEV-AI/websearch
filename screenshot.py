@@ -14,8 +14,8 @@ async def cdpa11y_snapshot(url: str, verbose: bool = False, max_chars: int = 100
     try:
         page = await _get_optimized_page(block_resources=False)
         try:
-            await page.goto(url, wait_until="commit", timeout=30000)
-            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            await page.goto(url, wait_until="commit", timeout=30)
+            await page.wait_for_load_state("domcontentloaded", timeout=10)
             await asyncio.sleep(0.3)
             snap_kwargs: dict = {"mode": "ai"}
             if depth is not None:
@@ -24,7 +24,7 @@ async def cdpa11y_snapshot(url: str, verbose: bool = False, max_chars: int = 100
                 snap_kwargs["boxes"] = True
             snap = await page.aria_snapshot(**snap_kwargs)
             if not snap or not snap.strip():
-                html_c = await page.evaluate("document.documentElement.outerHTML")
+                html_c = await page.document_html()
                 return {"success": True, "url": url, "snapshot": "", "note": "no aria snapshot",
                         "fallback_html_len": len(html_c)}
             if not verbose:
@@ -62,12 +62,12 @@ async def screenshot_cdp(url: str, full_page: bool = True,
     try:
         page = await _get_optimized_page(block_resources=True)
         try:
-            await page.goto(url, wait_until="commit", timeout=30000)
-            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            await page.goto(url, wait_until="commit", timeout=30)
+            await page.wait_for_load_state("domcontentloaded", timeout=10)
             await asyncio.sleep(0.3)
-            ss_kwargs: dict = {"full_page": full_page, "type": image_type, "timeout": 30000}
+            ss_kwargs: dict = {"captureBeyondViewport": full_page, "format": image_type}
             if omit_background:
-                ss_kwargs["omit_background"] = True
+                ss_kwargs["omitBackground"] = True
             if caret in ("hide", "initial"):
                 ss_kwargs["caret"] = caret
             if clip_width > 0 and clip_height > 0:
@@ -79,16 +79,16 @@ async def screenshot_cdp(url: str, full_page: bool = True,
                 ss_kwargs["animations"] = animations
             if quality is not None and image_type == "jpeg":
                 ss_kwargs["quality"] = quality
-            b64 = await page.screenshot(**ss_kwargs)
-            if not b64:
+            b64_bytes = await page.screenshot(**ss_kwargs)
+            if not b64_bytes:
                 return {"success": False, "url": url, "error": "no screenshot captured"}
-            encoded = base64.b64encode(b64).decode("utf-8")
+            encoded = base64.b64encode(b64_bytes).decode("utf-8")
             if len(encoded) > 2_000_000:
                 fp = os.path.join(tempfile.gettempdir(), f"ss_{int(time.monotonic())}.{image_type}")
                 with open(fp, "wb") as f:
-                    f.write(b64)
+                    f.write(b64_bytes)
                 return {"success": True, "url": url,
-                        "screenshot_base64": f"[saved to {fp} ({len(b64)//1024}KB)]"}
+                        "screenshot_base64": f"[saved to {fp} ({len(b64_bytes)//1024}KB)]"}
             return {"success": True, "url": url, "screenshot_base64": encoded}
         finally:
             try:

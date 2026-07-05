@@ -2,7 +2,7 @@
 
 Architecture:
 - Single CDP connection to Helium (http://127.0.0.1:9222), shared across calls
-- Hidden pages via Target.createTarget(hidden=True) — no tab flashing
+- Hidden pages via Target.createTarget(background=true) — no tab flashing
 - 4-stage completion detection (SVG → aria-label → text → timeout)
 - SERPO citation extraction with [CITE-N] markers → sequential footnotes
 
@@ -22,6 +22,7 @@ import urllib.parse
 from typing import Any
 
 from config import GOOGLE_AI_URL, HELIUM_CDP, get_http_client
+from cdp_client import CDPPage, get_cdp_session, close_cdp
 
 logger = logging.getLogger("gai")
 
@@ -97,100 +98,54 @@ Object.defineProperty(navigator, 'permissions', {
 Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
 """
 
-# ── Shared CDP browser singleton ─────────────────────────────────
+RESOURCE_BLOCK_PATTERNS = [
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.webp", "*.ico",
+    "*.woff", "*.woff2", "*.ttf", "*.eot", "*.otf",
+    "*.mp4", "*.webm", "*.ogg", "*.mp3", "*.wav",
+    "*/ads/*", "*/analytics/*", "*/tracking/*",
+]
 
-_pw = None
-_browser = None
-_browser_lock = asyncio.Lock()
-
-async def _get_browser():
-    """Get or create a shared CDP connection to Helium."""
-    global _pw, _browser
-    async with _browser_lock:
-        if _browser:
-            try:
-                ctx = _browser.contexts
-                if ctx and ctx[0].pages:
-                    await asyncio.wait_for(ctx[0].pages[0].title(), timeout=3)
-                    return _browser
-            except Exception:
-                logger.debug("CDP browser stale, reconnecting")
-                await _shutdown()
-        from playwright.async_api import async_playwright
-        _pw = await async_playwright().start()
-        _browser = await _pw.chromium.connect_over_cdp(HELIUM_CDP)
-        logger.info("Connected to Helium CDP")
-        return _browser
-
-async def _shutdown():
-    """Close everything — CDP, Playwright."""
-    global _pw, _browser
-    if _browser:
-        try:
-            await _browser.close()
-        except Exception:
-            pass
-        _browser = None
-    if _pw:
-        try:
-            await _pw.stop()
-        except Exception:
-            pass
-        _pw = None
-
-async def _create_hidden_page(ctx):
-    """Create a page without stealing focus.
-
-    Uses ctx.new_page() — same approach as the reference implementation.
-    Pages are closed after use; with hidden-target CDP being unreliable
-    (Playwright doesn't discover hidden CDP targets as Page objects),
-    a normal new page is simpler and always works.
-    """
-    return await ctx.new_page()
-
-async def _cleanup_orphan_tabs(exclude_page=None):
-    """Close stale about:blank pages left by broken searches."""
-    global _browser
-    if not _browser:
-        return
-    try:
-        ctx = _browser.contexts[0]
-        for p in list(ctx.pages):
-            try:
-                if p.url == "about:blank" and p is not exclude_page:
-                    await p.close()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
+# ── Page lifecycle semaphore ──────────────────────────────────────
 
 _page_semaphore = asyncio.Semaphore(5)
 
-async def _get_optimized_page(block_resources: bool = True):
-    """Create a hidden page with anti-detection JS and optional resource blocking.
 
-    Used by fetch.py and screenshot.py for stealth CDP operations.
+async def _get_optimized_page(block_resources: bool = True) -> CDPPage:
+    """Create a hidden CDP page with anti-detection JS and optional resource blocking.
+
+    Used by fetch.py, screenshot.py, and crawl.py for stealth CDP operations.
     """
     async with _page_semaphore:
-        b = await _get_browser()
-        ctx = b.contexts[0]
-        page = await _create_hidden_page(ctx)
-        await page.add_init_script(ANTI_DETECT_JS)
-        if block_resources:
-            try:
-                cdp = await ctx.new_cdp_session(page)
-                await cdp.send("Network.enable")
-                await cdp.send("Network.setBlockedURLs", {"urls": [
-                    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.webp", "*.ico",
-                    "*.woff", "*.woff2", "*.ttf", "*.eot", "*.otf",
-                    "*.mp4", "*.webm", "*.ogg", "*.mp3", "*.wav",
-                    "*/ads/*", "*/analytics/*", "*/tracking/*",
-                ]})
-                await cdp.detach()
-            except Exception:
-                pass
-        return page
+        session = await get_cdp_session()
+        if not session:
+            raise ConnectionError("Cannot connect to Helium CDP")
+        page = await session.create_page()
+        try:
+            await page.add_init_script(ANTI_DETECT_JS)
+            if block_resources:
+                try:
+                    await page.set_blocked_resources(RESOURCE_BLOCK_PATTERNS)
+                except Exception:
+                    pass
+            return page
+        except Exception:
+            await page.close()
+            raise
+
+
+async def _cleanup_orphan_tabs():
+    """Close stale about:blank pages left by broken searches."""
+    try:
+        session = await get_cdp_session()
+        if not session:
+            return
+        result = await session.send("Target.getTargets")
+        for t in result.get("targetInfos", []):
+            if t["url"] == "about:blank":
+                await session.send("Target.closeTarget", {"targetId": t["targetId"]})
+    except Exception:
+        pass
+
 
 # ── GoogleAIClient ────────────────────────────────────────────────
 
@@ -200,16 +155,13 @@ class CompletionResult:
         self.success = success
         self.method = method  # "svg" | "aria" | "text" | "timeout" | "captcha" | "blocked"
 
+
 class GoogleAIClient:
     """One-shot search via Google AI Mode, connecting to the user's Helium CDP session."""
 
     def __init__(self, cdp_url: str | None = None):
         self._cdp_url = cdp_url or HELIUM_CDP
-        self._page = None
-
-    async def _get_context(self):
-        b = await _get_browser()
-        return b.contexts[0]
+        self._page: CDPPage | None = None
 
     async def search(self, query: str, search_prompt: str = "", pro_mode: bool = False,
                      gl: str = "", hl: str = "en", tbs: str = "", pws: str = "",
@@ -219,9 +171,10 @@ class GoogleAIClient:
         Returns {"success": bool, "result": {"answer": str, "sources": list, "followUp": str}}
         or {"success": False, "error": str}.
         """
-        b = await _get_browser()
-        ctx = b.contexts[0]
-        p = await _create_hidden_page(ctx)
+        session = await get_cdp_session()
+        if not session:
+            return {"success": False, "error": "Cannot connect to Helium CDP"}
+        p = await session.create_page()
         self._page = p
         try:
             await p.add_init_script(ANTI_DETECT_JS)
@@ -233,9 +186,8 @@ class GoogleAIClient:
                 for k, v in [("hl", hl), ("gl", gl), ("tbs", tbs), ("pws", pws)]:
                     if v:
                         bare_url += f"&{k}={v}"
-                await p.goto(bare_url, wait_until="domcontentloaded", timeout=20000,
-                             referer="https://www.google.com/")
-                await p.wait_for_load_state("networkidle", timeout=15000)
+                await p.goto(bare_url, wait_until="domcontentloaded", timeout=20)
+                await p.wait_for_load_state("networkidle", timeout=15)
                 cap = await self._detect_captcha(p)
                 if cap:
                     return {"success": False, "error": cap}
@@ -258,8 +210,7 @@ class GoogleAIClient:
                     if v:
                         params.append(f"{k}={v}")
                 url = f"{GOOGLE_AI_URL}?{'&'.join(params)}"
-                await p.goto(url, wait_until="domcontentloaded", timeout=20000,
-                             referer="https://www.google.com/")
+                await p.goto(url, wait_until="domcontentloaded", timeout=20)
                 cap = await self._detect_captcha(p)
                 if cap:
                     return {"success": False, "error": cap}
@@ -284,7 +235,7 @@ class GoogleAIClient:
 
             # ── SERPO: Click citation buttons, insert [CITE-N] markers, extract sources ──
             try:
-                await p.evaluate("""(selectors) => {
+                await p.call_function("""(selectors) => {
                     function isVisible(el) {
                         if (!el) return false;
                         try {
@@ -319,7 +270,7 @@ class GoogleAIClient:
             except Exception:
                 pass
 
-            # ── Extract results ──
+            # ── Extract results (no inline args — all self-contained) ──
             serpo = await p.evaluate("""() => {
                 const turns = document.querySelectorAll('[data-subtree=aimc]');
                 const lastTurn = turns[turns.length - 1];
@@ -401,22 +352,23 @@ class GoogleAIClient:
                 await p.close()
             except Exception:
                 pass
-            asyncio.ensure_future(_cleanup_orphan_tabs(exclude_page=None))
+            asyncio.ensure_future(_cleanup_orphan_tabs())
 
     # ── Completion detection ──────────────────────────────────────
 
-    async def _wait_for_completion(self, p, deadline_seconds: float) -> CompletionResult:
+    async def _wait_for_completion(self, p: CDPPage, deadline_seconds: float) -> CompletionResult:
         """4-stage detection: SVG thumbs-up → aria-label → text indicators → timeout.
 
         Returns at the deadline or when detection succeeds.
         """
         deadline = time.monotonic() + deadline_seconds
-        # Stage 1-2: SVG button + aria-label (polled together)
         while time.monotonic() < deadline:
             try:
-                svg = await p.query_selector('button svg[viewBox="3 3 18 18"]')
-                if svg:
-                    has_aimc = await p.evaluate("!!document.querySelector('[data-subtree=aimc]')")
+                has_svg = await p.evaluate(
+                    "!!document.querySelector('button svg[viewBox=\"3 3 18 18\"]')")
+                if has_svg:
+                    has_aimc = await p.evaluate(
+                        "!!document.querySelector('[data-subtree=aimc]')")
                     if has_aimc:
                         return CompletionResult(True, "svg")
             except Exception:
@@ -424,7 +376,8 @@ class GoogleAIClient:
             try:
                 body = await p.evaluate("document.body.innerText")
                 if any(ind in body for ind in AI_COMPLETION_TEXT_INDICATORS):
-                    has_aimc = await p.evaluate("!!document.querySelector('[data-subtree=aimc]')")
+                    has_aimc = await p.evaluate(
+                        "!!document.querySelector('[data-subtree=aimc]')")
                     if has_aimc:
                         return CompletionResult(True, "text")
             except Exception:
@@ -444,14 +397,12 @@ class GoogleAIClient:
             md = re.sub(r'==+([^=]+)==+', r'\1', md)
             md = re.sub(r'!\[[^\]]*\]\(data:image\/[^)]+\)', '', md)
             md = re.sub(r'\[\]\([^)]*\)', '', md)
-            # Split off the Sources section so we don't cut it with noise
             body = md
             sources = ""
             si = md.rfind("## Sources")
             if si >= 0:
                 body = md[:si].strip()
                 sources = md[si:]
-            # Line-based cutoff: find first noise line and cut there
             lines = body.split("\n")
             cut_idx = None
             for i, line in enumerate(lines):
@@ -461,7 +412,6 @@ class GoogleAIClient:
                     break
             if cut_idx is not None:
                 lines = lines[:cut_idx]
-            # Strip trailing standalone noise lines (buttons, share UI)
             noise_lines = {
                 "Copy", "# Share public link", "Share public link",
                 "Good response", "Bad response", "More",
@@ -485,7 +435,7 @@ class GoogleAIClient:
 
     # ── CAPTCHA detection ─────────────────────────────────────────
 
-    async def _detect_captcha(self, p) -> str | None:
+    async def _detect_captcha(self, p: CDPPage) -> str | None:
         """Returns a reason string if CAPTCHA or blocking is detected, None otherwise."""
         try:
             if any(i in p.url.lower() for i in CAPTCHA_INDICATORS):
@@ -501,7 +451,7 @@ class GoogleAIClient:
 
     # ── File upload ───────────────────────────────────────────────
 
-    async def _upload_files(self, p, upload_urls: list[str]) -> bool:
+    async def _upload_files(self, p: CDPPage, upload_urls: list[str]) -> bool:
         """Upload files via DragEvent drop through the browser."""
         if not upload_urls:
             return False
@@ -523,7 +473,7 @@ class GoogleAIClient:
                     ext = os.path.splitext(path.lower())[1]
                     name = os.path.basename(path)
                     mime = MIME_MAP.get(ext, 'application/octet-stream')
-                    ok = await p.evaluate("""async ({b64, mime, name}) => {
+                    ok = await p.call_function("""async ({b64, mime, name}) => {
                         const r = await fetch(`data:${mime};base64,${b64}`);
                         const blob = await r.blob();
                         const f = new File([blob], name, {type: mime});
@@ -544,7 +494,7 @@ class GoogleAIClient:
                         await asyncio.sleep(1)
                     continue
                 # Remote URL
-                ok = await p.evaluate("""async (url) => {
+                ok = await p.call_function("""async (url) => {
                     const resp = await fetch(url);
                     if (!resp.ok) return {error: `HTTP ${resp.status}`};
                     const blob = await resp.blob();
@@ -575,7 +525,7 @@ class GoogleAIClient:
                     b64 = base64.b64encode(resp.content).decode('ascii')
                     ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower() or '.bin'
                     mime = MIME_MAP.get(ext, resp.headers.get('content-type', 'application/octet-stream'))
-                    ok2 = await p.evaluate("""async ({b64, mime, name}) => {
+                    ok2 = await p.call_function("""async ({b64, mime, name}) => {
                         const r = await fetch(`data:${mime};base64,${b64}`);
                         const blob = await r.blob();
                         const f = new File([blob], name, {type: mime});
@@ -607,10 +557,12 @@ class GoogleAIClient:
                 pass
             self._page = None
 
+
 # ── Singleton accessor ────────────────────────────────────────────
 
 _gaiclient: GoogleAIClient | None = None
 _gai_lock = asyncio.Lock()
+
 
 async def get_gai_client(cdp_url: str | None = None) -> GoogleAIClient | None:
     """Get or create the singleton GAI client. No availability check — handled by search()."""
@@ -625,24 +577,25 @@ async def get_gai_client(cdp_url: str | None = None) -> GoogleAIClient | None:
             return None
         # Quick liveness check — connect to CDP, create one page, close it
         try:
-            b = await _get_browser()
-            ctx = b.contexts[0]
-            p = await _create_hidden_page(ctx)
+            session = await get_cdp_session(url)
+            if not session:
+                return None
+            p = await session.create_page()
             try:
                 await p.add_init_script(ANTI_DETECT_JS)
-                await p.goto("about:blank", timeout=10000)
+                await p.evaluate("1+1")
             finally:
                 await p.close()
-                asyncio.ensure_future(_cleanup_orphan_tabs())
             _gaiclient = GoogleAIClient(cdp_url=url)
             return _gaiclient
         except Exception as e:
             logger.warning("GAI CDP check failed: %s", e)
             return None
 
+
 async def gai_shutdown():
     """Shutdown the GAI client and CDP connection."""
     global _gaiclient
     if _gaiclient:
         _gaiclient = None
-    await _shutdown()
+    await close_cdp()
