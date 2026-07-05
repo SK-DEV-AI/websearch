@@ -170,13 +170,12 @@ class GoogleAIClient:
         Returns {"success": bool, "result": {"answer": str, "sources": list, "followUp": str}}
         or {"success": False, "error": str}.
         """
-        session = await get_cdp_session()
-        if not session:
+        try:
+            p = await _get_optimized_page(block_resources=False)
+        except ConnectionError:
             return {"success": False, "error": "Cannot connect to Helium CDP"}
-        p = await session.create_page()
         self._page = p
         try:
-            await p.add_init_script(ANTI_DETECT_JS)
 
             # ── Navigate ──
             final_query = " ".join(filter(None, [query, search_prompt]))
