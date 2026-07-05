@@ -279,7 +279,11 @@ class GoogleAIClient:
                 const ansHtml = (() => {
                     if (!lastTurn) return '';
                     const c = lastTurn.cloneNode(true);
-                    for (const e of c.querySelectorAll('[role=button], button, style, script')) e.remove();
+                    for (const e of c.querySelectorAll('button, style, script')) e.remove();
+                    for (const e of c.querySelectorAll('[role=button]')) {
+                        const txt = document.createTextNode(' ' + e.textContent + ' ');
+                        e.parentNode.replaceChild(txt, e);
+                    }
                     for (const m of c.querySelectorAll('.citation-marker')) m.remove();
                     return c.innerHTML;
                 })();

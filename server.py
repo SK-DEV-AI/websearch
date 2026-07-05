@@ -214,8 +214,9 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
             count = min(safe_int(arguments.get("count",10)), MAX_RESULTS)
             depth = safe_int(arguments.get("depth",1))
             lang = str(arguments.get("language","en"))
+            google_ai_only = bool(arguments.get("google_ai_only", False))
             r = await search_multi(query, count=max(count, depth * 3),
-                google_ai_only=bool(arguments.get("google_ai_only",False)),
+                google_ai_only=google_ai_only,
                 search_type=str(arguments.get("search_type","auto")),
                 search_prompt=str(arguments.get("search_prompt","")),
                 pro_mode=bool(arguments.get("pro_mode",False)),
@@ -253,7 +254,9 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                     cdp_url=HELIUM_CDP, count=count, language=lang)
                 if fetched.get("fetched_content"):
                     r["fetched_content"] = fetched["fetched_content"]
-            if r.get("success") and bool(arguments.get("synthesize", True)) and r.get("results"):
+            # Skip Groq synthesis when GAI already returned a full answer
+            skip_synthesis = google_ai_only and r.get("ai_answer")
+            if r.get("success") and bool(arguments.get("synthesize", True)) and r.get("results") and not skip_synthesis:
                 try:
                     top = r["results"][:3]
                     ctx = "\n\n".join(f"[{i+1}] {x.get('title','')}: {x.get('content','')[:400]}"
