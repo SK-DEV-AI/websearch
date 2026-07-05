@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import re
@@ -186,23 +185,17 @@ class GoogleAIClient:
                 for k, v in [("hl", hl), ("gl", gl), ("tbs", tbs), ("pws", pws)]:
                     if v:
                         bare_url += f"&{k}={v}"
-                await p.goto(bare_url, wait_until="domcontentloaded", timeout=20)
+                await p.goto(bare_url, wait_until="domcontentloaded", timeout=20,
+                            referrer="https://www.google.com/")
                 await p.wait_for_load_state("networkidle", timeout=15)
                 cap = await self._detect_captcha(p)
                 if cap:
                     return {"success": False, "error": cap}
                 uploaded = await self._upload_files(p, upload_urls)
                 if uploaded:
-                    await p.evaluate(f"""() => {{
-                        const ta = document.querySelector('textarea');
-                        if (ta) {{ ta.focus(); ta.value = {json.dumps(final_query)};
-                            ta.dispatchEvent(new Event('input', {{bubbles: true}})); }}
-                    }}""")
+                    await p.type_text(final_query, selector="textarea")
                     await asyncio.sleep(0.5)
-                    await p.evaluate("""() => {
-                        const btn = document.querySelector('[aria-label="Send"]');
-                        if (btn) { btn.disabled = false; btn.click(); }
-                    }""")
+                    await p.click('[aria-label="Send"]')
                     await asyncio.sleep(0.3)
             else:
                 params = [f"q={urllib.parse.quote_plus(final_query)}", "udm=50"]
@@ -210,7 +203,8 @@ class GoogleAIClient:
                     if v:
                         params.append(f"{k}={v}")
                 url = f"{GOOGLE_AI_URL}?{'&'.join(params)}"
-                await p.goto(url, wait_until="domcontentloaded", timeout=20)
+                await p.goto(url, wait_until="domcontentloaded", timeout=20,
+                            referrer="https://www.google.com/")
                 cap = await self._detect_captcha(p)
                 if cap:
                     return {"success": False, "error": cap}

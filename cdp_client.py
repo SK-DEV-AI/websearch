@@ -247,7 +247,8 @@ class CDPPage:
     # ── Navigation ────────────────────────────────────────────────
 
     async def goto(
-        self, url: str, wait_until: str = "load", timeout: float = 30
+        self, url: str, wait_until: str = "load", timeout: float = 30,
+        referrer: str = "",
     ) -> dict:
         """Navigate to a URL.
 
@@ -255,9 +256,13 @@ class CDPPage:
             wait_until: ``"commit"`` (return immediately after navigation starts),
                         ``"domcontentloaded"`` (wait for DOM),
                         ``"load"`` (wait for full page load).
+            referrer: Optional HTTP Referer header (helps anti-bot).
         """
+        params = {"url": url}
+        if referrer:
+            params["referrer"] = referrer
         result = await self._session.send(
-            "Page.navigate", {"url": url}, session_id=self._session_id, timeout=timeout
+            "Page.navigate", params, session_id=self._session_id, timeout=timeout
         )
         self._url = url
 
@@ -319,6 +324,100 @@ class CDPPage:
         finally:
             self._session.off("Network.requestWillBeSent", on_activity)
             self._session.off("Network.responseReceived", on_activity)
+
+    # ── Input (keyboard / mouse) ──────────────────────────────────
+
+    async def click(self, selector: str, button: str = "left",
+                    click_count: int = 1) -> bool:
+        """Click an element identified by *selector* via CDP Input domain.
+
+        Uses real browser-level mouse events (not JS .click()).
+        Returns True if the element was found and clicked.
+        """
+        box = await self.evaluate(f"""(s => {{
+            const el = document.querySelector(s);
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            return {{x: r.left + r.width / 2, y: r.top + r.height / 2}};
+        }})({json.dumps(selector)})""")
+        if not box:
+            return False
+        await self._session.send(
+            "Input.dispatchMouseEvent",
+            {"type": "mousePressed", "x": box["x"], "y": box["y"],
+             "button": button, "clickCount": click_count},
+            session_id=self._session_id, timeout=10,
+        )
+        await self._session.send(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseReleased", "x": box["x"], "y": box["y"],
+             "button": button, "clickCount": click_count},
+            session_id=self._session_id, timeout=10,
+        )
+        return True
+
+    async def type_text(self, text: str, selector: str | None = None,
+                        delay_ms: float = 20) -> bool:
+        """Type *text* into an element via CDP Input domain.
+
+        If *selector* is given, focuses the element first.
+        Generates real keyDown/keyPress/keyUp events with inter-key delay.
+        """
+        if selector:
+            await self.evaluate(f"""(s => {{
+                const el = document.querySelector(s);
+                if (el) el.focus();
+            }})({json.dumps(selector)})""")
+            await asyncio.sleep(0.05)
+
+        for ch in text:
+            key = ch
+            code = f"Key{ch.upper()}" if ch.isalpha() else ch
+            await self._session.send(
+                "Input.dispatchKeyEvent",
+                {"type": "keyDown", "key": key, "code": code,
+                 "text": ch, "unmodifiedText": ch},
+                session_id=self._session_id, timeout=10,
+            )
+            await self._session.send(
+                "Input.dispatchKeyEvent",
+                {"type": "keyUp", "key": key, "code": code},
+                session_id=self._session_id, timeout=10,
+            )
+            if delay_ms:
+                await asyncio.sleep(delay_ms / 1000)
+        return True
+
+    async def press_key(self, key: str, code: str = ""):
+        """Press and release a single key via CDP Input domain.
+
+        *key* is the DOM key value (e.g., ``"Enter"``, ``"Escape"``).
+        """
+        if not code:
+            code = key
+        await self._session.send(
+            "Input.dispatchKeyEvent",
+            {"type": "keyDown", "key": key, "code": code},
+            session_id=self._session_id, timeout=10,
+        )
+        await self._session.send(
+            "Input.dispatchKeyEvent",
+            {"type": "keyUp", "key": key, "code": code},
+            session_id=self._session_id, timeout=10,
+        )
+
+    # ── Network utilities ─────────────────────────────────────────
+
+    async def cookies(self, urls: list[str] | None = None) -> list[dict]:
+        """Return all browser cookies (optional URL filter)."""
+        params = {}
+        if urls:
+            params["urls"] = urls
+        result = await self._session.send(
+            "Network.getCookies", params,
+            session_id=self._session_id, timeout=10,
+        )
+        return result.get("cookies", [])
 
     # ── JavaScript ─────────────────────────────────────────────────
 
