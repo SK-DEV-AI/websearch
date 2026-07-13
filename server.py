@@ -43,7 +43,7 @@ async def handle_list_tools() -> list[Tool]:
                 "timelimit": {"type": "string", "description": "Time filter: d/w/m/y"},
                 "safesearch": {"type": "string", "enum": ["off","moderate","strict"], "default": "moderate"},
                 "language": {"type": "string", "default": "en", "description": "Content language for Wikipedia/summaries"},
-                "upload_urls": {"type": "array", "items": {"type": "string"}, "description": "Image/PDF URLs or local file paths for GAI"},
+                "upload_urls": {"type": "array", "items": {"type": "string"}, "description": "GAI file upload: supported formats .avif .bmp .heic .heif .jpeg .pdf .png .webp. 10MB max. Only one file per call (GAI drops all but the last). Local: file:///path or remote URL."},
                 "start_date": {"type": "string", "description": "Tavily date filter start (YYYY-MM-DD)"},
                 "end_date": {"type": "string", "description": "Tavily date filter end (YYYY-MM-DD)"},
                 "synthesize": {"type": "boolean", "default": True, "description": "Groq-synthesize top results into a concise answer with citations"},
