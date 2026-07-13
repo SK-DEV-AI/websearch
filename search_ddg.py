@@ -105,13 +105,17 @@ async def ddgs_extract(url: str, extract_type: str = "markdown") -> dict | None:
 
 
 async def search_google_rss(query: str, count: int = 10, region: str = "en",
-                            retries: int = 2) -> list[dict]:
+                            retries: int = 2, timelimit: str = "") -> list[dict]:
     # Parse region ("us-en", "de-de", "in-en", "fr-fr", etc.) into hl/gl/ceid
     parts = region.split("-")
     hl = parts[0] if len(parts) > 0 else "en"
     gl = parts[1].upper() if len(parts) > 1 else parts[0].upper()
     ceid = f"{gl}:{hl}"
     rss_url = f"{GNEWS_RSS}?q={urllib.parse.quote_plus(query)}&hl={hl}&gl={gl}&ceid={ceid}"
+    rss_time_map = {"d": "1d", "w": "7d", "m": "1m", "y": "1y"}
+    when = rss_time_map.get(timelimit, "")
+    if when:
+        rss_url += f"&when={when}"
     last_err = None
     for attempt in range(retries + 1):
         try:

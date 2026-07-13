@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import urllib.parse
 
 from config import cached
@@ -22,17 +23,30 @@ from resilience import CircuitBreaker
 _ddg_breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=60)
 
 
+# TinyFish intent detection
+_TINYFISH_NEWS = re.compile(r"(?i)\b(news|headlines?|breaking|latest|today|update|coverage|event)\b")
+_TINYFISH_ACADEMIC = re.compile(r"(?i)\b(paper|research|study|arxiv|doi|survey|review|implementation|method|experiment)\b")
+
+
+def _detect_tinyfish_type(query: str) -> str:
+    if _TINYFISH_ACADEMIC.search(query):
+        return "research_paper"
+    if _TINYFISH_NEWS.search(query):
+        return "news"
+    return "web"
+
+
 @cached(ttl=90)
 async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                        google_ai_only: bool = False, search_type: str = "auto",
-                       search_prompt: str = "", pro_mode: bool = False, gl: str = "",
+                        search_prompt: str = "", gl: str = "",
                        hl: str = "en", tbs: str = "", pws: str = "", backend: str = "auto",
                        timelimit: str = "", page: int = 1, region: str = "wt-wt",
                        safesearch: str = "moderate",
                        language: str = "en", country: str = "",
                        upload_urls: list[str] | None = None,
                        query_expand: bool = True,
-                       tavily_topic: str = "general", tavily_depth: str = "basic",
+                        tavily_topic: str = "general", tavily_depth: str = "advanced",
                        domain: str = "",
                        include_domains: list[str] | None = None,
                        exclude_domains: list[str] | None = None,
@@ -56,7 +70,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             return None
         try:
             r = await asyncio.wait_for(gai.search(query, search_prompt=search_prompt,
-                pro_mode=pro_mode, gl=gl, hl=hl, tbs=tbs, pws=pws, upload_urls=upload_urls),
+                gl=gl, hl=hl, tbs=tbs, pws=pws, upload_urls=upload_urls),
                 timeout=300)
             if r.get("success"):
                 return r
@@ -109,17 +123,18 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 license_videos=license_videos))
 
         tasks = {
-            "rss": asyncio.create_task(search_google_rss(query, count, region=region)),
+            "rss": asyncio.create_task(search_google_rss(query, count, region=region, timelimit=timelimit)),
             "tavily": asyncio.create_task(search_tavily(query, n=count, topic=tavily_topic,
                 time_range=tavily_tr or tbs, search_depth=tavily_depth, include_raw_content=True,
                 start_date=start_date, end_date=end_date, exact_phrase=exact_phrase,
                 country=country, include_domains=include_domains, exclude_domains=exclude_domains)),
-            "wiki": asyncio.create_task(search_wikipedia(query, count=min(count, 5), language=language)),
-            "arxiv": asyncio.create_task(search_arxiv(query, count=min(count, 3))),
-            "anysearch": asyncio.create_task(search_anysearch(query, count=min(count, 5), domain=domain,
+            "wiki": asyncio.create_task(search_wikipedia(query, count=min(count, 8), language=language)),
+            "arxiv": asyncio.create_task(search_arxiv(query, count=min(count, 10))),
+            "anysearch": asyncio.create_task(search_anysearch(query, count=min(count, 20), domain=domain,
                 tag=anysearch_tag, zone=anysearch_zone, language=anysearch_language,
                 params=anysearch_params)),
-            "tinyfish": asyncio.create_task(tinyfish_search(query, count=min(count, 5))),
+            "tinyfish": asyncio.create_task(tinyfish_search(query, count=min(count, 50),
+                domain_type=_detect_tinyfish_type(query), goal=query)),
             **ddg_tasks,
         }
         done = await asyncio.gather(*tasks.values(), return_exceptions=True)

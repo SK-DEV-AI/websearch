@@ -29,6 +29,7 @@ async def tinyfish_search(
     after_date: str = "",
     before_date: str = "",
     page: int = 0,
+    goal: str = "",
 ) -> list[dict]:
     """Search via TinyFish API. Returns list of {title, url, snippet, source}."""
     key = _next_key()
@@ -38,6 +39,8 @@ async def tinyfish_search(
     params: dict[str, Any] = {"q": query, "n": min(count, 50)}
     if domain_type in ("web", "news", "research_paper"):
         params["domain_type"] = domain_type
+    if goal:
+        params["goal"] = goal[:200]
     if location:
         params["location"] = location
     if language:

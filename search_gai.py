@@ -161,7 +161,7 @@ class GoogleAIClient:
         self._cdp_url = cdp_url or HELIUM_CDP
         self._page: CDPPage | None = None
 
-    async def search(self, query: str, search_prompt: str = "", pro_mode: bool = False,
+    async def search(self, query: str, search_prompt: str = "",
                      gl: str = "", hl: str = "en", tbs: str = "", pws: str = "",
                      upload_urls: list[str] | None = None) -> dict:
         """Execute a single search via Google AI Mode.
