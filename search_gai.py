@@ -192,9 +192,10 @@ class GoogleAIClient:
                     return {"success": False, "error": cap}
                 uploaded = await self._upload_files(p, upload_urls)
                 if uploaded:
+                    await asyncio.sleep(1)
                     await p.type_text(final_query, selector="textarea")
                     await asyncio.sleep(0.5)
-                    await p.click('[aria-label="Send"]')
+                    await p.evaluate('document.querySelector(\'[aria-label="Send"]\')?.click()')
                     await asyncio.sleep(0.3)
             else:
                 params = [f"q={urllib.parse.quote_plus(final_query)}", "udm=50"]

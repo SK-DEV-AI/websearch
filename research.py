@@ -94,16 +94,19 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 _ddg_breaker.record_failure()
                 return []
 
-        ddg_tasks = {f"ddg_{i}": asyncio.create_task(_ddg_with_breaker(
-            q, ddg_count, search_type=search_type, backend=backend,
-            timelimit=timelimit, page=page, region=region, safesearch=safesearch,
-            size=size, color=color, type_image=type_image, layout=layout,
-            license_image=license_image, resolution=resolution, duration=duration,
-            license_videos=license_videos))
-            for i, q in enumerate(queries)}
-
         tr_map = {"d": "day", "w": "week", "m": "month", "y": "year"}
         tavily_tr = tr_map.get(timelimit, "")
+
+        ddg_tasks = {}
+        for i, q in enumerate(queries):
+            k = f"ddg_{i}"
+            ddg_tasks[k] = asyncio.create_task(_ddg_with_breaker(
+                q, ddg_count, search_type=search_type, backend=backend,
+                timelimit=timelimit, page=page, region=region, safesearch=safesearch,
+                size=size, color=color, type_image=type_image, layout=layout,
+                license_image=license_image, resolution=resolution, duration=duration,
+                license_videos=license_videos))
+
         tasks = {
             "rss": asyncio.create_task(search_google_rss(query, count, region=region)),
             "tavily": asyncio.create_task(search_tavily(query, n=count, topic=tavily_topic,

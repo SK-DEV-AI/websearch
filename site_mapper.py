@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import gzip
 import html as html_mod
-import io
 import logging
 import re
 import xml.parsers.expat
 import urllib.parse
-from html.parser import HTMLParser
 from typing import Any
 
 import httpx
@@ -58,7 +55,6 @@ async def map_site(
     seen: set[str] = set()
     results: list[dict[str, Any]] = []
     source = "none"
-    discover_urls = set()
     c = get_http_client()
 
     if include_sitemap:
@@ -314,7 +310,6 @@ def _parse_xml_fallback(
             in_loc = False
 
     def data(text: str) -> None:
-        nonlocal in_loc
         if in_loc and text.strip():
             url = _clean_url(text.strip())
             if url:

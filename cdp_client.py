@@ -361,7 +361,8 @@ class CDPPage:
         """Type *text* into an element via CDP Input domain.
 
         If *selector* is given, focuses the element first.
-        Generates real keyDown/keyPress/keyUp events with inter-key delay.
+        Uses ``Input.insertText`` for reliable character insertion.
+        ``delay_ms`` is preserved for API compatibility (unused — insertText is instant).
         """
         if selector:
             await self.evaluate(f"""(s => {{
@@ -370,22 +371,11 @@ class CDPPage:
             }})({json.dumps(selector)})""")
             await asyncio.sleep(0.05)
 
-        for ch in text:
-            key = ch
-            code = f"Key{ch.upper()}" if ch.isalpha() else ch
+        if text:
             await self._session.send(
-                "Input.dispatchKeyEvent",
-                {"type": "keyDown", "key": key, "code": code,
-                 "text": ch, "unmodifiedText": ch},
+                "Input.insertText", {"text": text},
                 session_id=self._session_id, timeout=10,
             )
-            await self._session.send(
-                "Input.dispatchKeyEvent",
-                {"type": "keyUp", "key": key, "code": code},
-                session_id=self._session_id, timeout=10,
-            )
-            if delay_ms:
-                await asyncio.sleep(delay_ms / 1000)
         return True
 
     async def press_key(self, key: str, code: str = ""):

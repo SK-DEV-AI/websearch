@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import math
 import struct
 from typing import Any
@@ -10,7 +9,7 @@ import httpx
 
 import asyncio
 
-from config import NV_KEY, NV_BASE, NV_EMBED_MODEL, _cache, _MAX_CACHE, _cached, _set_cache, get_http_client
+from config import NV_KEY, NV_BASE, NV_EMBED_MODEL, _cached, _set_cache, get_http_client
 
 _NV_KEYS: list[str] = [k.strip() for k in NV_KEY.split(",") if k.strip()] if NV_KEY else []
 _nv_idx = 0

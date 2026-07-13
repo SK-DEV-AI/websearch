@@ -12,8 +12,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool
 
 from config import MAX_RESULTS, HELIUM_CDP
-from search_ddg import search_ddg, ddgs_extract
-from search_gai import GoogleAIClient, get_gai_client
+from search_ddg import ddgs_extract
 from fetch import fetch_url, scrapling_stealthy_fetch
 from crawl import crawl_url
 from pdf_extract import extract_pdf
@@ -28,6 +27,7 @@ from wikipedia import (search_wikipedia, fetch_wikipedia_summary, fetch_wikipedi
 from arxiv import search_arxiv
 from site_mapper import map_site
 from research import search_multi, enrich
+from extract import extract_content
 
 server = Server("websearch")
 
@@ -156,6 +156,17 @@ async def handle_list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "extract_type": {"type": "string", "enum": ["markdown","text_plain","raw"], "default": "markdown"}},
                 "required": ["url"]}),
+         Tool(name="extract",
+            description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Uses crawl4ai to crawl the page and apply the chosen extraction strategy. For LLM strategy, describe what you want (e.g., 'extract product name, price, and rating') and get clean JSON back. For CSS strategy, provide field names to extract via heuristic selectors. No CSS selector maintenance needed.",
+            inputSchema={"type": "object", "properties": {
+                "url": {"type": "string", "description": "Target URL to extract data from"},
+                "instruction": {"type": "string", "description": "Natural language extraction instruction (used with strategy=llm). Example: 'extract all product names, prices, and ratings from this page'"},
+                "strategy": {"type": "string", "enum": ["llm", "css", "regex"], "default": "llm", "description": "llm=AI-powered extraction (needs GROQ_API_KEYS), css=CSS-selector-based extraction (fast, free), regex=pattern-based extraction (emails, phones, URLs)"},
+                "fields": {"type": "array", "items": {"type": "string"}, "description": "List of field names for extraction (e.g. ['name', 'price', 'rating']). Used with strategy=css or strategy=llm"},
+                "chunk_threshold": {"type": "integer", "default": 2000, "description": "Max tokens per chunk for LLM extraction (lower = cheaper, higher = more context)"},
+                "css_selector": {"type": "string", "description": "CSS selector for the container element (used with strategy=css). Defaults to 'body'"},
+                "provider": {"type": "string", "default": "groq/meta-llama/llama-4-scout-17b-16e-instruct", "description": "LLM provider string in LiteLLM format (e.g. groq/meta-llama/llama-4-scout-17b-16e-instruct, openai/gpt-4o, ollama/llama2)"}},
+                "required": ["url"]}),
          Tool(name="pdf_extract",
             description="PDF to structured data via opendataloader-pdf. Extracts text, tables, formulas, images with bounding boxes. Supports scanned PDFs (OCR), complex tables, and accessibility tagging.",
             inputSchema={"type": "object", "properties": {
@@ -271,7 +282,7 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                         resp = await c.post(
                             "https://api.groq.com/openai/v1/chat/completions",
                             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                            json={"model": "llama-3.3-70b-versatile",
+                            json={"model": "meta-llama/llama-4-scout-17b-16e-instruct",
                                   "messages": [{"role": "system", "content": "Answer concisely from sources. Use [N] citations like [1][2]."},
                                                {"role": "user", "content": f"Query: {query}\n\nResults:\n{ctx}"}],
                                   "temperature": 0.3, "max_tokens": 256}, timeout=15)
@@ -305,9 +316,14 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
             status = r.get("status", 0)
             r_error = (r.get("error", "") or "").lower()
             content_lower = content.lower()
+            # Scan content for Cloudflare indicators even if httpx path missed them
+            cf_hits = sum(1 for kw in ["just a moment", "checking your browser",
+                           "cf-challenge", "__cf_chl_", "cf-turnstile",
+                           "verify you are human", "attention required"]
+                          if kw in content_lower[:800])
             should_retry = (
                 not r.get("success") and "cloudflare" in r_error
-            ) or status in (403, 429, 503) or (
+            ) or status in (403, 429, 503) or cf_hits >= 2 or (
                 len(content) < 300 and (
                     "blocked" in content_lower or "access denied" in content_lower
                     or "network security" in content_lower or "rate limit" in content_lower
@@ -476,6 +492,17 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
             r = await ddgs_extract(url=str(arguments.get("url", "")),
                 extract_type=str(arguments.get("extract_type", "markdown")))
             return _res({"success": True, "result": r})
+        elif name == "extract":
+            r = await extract_content(
+                url=str(arguments["url"]),
+                instruction=str(arguments.get("instruction") or "").strip() or None,
+                strategy=str(arguments.get("strategy", "llm")),
+                fields=arguments.get("fields"),
+                chunk_threshold=safe_int(arguments.get("chunk_threshold", 2000)),
+                css_selector=str(arguments.get("css_selector") or "").strip() or None,
+                provider=str(arguments.get("provider", "")).strip() or None,
+            )
+            return _res(r)
         elif name == "pdf_extract":
             paths = arguments.get("input_path", [])
             if isinstance(paths, str):

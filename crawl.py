@@ -168,7 +168,6 @@ async def crawl_url(
                 texts = [(p.get("url", "") or "")[:200] for p in pages]
                 item_emb = await _embed(texts, "passage")
                 if item_emb:
-                    q_emb = item_emb[0] if item_emb else None
                     deduped_pages = []
                     deduped_indices = []
                     seen_emb: list[list[float]] = []

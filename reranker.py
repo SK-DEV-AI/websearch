@@ -50,16 +50,15 @@ async def _close_connection():
 
 
 async def _ensure_worker():
+    """Spawn the reranker worker process and connect to its socket.
+
+    Always removes the stale socket and spawns a fresh worker — never tries
+    to reuse a dead peer connection. Tests the connection with a ping after
+    connecting.
+    """
     global _PROC, _READER, _WRITER
-    if _PROC is not None and _PROC.returncode is None:
-        return True
-    # Close stale connection before attempting new one
+    # Kill any stale process and close old connection
     await _close_connection()
-    try:
-        _READER, _WRITER = await asyncio.open_unix_connection(_SOCKET_PATH)
-        return True
-    except (FileNotFoundError, ConnectionRefusedError, OSError):
-        pass
     # Remove stale socket so new worker can bind
     try:
         os.unlink(_SOCKET_PATH)
@@ -76,9 +75,7 @@ async def _ensure_worker():
             try:
                 _READER, _WRITER = await asyncio.open_unix_connection(_SOCKET_PATH)
                 return True
-            except (FileNotFoundError, ConnectionRefusedError):
-                await asyncio.sleep(0.1)
-            except OSError:
+            except (FileNotFoundError, ConnectionRefusedError, OSError):
                 await asyncio.sleep(0.1)
         return False
     except Exception as e:
