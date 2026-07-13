@@ -62,8 +62,8 @@ async def handle_list_tools() -> list[Tool]:
                 "target_language": {"type": "string"},
                 "output_format": {"type": "string", "enum": ["markdown","txt","json","xml","csv"], "default": "markdown"},
                 "fast": {"type": "boolean"},
-                   "raw": {"type": "boolean", "description": "Skip CDP/trafilatura, return raw text directly (use for GitHub raw files, pastebin, etc.)"},
-                   "network_idle": {"type": "boolean", "default": True, "description": "Wait for network idle before extracting (slower but captures JS-rendered content)"},
+                "raw": {"type": "boolean", "description": "Skip CDP/trafilatura, return raw text directly (use for GitHub raw files, pastebin, etc.)"},
+                "network_idle": {"type": "boolean", "default": True, "description": "Wait for network idle before extracting (slower but captures JS-rendered content)"},
                    "include_images": {"type": "boolean", "default": True, "description": "Include image captions/alt text"},
                    "include_links": {"type": "boolean", "default": True, "description": "Include hyperlinks in output"},
                    "include_formatting": {"type": "boolean", "default": True, "description": "Preserve text formatting (bold, italic, etc)"},
@@ -229,42 +229,25 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
             r = await search_multi(query, count=max(count, depth * 3),
                 google_ai_only=google_ai_only,
                 search_type=str(arguments.get("search_type","auto")),
-                search_prompt=str(arguments.get("search_prompt","")),
-                pro_mode=bool(arguments.get("pro_mode",False)),
-                gl=str(arguments.get("gl","")), hl=str(arguments.get("hl","en")),
-                tbs=str(arguments.get("tbs","")), pws=str(arguments.get("pws","")),
-                backend=str(arguments.get("backend","auto")),
                 timelimit=str(arguments.get("timelimit","")),
-                page=safe_int(arguments.get("page",1)),
-                region=str(arguments.get("region","wt-wt")),
                 safesearch=str(arguments.get("safesearch","moderate")),
                 language=lang,
-                country=str(arguments.get("country","")),
                 upload_urls=arguments.get("upload_urls"),
-                query_expand=bool(arguments.get("query_expand",True)),
-                tavily_topic=str(arguments.get("tavily_topic","general")),
-                tavily_depth=str(arguments.get("tavily_depth","basic")),
-                size=str(arguments.get("size","")),
-                color=str(arguments.get("color","")),
-                type_image=str(arguments.get("type_image","")),
-                layout=str(arguments.get("layout","")),
-                license_image=str(arguments.get("license_image","")),
-                resolution=str(arguments.get("resolution","")),
-                duration=str(arguments.get("duration","")),
-                license_videos=str(arguments.get("license_videos","")),
                 start_date=str(arguments.get("start_date","")),
                 end_date=str(arguments.get("end_date","")),
-                exact_phrase=bool(arguments.get("exact_phrase",False)),
                 domain=str(arguments.get("domain","")),
                 anysearch_tag=str(arguments.get("anysearch_tag","")),
                 anysearch_zone=str(arguments.get("anysearch_zone","")),
                 anysearch_language=str(arguments.get("anysearch_language","")),
                 cdp_url=HELIUM_CDP)
             if r.get("success") and depth >= 2 and r.get("results"):
-                fetched = await enrich(r["results"], query, depth=depth,
-                    cdp_url=HELIUM_CDP, count=count, language=lang)
-                if fetched.get("fetched_content"):
-                    r["fetched_content"] = fetched["fetched_content"]
+                try:
+                    fetched = await enrich(r["results"], query, depth=depth,
+                        cdp_url=HELIUM_CDP, count=count, language=lang)
+                    if fetched.get("fetched_content"):
+                        r["fetched_content"] = fetched["fetched_content"]
+                except Exception:
+                    pass
             # Skip Groq synthesis when GAI already returned a full answer
             skip_synthesis = google_ai_only and r.get("ai_answer")
             if r.get("success") and bool(arguments.get("synthesize", True)) and r.get("results") and not skip_synthesis:
@@ -294,22 +277,13 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
         elif name == "fetch":
             r = await fetch_url(arguments["url"],
                     max_chars=safe_int(arguments.get("max_chars",5000)),
-                    main_content_only=bool(arguments.get("main_content_only",True)),
                     target_language=str(arguments.get("target_language","")),
-                    favor_precision=bool(arguments.get("favor_precision",False)),
-                    favor_recall=bool(arguments.get("favor_recall",False)),
                     fast=bool(arguments.get("fast",False)),
-                    deduplicate=bool(arguments.get("deduplicate",True)),
                     output_format=str(arguments.get("output_format","markdown")),
                     include_images=bool(arguments.get("include_images",True)),
                     include_tables=bool(arguments.get("include_tables",True)),
-                    include_comments=bool(arguments.get("include_comments",True)),
                     include_formatting=bool(arguments.get("include_formatting",True)),
                     include_links=bool(arguments.get("include_links",True)),
-                    prune_xpath=str(arguments.get("prune_xpath","")),
-                    url_blacklist=str(arguments.get("url_blacklist","")),
-                    author_blacklist=str(arguments.get("author_blacklist","")),
-                    min_output_size=safe_int(arguments.get("min_output_size", 0)),
                     raw=bool(arguments.get("raw", False)))
             # Auto-fallback: if Cloudflare/403/blocked/empty content, retry via CDP
             content = (r.get("content", "") or "").strip()
@@ -361,7 +335,6 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                 exclude_domains=arguments.get("exclude_domains"),
                 content_filter=str(arguments.get("content_filter","")),
                 filter_query=str(arguments.get("filter_query","")),
-                css_extract=arguments.get("css_extract"),
                 page_timeout=safe_int(arguments.get("page_timeout",60000)),
                 check_robots_txt=bool(arguments.get("check_robots_txt",False)),
                 capture_console_messages=bool(arguments.get("capture_console_messages",False)),

@@ -76,14 +76,13 @@ AI_MODE_BLOCKED = [
     "le mode ia n'est pas disponible",
 ]
 
+# GAI only accepts images + PDF — other formats silently fail on the backend
 MIME_MAP = {
-    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-    '.gif': 'image/gif', '.webp': 'image/webp', '.pdf': 'application/pdf',
-    '.svg': 'image/svg+xml', '.bmp': 'image/bmp', '.avif': 'image/avif',
-    '.mp4': 'video/mp4', '.mov': 'video/mp4', '.mp3': 'audio/mpeg',
-    '.wav': 'audio/wav', '.ogg': 'audio/ogg',
-    '.txt': 'text/plain', '.md': 'text/markdown', '.csv': 'text/csv',
-    '.json': 'application/json', '.xml': 'text/xml', '.html': 'text/html',
+    '.avif': 'image/avif', '.bmp': 'image/bmp',
+    '.heic': 'image/heic', '.heif': 'image/heif',
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.png': 'image/png', '.webp': 'image/webp',
+    '.pdf': 'application/pdf',
 }
 
 ANTI_DETECT_JS = """
@@ -255,8 +254,7 @@ class GoogleAIClient:
                         const marker = document.createElement('span');
                         marker.className = 'citation-marker';
                         marker.innerHTML = '<code>[CITE-' + i + ']</code>';
-                        ref = buttons[i].nextSibling ? buttons[i] : buttons[i];
-                        ref.parentNode.insertBefore(marker, ref.nextSibling);
+                        buttons[i].parentNode.insertBefore(marker, buttons[i].nextSibling);
                         try { buttons[i].click(); } catch(e) {}
                     }
                 }""", CITATION_SELECTORS)
