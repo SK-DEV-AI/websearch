@@ -15,7 +15,6 @@ import asyncio
 import base64
 import json
 import logging
-import time
 from typing import Any, Callable
 
 import httpx
@@ -230,7 +229,7 @@ class CDPPage:
         self._nav_listener = None
 
     async def _init(self):
-        """Enable page-level CDP events and register navigation tracking."""
+        """Enable page-level CDP events and register navigation + lifecycle tracking."""
         # Track main frame URL changes
         def on_frame_navigated(params, sess_id):
             if sess_id == self._session_id:
@@ -241,7 +240,22 @@ class CDPPage:
         self._nav_listener = on_frame_navigated
         self._session.on("Page.frameNavigated", on_frame_navigated)
 
+        # Lifecycle events: resolve futures per event name
+        self._lifecycle_futures: dict[str, asyncio.Future] = {}
+
+        def on_lifecycle(params, sess_id):
+            if sess_id == self._session_id:
+                name = params.get("name", "")
+                fut = self._lifecycle_futures.get(name)
+                if fut and not fut.done():
+                    fut.set_result(True)
+
+        self._lifecycle_listener = on_lifecycle
+        self._session.on("Page.lifecycleEvent", on_lifecycle)
+
         await self._session.send("Page.enable", session_id=self._session_id)
+        await self._session.send("Page.setLifecycleEventsEnabled",
+                                 {"enabled": True}, session_id=self._session_id)
         await self._session.send("Runtime.enable", session_id=self._session_id)
 
     # ── Navigation ────────────────────────────────────────────────
@@ -255,7 +269,8 @@ class CDPPage:
         Args:
             wait_until: ``"commit"`` (return immediately after navigation starts),
                         ``"domcontentloaded"`` (wait for DOM),
-                        ``"load"`` (wait for full page load).
+                        ``"load"`` (wait for full page load),
+                        ``"networkidle"`` (wait for network to be idle).
             referrer: Optional HTTP Referer header (helps anti-bot).
         """
         params = {"url": url}
@@ -270,60 +285,46 @@ class CDPPage:
         if error:
             raise Exception(f"Navigation error: {error}")
 
-        if wait_until in ("domcontentloaded", "load"):
-            target = "interactive" if wait_until == "domcontentloaded" else "complete"
-            await self._wait_ready_state(target, timeout)
-
+        await self.wait_for_load_state(wait_until, timeout)
         return result
 
-    async def _wait_ready_state(self, target: str, timeout: float):
-        """Poll document.readyState until target is reached (or exceeded)."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                rs = await self.evaluate("document.readyState")
-                if rs == "complete" or (
-                    target == "interactive" and rs in ("interactive", "complete")
-                ):
-                    return
-            except Exception:
-                pass
-            await asyncio.sleep(0.1)
+    async def _wait_lifecycle(self, event_name: str, timeout: float):
+        """Wait for a *lifecycleEvent* (event-driven, no polling)."""
+        # Clear any stale future from a prior navigation
+        old = self._lifecycle_futures.pop(event_name, None)
+        if old and not old.done():
+            old.cancel()
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._lifecycle_futures[event_name] = fut
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._lifecycle_futures.pop(event_name, None)
+        except asyncio.CancelledError:
+            self._lifecycle_futures.pop(event_name, None)
+            raise
 
     async def wait_for_load_state(
         self, state: str = "domcontentloaded", timeout: float = 30
     ):
-        """Wait for a page load milestone.
+        """Wait for a page load milestone via CDP events (no polling).
 
-        Supports ``"domcontentloaded"``, ``"load"``, and ``"networkidle"``.
+        Supports ``"commit"``, ``"domcontentloaded"``, ``"load"``, and ``"networkidle"``.
+        ``"networkidle"`` uses ``networkAlmostIdle`` from lifecycle events.
         """
-        if state == "networkidle":
-            await self._wait_network_idle(timeout)
+        LIFECYCLE_MAP = {
+            "commit": "commit",
+            "domcontentloaded": "DOMContentLoaded",
+            "load": "load",
+            "networkidle": "networkAlmostIdle",
+        }
+        name = LIFECYCLE_MAP.get(state)
+        if name:
+            await self._wait_lifecycle(name, timeout)
         else:
-            target = "interactive" if state == "domcontentloaded" else "complete"
-            await self._wait_ready_state(target, timeout)
-
-    async def _wait_network_idle(self, timeout: float, quiet_ms: int = 500):
-        """Wait until no network activity for *quiet_ms*."""
-        deadline = time.monotonic() + timeout
-        last_activity = time.monotonic()
-
-        def on_activity(_params, sess_id):
-            if sess_id == self._session_id:
-                nonlocal last_activity
-                last_activity = time.monotonic()
-
-        self._session.on("Network.requestWillBeSent", on_activity)
-        self._session.on("Network.responseReceived", on_activity)
-        try:
-            await self._session.send("Network.enable", session_id=self._session_id)
-            while time.monotonic() < deadline:
-                if time.monotonic() - last_activity >= quiet_ms / 1000:
-                    return
-                await asyncio.sleep(0.2)
-        finally:
-            self._session.off("Network.requestWillBeSent", on_activity)
-            self._session.off("Network.responseReceived", on_activity)
+            raise ValueError(f"Unknown load state: {state}")
 
     # ── Input (keyboard / mouse) ──────────────────────────────────
 
@@ -542,13 +543,97 @@ class CDPPage:
     # ── Resource blocking ──────────────────────────────────────────
 
     async def set_blocked_resources(self, patterns: list[str]):
-        """Block network requests matching URL patterns."""
-        await self._session.send("Network.enable", session_id=self._session_id)
+        """Block network requests matching URL patterns.
+
+        Uses zero buffer caps (``maxResourceBufferSize=0``) so Chrome
+        does not keep response bodies in memory — only event metadata
+        is tracked, saving RAM on concurrent pages.
+        """
+        await self._session.send(
+            "Network.enable",
+            {"maxTotalBufferSize": 0, "maxResourceBufferSize": 0, "maxPostDataSize": 0},
+            session_id=self._session_id,
+        )
         await self._session.send(
             "Network.setBlockedURLs",
             {"urls": patterns},
             session_id=self._session_id,
         )
+
+    async def disable_images(self):
+        """Prevent image bytes from entering the renderer at the engine level.
+
+        Saves RAM and bandwidth on text-only fetches by telling Chrome
+        to skip decoding all image types. Call before ``goto()``.
+        """
+        await self._session.send(
+            "Emulation.setDisabledImageTypes",
+            {"imageTypes": ["avif", "webp", "png", "jpeg", "gif", "svg", "ico", "bmp"]},
+            session_id=self._session_id,
+        )
+
+    # ── Security & behavior ──────────────────────────────────────
+
+    async def set_download_behavior(self, behavior: str = "deny"):
+        """Prevent stray file downloads from consuming disk/RAM."""
+        await self._session.send(
+            "Browser.setDownloadBehavior", {"behavior": behavior},
+        )
+
+    async def ignore_certificate_errors(self, ignore: bool = True):
+        """Ignore TLS certificate errors (for CDP fallback on HTTPS sites)."""
+        await self._session.send(
+            "Security.setIgnoreCertificateErrors", {"ignore": ignore},
+        )
+
+    # ── JS safety ─────────────────────────────────────────────────
+
+    async def terminate_execution(self):
+        """Kill running JS in the page.
+
+        Use when a hung script blocks page interaction or extraction.
+        """
+        try:
+            await self._session.send(
+                "Runtime.terminateExecution", {},
+                session_id=self._session_id, timeout=5,
+            )
+        except Exception:
+            pass
+
+    # ── Diagnostics ──────────────────────────────────────────────
+
+    async def dom_counters(self) -> dict:
+        """Return DOM node counters (documents, nodes, jsEventListeners)."""
+        try:
+            return (await self._session.send(
+                "Memory.getDOMCounters", {},
+                session_id=self._session_id, timeout=5,
+            )).get("result", {})
+        except Exception:
+            return {"documents": 0, "nodes": 0, "jsEventListeners": 0}
+
+    async def get_ax_tree(self, depth: int = 5) -> list[dict]:
+        """Return the AX tree via **Accessibility.getFullAXTree**.
+
+        Fallback when ``Page.captureSnapshot`` ``mode="ai"`` output
+        is not usable. Enables/disables Accessibility per-call.
+        """
+        try:
+            await self._session.send(
+                "Accessibility.enable", {},
+                session_id=self._session_id, timeout=5,
+            )
+            result = await self._session.send(
+                "Accessibility.getFullAXTree", {"depth": depth},
+                session_id=self._session_id, timeout=10,
+            )
+            return result.get("nodes", [])
+        finally:
+            await self._session.send(
+                "Accessibility.disable", {},
+                session_id=self._session_id, timeout=5,
+            )
 
     # ── Close ──────────────────────────────────────────────────────
 

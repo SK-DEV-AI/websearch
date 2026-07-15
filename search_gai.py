@@ -116,6 +116,8 @@ async def _get_optimized_page(block_resources: bool = True) -> CDPPage:
     """Create a hidden CDP page with anti-detection JS and optional resource blocking.
 
     Used by fetch.py, screenshot.py, and crawl.py for stealth CDP operations.
+    Also applies protective defaults: disable images, deny downloads,
+    ignore cert errors, and (optionally) block resource URLs.
     """
     async with _page_semaphore:
         session = await get_cdp_session()
@@ -124,6 +126,10 @@ async def _get_optimized_page(block_resources: bool = True) -> CDPPage:
         page = await session.create_page()
         try:
             await page.add_init_script(ANTI_DETECT_JS)
+            # Protective defaults — save RAM, prevent leaks, avoid hangs
+            await page.disable_images()
+            await page.set_download_behavior("deny")
+            await page.ignore_certificate_errors(True)
             if block_resources:
                 try:
                     await page.set_blocked_resources(RESOURCE_BLOCK_PATTERNS)
@@ -346,6 +352,10 @@ class GoogleAIClient:
             }
         except Exception as e:
             logger.exception("GAI search failed")
+            try:
+                await p.terminate_execution()
+            except Exception:
+                pass
             return {"success": False, "error": f"{type(e).__name__}: {e}"}
         finally:
             try:
@@ -378,7 +388,7 @@ class GoogleAIClient:
                 body = await p.evaluate("document.body.innerText")
                 for err in GAI_ERROR_TEXT_INDICATORS:
                     if err in body.lower():
-                        # GAI returned an error page — no point waiting for timeout
+                        await p.terminate_execution()
                         return CompletionResult(False, err)
                 if any(ind in body for ind in AI_COMPLETION_TEXT_INDICATORS):
                     has_aimc = await p.evaluate(
@@ -388,6 +398,7 @@ class GoogleAIClient:
             except Exception:
                 pass
             await asyncio.sleep(0.5)
+        await p.terminate_execution()
         return CompletionResult(True, "timeout")
 
     # ── HTML → markdown ───────────────────────────────────────────
