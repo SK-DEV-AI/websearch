@@ -47,6 +47,10 @@ AI_COMPLETION_TEXT_INDICATORS = [
     "Risposte IA", "Panoramica IA",
 ]
 
+GAI_ERROR_TEXT_INDICATORS = [
+    "something went wrong and an ai response wasn't generated",
+]
+
 CUTOFF_MARKERS = [
     "AI-generated answers may contain mistakes", "AI can make mistakes",
     "Generative AI is experimental", "AI overviews are experimental",
@@ -355,6 +359,7 @@ class GoogleAIClient:
     async def _wait_for_completion(self, p: CDPPage, deadline_seconds: float) -> CompletionResult:
         """4-stage detection: SVG thumbs-up → aria-label → text indicators → timeout.
 
+        Also detects GAI error messages and returns early with failure.
         Returns at the deadline or when detection succeeds.
         """
         deadline = time.monotonic() + deadline_seconds
@@ -371,6 +376,10 @@ class GoogleAIClient:
                 pass
             try:
                 body = await p.evaluate("document.body.innerText")
+                for err in GAI_ERROR_TEXT_INDICATORS:
+                    if err in body.lower():
+                        # GAI returned an error page — no point waiting for timeout
+                        return CompletionResult(False, err)
                 if any(ind in body for ind in AI_COMPLETION_TEXT_INDICATORS):
                     has_aimc = await p.evaluate(
                         "!!document.querySelector('[data-subtree=aimc]')")
