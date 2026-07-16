@@ -14,6 +14,7 @@ from fetch import fetch_url
 from embed import _embed, _dedup_rank, _cosine_sim
 from wikipedia import search_wikipedia, fetch_wikipedia_summary_rest
 from arxiv import search_arxiv
+from reddit import search_reddit
 from query_expand import expand_query
 from reranker import rerank as _rerank
 from resilience import CircuitBreaker
@@ -43,7 +44,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                        hl: str = "en", tbs: str = "", pws: str = "", backend: str = "auto",
                        timelimit: str = "", page: int = 1, region: str = "wt-wt",
                        safesearch: str = "moderate",
-                       language: str = "en", country: str = "",
+                        language: str = "en", country: str = "",
+                        reddit_subreddit: str = "", reddit_comments: bool = True,
                        upload_urls: list[str] | None = None,
                        query_expand: bool = True,
                         tavily_topic: str = "general", tavily_depth: str = "advanced",
@@ -109,6 +111,12 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 _ddg_breaker.record_failure()
                 return []
 
+        async def _reddit_search(q, n, **kw):
+            try:
+                return await search_reddit(q, n, **kw)
+            except Exception:
+                return []
+
         tr_map = {"d": "day", "w": "week", "m": "month", "y": "year"}
         tavily_tr = tr_map.get(timelimit, "")
 
@@ -129,6 +137,9 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 start_date=start_date, end_date=end_date, exact_phrase=exact_phrase,
                 country=country, include_domains=include_domains, exclude_domains=exclude_domains)),
             "wiki": asyncio.create_task(search_wikipedia(query, count=min(count, 8), language=language)),
+            "reddit": asyncio.create_task(_reddit_search(query, count,
+                subreddit=reddit_subreddit or None, include_comments=reddit_comments,
+                include_ai_summary=True)),
             "arxiv": asyncio.create_task(search_arxiv(query, count=min(count, 10))),
             "anysearch": asyncio.create_task(search_anysearch(query, count=min(count, 20), domain=domain,
                 tag=anysearch_tag, zone=anysearch_zone, language=anysearch_language,
@@ -139,17 +150,22 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         }
         done = await asyncio.gather(*tasks.values(), return_exceptions=True)
         done_map = dict(zip(tasks.keys(), done))
-        for key in ("rss", "tavily", "wiki", "arxiv", "anysearch", "tinyfish") + tuple(ddg_tasks.keys()):
+        for key in ("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish") + tuple(ddg_tasks.keys()):
             val = done_map[key]
             if isinstance(val, BaseException) or not isinstance(val, list):
                 continue
             for r in val:
                 if isinstance(r, dict) and "error" not in r and r.get("url"):
                     if not any(e.get("url") == r["url"] for e in results):
-                        r["engine"] = "duckduckgo" if key.startswith("ddg") else (
-                            "google-news-rss" if key == "rss" else key)
+                        if key != "reddit" or r.get("engine") in ("reddit", "reddit-comment", "reddit-ai-summary"):
+                            new_eng = "duckduckgo" if key.startswith("ddg") else (
+                                "google-news-rss" if key == "rss" else key)
+                            # Preserve sub-engine (e.g., reddit-ai-summary, reddit-comment)
+                            cur = r.get("engine")
+                            if not cur or cur == key or cur == new_eng:
+                                r["engine"] = new_eng
                         results.append(r)
-        eng = {"rss": "google-news-rss", "tavily": "tavily", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish"}
+        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish"}
         for key, name in eng.items():
             val = done_map.get(key)
             if isinstance(val, list) and any(isinstance(r, dict) and "error" not in r for r in val):
