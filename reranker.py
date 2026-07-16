@@ -112,7 +112,7 @@ async def rerank(query: str, passages: list[dict], top_k: int = 20) -> list[dict
         for p in passages:
             item = dict(p)
             text = item.get("snippet") or item.get("text") or item.get("content") or ""
-            item["snippet"] = text[:2000]
+            item["snippet"] = text[:3072]
             normalized.append(item)
         req = json.dumps({"query": query, "passages": normalized, "top_k": top_k})
         try:
