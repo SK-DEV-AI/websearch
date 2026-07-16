@@ -304,7 +304,8 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
             logger.warning("AI summary failed: %s", e)
 
     # --- Phase 2: fetch search results via in-browser fetch --------------
-    params = {"q": query, "limit": str(count), "sort": sort, "t": time_filter,
+    limit = max(count, min(count * 5, 100))
+    params = {"q": query, "limit": str(limit), "sort": sort, "t": time_filter,
               "type": "link", "raw_json": "1"}
     if subreddit:
         params["restrict_sr"] = "on"

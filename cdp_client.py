@@ -625,7 +625,7 @@ class CDPPage:
                 session_id=self._session_id, timeout=5,
             )
             result = await self._session.send(
-                "Accessibility.getFullAXTree", {"depth": depth},
+                "Accessibility.getFullAXTree", {"max_depth": depth},
                 session_id=self._session_id, timeout=10,
             )
             return result.get("nodes", [])
