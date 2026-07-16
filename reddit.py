@@ -372,9 +372,10 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
         snippet = p.get("selftext", "").strip()
         if not snippet:
             snippet = p.get("title", "")
+        snippet = f"[r/{sub}] {snippet}"
         comments = post_comments.get(p.get("id"), [])
         if comments:
-            lines = [f"\n\nTop comments (r/{sub}):"]
+            lines = [f"\n\nTop comments:"]
             for c in comments:
                 lines.append(f"  u/{c['author']}: {c['body']}")
             snippet = (snippet + "\n".join(lines))[:1600]
