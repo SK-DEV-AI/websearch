@@ -22,7 +22,7 @@ def _init() -> None:
 
 _init()
 
-_DEFAULT_LLM = "groq/meta-llama/llama-4-scout-17b-16e-instruct"
+_DEFAULT_LLM = "groq/openai/gpt-oss-120b"
 
 
 async def extract_content(

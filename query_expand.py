@@ -61,7 +61,7 @@ async def expand_query(query: str) -> list[str]:
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={
-                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "model": "openai/gpt-oss-120b",
                 "messages": [
                     {"role": "system", "content": "Generate exactly 2 keyword-only search query variations. One query per line. No numbering. No prefixes. No explanations."},
                     {"role": "user", "content": prompt},

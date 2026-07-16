@@ -165,7 +165,7 @@ async def handle_list_tools() -> list[Tool]:
                 "fields": {"type": "array", "items": {"type": "string"}, "description": "List of field names for extraction (e.g. ['name', 'price', 'rating']). Used with strategy=css or strategy=llm"},
                 "chunk_threshold": {"type": "integer", "default": 2000, "description": "Max tokens per chunk for LLM extraction (lower = cheaper, higher = more context)"},
                 "css_selector": {"type": "string", "description": "CSS selector for the container element (used with strategy=css). Defaults to 'body'"},
-                "provider": {"type": "string", "default": "groq/meta-llama/llama-4-scout-17b-16e-instruct", "description": "LLM provider string in LiteLLM format (e.g. groq/meta-llama/llama-4-scout-17b-16e-instruct, openai/gpt-4o, ollama/llama2)"}},
+                "provider": {"type": "string", "default": "groq/openai/gpt-oss-120b", "description": "LLM provider string in LiteLLM format (e.g. groq/openai/gpt-oss-120b, openai/gpt-4o, ollama/llama2)"}},
                 "required": ["url"]}),
          Tool(name="pdf_extract",
             description="PDF to structured data via opendataloader-pdf. Extracts text, tables, formulas, images with bounding boxes. Supports scanned PDFs (OCR), complex tables, and accessibility tagging.",
@@ -265,7 +265,7 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                         resp = await c.post(
                             "https://api.groq.com/openai/v1/chat/completions",
                             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                            json={"model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                            json={"model": "openai/gpt-oss-120b",
                                   "messages": [{"role": "system", "content": "Answer concisely from sources. Use [N] citations like [1][2]."},
                                                {"role": "user", "content": f"Query: {query}\n\nResults:\n{ctx}"}],
                                   "temperature": 0.3, "max_tokens": 256}, timeout=15)

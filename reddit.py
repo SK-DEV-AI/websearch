@@ -19,6 +19,7 @@ import asyncio
 import html as _html
 import json
 import logging
+import time
 from typing import Any
 
 from urllib.parse import quote as _quote
@@ -43,8 +44,8 @@ async def _ensure_reddit_page():
     async with _reddit_page_lock:
         if _reddit_page_ready and _reddit_page:
             try:
-                title = await _reddit_page.evaluate("document.title")
-                if title and "reddit" in title.lower():
+                host = await _reddit_page.evaluate("document.location.hostname")
+                if host and "reddit" in host:
                     return _reddit_page
             except Exception:
                 pass
@@ -60,7 +61,16 @@ async def _ensure_reddit_page():
 
             page = await session.create_page()
             await page.goto("https://www.reddit.com/", referrer="https://www.google.com/")
-            await asyncio.sleep(6)
+            # Wait for page to become interactive (CDP lifecycle event handles load)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    alive = await page.evaluate("document.readyState")
+                    if alive in ("interactive", "complete"):
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.3)
 
             _reddit_page = page
             _reddit_page_ready = True
@@ -135,10 +145,17 @@ async def get_ai_summary(query: str, timeout: int = 25) -> dict | None:
 
     result: dict[str, Any] = {}
 
-    # --- Step 1: navigate to search results ---
+    # --- Step 1: navigate to search results and poll for AI summary ---
     search_url = f"https://www.reddit.com/search/?q={_quote(query)}"
     await page.goto(search_url, referrer="https://www.google.com/")
-    await asyncio.sleep(8)
+
+    # Poll for the AI summary to appear (up to 15s) instead of fixed sleep
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        ready = await page.evaluate('document.body?.innerText?.includes("What people are saying")')
+        if ready:
+            break
+        await asyncio.sleep(0.5)
 
     extracted = await page.evaluate('''
 (() => {
@@ -177,21 +194,30 @@ async def get_ai_summary(query: str, timeout: int = 25) -> dict | None:
     info = json.loads(extracted) if isinstance(extracted, str) else extracted
     result["summary"] = info.get("summary")
     result["source_subreddits"] = info.get("source_subreddits", [])
+    result["answers_url"] = info.get("answers_url")
 
     # --- Step 2: navigate to the full answers page for shadow-root content ---
     answers_url = info.get("answers_url")
     if answers_url:
         try:
             await page.goto(answers_url, referrer=search_url)
-            await asyncio.sleep(14)  # wait for the AI streaming response
 
-            full = await page.evaluate('''
+            # Poll for streaming content to appear in shadow root (up to 20s)
+            full = None
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                chunk = await page.evaluate('''
 (() => {
     const sc = document.querySelector('guides-response-container-streaming');
     if (!sc || !sc.shadowRoot) return null;
-    return sc.shadowRoot.textContent || '';
+    const text = sc.shadowRoot.textContent || '';
+    return text.length > 100 ? text : null;
 })()
 ''')
+                if chunk and isinstance(chunk, str):
+                    full = chunk
+                    break
+                await asyncio.sleep(0.5)
             if full and isinstance(full, str) and len(full.strip()) > 100:
                 result["full_answer"] = full.strip()
         except Exception as e:
@@ -318,9 +344,10 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
         if summary:
             subreddits = ai_summary_result.get("source_subreddits", [])
             sub_str = f" (sources: {', '.join(subreddits)})" if subreddits else ""
+            ai_url = ai_summary_result.get("answers_url") or f"https://www.reddit.com/search/?q={_quote(query)}"
             results.append({
                 "title": f"Reddit AI summary{ sub_str }",
-                "url": f"https://www.reddit.com/search/?q={_quote(query)}",
+                "url": ai_url,
                 "snippet": summary[:1600],
                 "source": "reddit.com",
                 "engine": "reddit-ai-summary",

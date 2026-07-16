@@ -568,7 +568,7 @@ class CDPPage:
         """
         await self._session.send(
             "Emulation.setDisabledImageTypes",
-            {"imageTypes": ["avif", "webp", "png", "jpeg", "gif", "svg", "ico", "bmp"]},
+            {"imageTypes": ["avif", "webp"]},
             session_id=self._session_id,
         )
 
