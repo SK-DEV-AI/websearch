@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 
@@ -9,8 +10,12 @@ import trafilatura
 
 from scrapling.fetchers import AsyncFetcher, AsyncStealthySession
 
-from config import cached
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
+import cache as cache_mod
+import focus as focus_mod
+from actions import run_actions
+
+logger = logging.getLogger("fetch")
 
 AsyncFetcher.configure(huge_tree=True)
 
@@ -131,7 +136,6 @@ def _extract_docx(content: bytes, max_chars: int = 50000) -> str:
         return f"[DOCX extraction error: {e}]"
 
 
-@cached(ttl=120)
 async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = True,
                     target_language: str = "", favor_precision: bool = False,
                     favor_recall: bool = False, fast: bool = False,
@@ -141,11 +145,34 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     include_formatting: bool = True, include_links: bool = True,
                     prune_xpath: str = "", url_blacklist: str = "",
                     author_blacklist: str = "", cdp_url: str = "",
-                    min_output_size: int = 0, raw: bool = False) -> dict:
+                    min_output_size: int = 0, raw: bool = False,
+                    # New params
+                    offset: int = 0, focus: str = "", actions: list | None = None,
+                    cache_ttl: int = 3600) -> dict:
+    """Fetch a URL with cache, focus filtering, actions, and pagination.
+
+    Cache keyed by URL+extraction_type+css_selector (focus and offset
+    are NOT part of the key — different queries share one cache entry).
+    """
     try:
         url_lower = url.lower()
+        extraction_type = output_format  # Backward compat
 
-        # Raw mode: skip CDP and trafilatura, return raw text directly
+        # ── Cache check (skip when actions change state or cache_ttl=0) ──
+        if cache_ttl > 0 and not actions:
+            cached = await cache_mod.get_cached(
+                url, extraction_type=extraction_type, ttl=cache_ttl)
+            if cached:
+                content = cached["content"]
+                if focus:
+                    content = focus_mod.filter_by_relevance(content, focus)
+                return _build_paginated_response(url, content, cached.get("status", 200),
+                                                  cached.get("title", ""),
+                                                  cached.get("metadata", {}),
+                                                  cached.get("content_type", ""),
+                                                  offset, max_chars, method="cache")
+
+        # ── Raw mode ────────────────────────────────────────────────
         if raw or any(url_lower.startswith(p) for p in
             ["https://raw.githubusercontent.com/", "https://raw.github.com/",
              "https://gitlab.com/", "https://bitbucket.org/",
@@ -154,14 +181,17 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             try:
                 resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True)
                 content = resp.body if isinstance(resp.body, str) else resp.body.decode("utf-8", errors="replace")
-                return {"success": True, "url": url, "title": url.split("/")[-1],
-                        "content": content.strip()[:max_chars],
-                        "method": "raw"}
+                full_content = content.strip()
+                if focus:
+                    full_content = focus_mod.filter_by_relevance(full_content, focus)
+                return _build_paginated_response(url, full_content, 200,
+                                                  url.split("/")[-1], {}, "",
+                                                  offset, max_chars, method="raw")
             except Exception as e:
                 return {"success": False, "url": url, "error": f"Raw fetch failed: {e}"}
 
-        # CDP-first: use Helium browser when available (real cookies, no CAPTCHA)
-        if cdp_url:
+        # ── CDP-first path (when cdp_url provided OR actions given) ──
+        if cdp_url or actions:
             try:
                 page = await _get_optimized_page(block_resources=True)
                 try:
@@ -172,22 +202,43 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     except Exception:
                         pass
                     await _wait_cf_resolution(page)
-                    text = await page.evaluate(_CDP_EXTRACT_MARKDOWN_JS)
-                    if text and text.strip():
-                        content = text.strip()
+
+                    # Run page interactions before extraction
+                    if actions:
+                        action_content = await run_actions(page, actions, timeout=30)
+                        if action_content:
+                            full_content = action_content
+                        else:
+                            text = await page.evaluate(_CDP_EXTRACT_MARKDOWN_JS)
+                            full_content = text.strip() if text and text.strip() else ""
                     else:
-                        html_c = await page.document_html()
-                        content = trafilatura.extract(
-                            html_c, output_format='markdown', include_links=include_links,
-                            include_images=include_images, include_tables=include_tables,
-                            deduplicate=deduplicate, fast=True, url=url,
-                        ) or await page.inner_text()
-                    if isinstance(content, bytes):
-                        content = content.decode("utf-8", errors="replace")
+                        text = await page.evaluate(_CDP_EXTRACT_MARKDOWN_JS)
+                        if text and text.strip():
+                            full_content = text.strip()
+                        else:
+                            html_c = await page.document_html()
+                            extracted = trafilatura.extract(
+                                html_c, output_format='markdown', include_links=include_links,
+                                include_images=include_images, include_tables=include_tables,
+                                deduplicate=deduplicate, fast=True, url=url,
+                            ) or await page.inner_text()
+                            full_content = extracted
+
+                    if isinstance(full_content, bytes):
+                        full_content = full_content.decode("utf-8", errors="replace")
                     title = await page.title()
-                    return {"success": True, "url": url, "title": title or "",
-                            "content": (content or "")[:max_chars],
-                            "method": "cdp"}
+
+                    # Cache the full content
+                    if cache_ttl > 0:
+                        asyncio.ensure_future(cache_mod.set_cached(
+                            url, full_content, extraction_type=extraction_type,
+                            title=title or "", ttl=cache_ttl))
+
+                    if focus:
+                        full_content = focus_mod.filter_by_relevance(full_content, focus)
+                    return _build_paginated_response(url, full_content, 200,
+                                                      title or "", {}, "",
+                                                      offset, max_chars, method="cdp")
                 finally:
                     try:
                         await page.close()
@@ -195,11 +246,14 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                         pass
                     asyncio.ensure_future(_cleanup_orphan_tabs())
             except Exception:
+                if actions:
+                    return {"success": False, "url": url, "error": "CDP actions fetch failed"}
                 pass  # Fall through to httpx
 
+        # ── PDF / EPUB / DOCX ───────────────────────────────────────
         if url_lower.endswith('.pdf'):
             try:
-                import asyncio, os, shutil, tempfile, opendataloader_pdf
+                import os, shutil, tempfile, opendataloader_pdf  # noqa: F811
                 from pathlib import Path
                 resp = await AsyncFetcher.get(url, timeout=60, stealthy_headers=True)
                 body = resp.body if isinstance(resp.body, bytes) else resp.body.encode()
@@ -217,28 +271,48 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 finally:
                     os.unlink(tmp.name)
                     shutil.rmtree(out_dir, ignore_errors=True)
-                md_text = md.read_text("utf-8", errors="replace")[:max_chars] if md else "[empty PDF]"
-                return {"success": True, "url": url, "title": url.split("/")[-1], "content": md_text}
+                md_text = md.read_text("utf-8", errors="replace") if md else "[empty PDF]"
+                full_content = md_text
+                if focus:
+                    full_content = focus_mod.filter_by_relevance(full_content, focus)
+                return _build_paginated_response(url, full_content, 200,
+                                                  url.split("/")[-1], {}, "",
+                                                  offset, max_chars, method="pdf")
             except Exception:
-                pass  # Fall through to httpx
+                pass
         if url_lower.endswith('.epub'):
             resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
             content = _extract_epub(
-                resp.body if isinstance(resp.body, bytes) else resp.body.encode(), max_chars)
-            return {"success": True, "url": url, "title": url.split("/")[-1],
-                    "content": content}
+                resp.body if isinstance(resp.body, bytes) else resp.body.encode(), 100000)
+            full_content = content
+            if focus:
+                full_content = focus_mod.filter_by_relevance(full_content, focus)
+            return _build_paginated_response(url, full_content, 200,
+                                              url.split("/")[-1], {}, "",
+                                              offset, max_chars, method="epub")
         if url_lower.endswith(('.docx', '.doc')):
             resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
             content = _extract_docx(
-                resp.body if isinstance(resp.body, bytes) else resp.body.encode(), max_chars)
-            return {"success": True, "url": url, "title": url.split("/")[-1],
-                    "content": content}
+                resp.body if isinstance(resp.body, bytes) else resp.body.encode(), 100000)
+            full_content = content
+            if focus:
+                full_content = focus_mod.filter_by_relevance(full_content, focus)
+            return _build_paginated_response(url, full_content, 200,
+                                              url.split("/")[-1], {}, "",
+                                              offset, max_chars, method="docx")
+
+        # ── httpx + trafilatura (primary path) ──────────────────────
         resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True)
         raw_html = resp.body if isinstance(resp.body, str) else resp.body.decode("utf-8", errors="replace")
         if not main_content_only:
             content = (resp.get_all_text() or "").strip()
-            return {"success": True, "url": url, "status": resp.status,
-                    "content": content[:max_chars] + ("\n[...truncated]" if len(content) > max_chars else "")}
+            full_content = content
+            if focus:
+                full_content = focus_mod.filter_by_relevance(full_content, focus)
+            return _build_paginated_response(url, full_content, resp.status,
+                                              "", {}, "",
+                                              offset, max_chars, method="httpx")
+
         kw: dict[str, Any] = {
             "output_format": output_format, "with_metadata": True,
             "include_links": include_links, "include_tables": include_tables,
@@ -264,41 +338,55 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         title = None
         if isinstance(result, str) and result.startswith('{'):
             d = json.loads(result)
-            content = d.get('text', '')
+            full_content = d.get('text', '')
             title = d.get('title')
         else:
-            content = result or ''
-        if not content:
-            content = trafilatura.extract(raw_html, output_format='txt',
-                                          with_metadata=False, url=url) or ''
-        if not content.strip():
+            full_content = result or ''
+        if not full_content:
+            full_content = trafilatura.extract(raw_html, output_format='txt',
+                                                with_metadata=False, url=url) or ''
+        if not full_content.strip():
             try:
-                content = (resp.get_all_text() or '').strip()
+                full_content = (resp.get_all_text() or '').strip()
             except Exception:
-                content = raw_html.strip()
-        clean = content.strip()[:max_chars]
-        # Cloudflare challenge detection in httpx path
+                full_content = raw_html.strip()
+        full_content = full_content.strip()
+
+        # Cloudflare challenge detection
         cf_keywords = ["just a moment", "checking your browser", "cf-challenge",
-                        "cloudflare ray id", "__cf_chl_", "cf-turnstile",
-                        "verify you are human", "attention required"]
-        if clean and sum(1 for kw in cf_keywords if kw in clean[:600].lower()) >= 2:
-            return {"success": False, "url": url, "error": "Cloudflare challenge detected — auto-fallback to CDP in progress."}
-        if len(clean) == max_chars:
-            clean += "\n[...truncated]"
-        if min_output_size and len(clean) < min_output_size:
-            return {"success": False, "url": url, "error": f"Content too short ({len(clean)} < {min_output_size} chars)"}
+                       "cloudflare ray id", "__cf_chl_", "cf-turnstile",
+                       "verify you are human", "attention required"]
+        if full_content and sum(1 for kw in cf_keywords if kw in full_content[:600].lower()) >= 2:
+            return {"success": False, "url": url,
+                    "error": "Cloudflare challenge detected — auto-fallback to CDP in progress."}
+
+        if min_output_size and len(full_content) < min_output_size:
+            return {"success": False, "url": url,
+                    "error": f"Content too short ({len(full_content)} < {min_output_size} chars)"}
+
         meta_str = trafilatura.extract(raw_html, output_format='json', with_metadata=True,
                                        include_links=False, include_tables=False,
-                                       url=url) if clean else None
+                                       url=url) if full_content else None
         meta = {}
         if isinstance(meta_str, str) and meta_str.startswith('{'):
             try:
                 meta = json.loads(meta_str).get("metadata", {})
             except Exception:
                 pass
-        return {"success": True, "url": url, "status": resp.status,
-                "title": title or meta.get("title", ""),
-                "content": clean, "metadata": {k: v for k, v in meta.items() if v}}
+
+        # Cache the full content
+        if cache_ttl > 0:
+            asyncio.ensure_future(cache_mod.set_cached(
+                url, full_content, extraction_type=extraction_type,
+                status=resp.status, title=title or "",
+                metadata={k: v for k, v in meta.items() if v}, ttl=cache_ttl))
+
+        if focus:
+            full_content = focus_mod.filter_by_relevance(full_content, focus)
+        return _build_paginated_response(url, full_content, resp.status,
+                                          title or meta.get("title", ""),
+                                          {k: v for k, v in meta.items() if v}, "",
+                                          offset, max_chars, method="httpx")
     except Exception as e:
         return {"success": False, "url": url, "error": str(e)}
 
@@ -385,7 +473,15 @@ async def scrapling_stealthy_fetch(
                     await _wait_cf_resolution(page)
                 except Exception:
                     pass
-                content = await _cdp_extract_content(page, css_selector, extraction_type, page_url=url)
+                # Run page interactions before extraction
+                if page_action:
+                    action_content = await run_actions(page, page_action, timeout=30)
+                    if action_content:
+                        content = action_content
+                    else:
+                        content = await _cdp_extract_content(page, css_selector, extraction_type, page_url=url)
+                else:
+                    content = await _cdp_extract_content(page, css_selector, extraction_type, page_url=url)
                 if isinstance(content, bytes):
                     content = content.decode("utf-8", errors="replace")
                 title = await page.title()
@@ -488,3 +584,58 @@ async def _cdp_wait_for_selector(page, css: str, timeout: float = 10):
             return True
         await asyncio.sleep(0.1)
     return False
+
+
+# ── Pagination helper ──────────────────────────────────────────────
+
+def _build_paginated_response(url: str, content: str, status: int | str,
+                              title: str, metadata: dict, content_type: str,
+                              offset: int, max_chars: int,
+                              method: str = "httpx") -> dict:
+    """Slice *content* at *offset* and return pagination metadata.
+
+    The ``offset`` param is a 0-based char offset into the full content.
+    Returns up to ``max_chars`` chars. Sets ``is_truncated`` and
+    ``next_offset`` so the agent can page through with another call.
+    """
+    total = len(content)
+
+    if offset > 0:
+        content = content[offset:]
+        if not content:
+            return {
+                "success": True, "url": url, "status": status,
+                "title": title, "content": "",
+                "content_type": content_type, "metadata": metadata,
+                "total_extracted_chars": total,
+                "offset": offset,
+                "is_truncated": False,
+                "next_offset": 0,
+                "method": method,
+            }
+
+    if total > max_chars:
+        sliced = content[:max_chars]
+        next_off = offset + max_chars
+        is_truncated = next_off < total
+        return {
+            "success": True, "url": url, "status": status,
+            "title": title, "content": sliced,
+            "content_type": content_type, "metadata": metadata,
+            "total_extracted_chars": total,
+            "offset": offset,
+            "is_truncated": is_truncated,
+            "next_offset": next_off if is_truncated else 0,
+            "method": method,
+        }
+    else:
+        return {
+            "success": True, "url": url, "status": status,
+            "title": title, "content": content,
+            "content_type": content_type, "metadata": metadata,
+            "total_extracted_chars": total,
+            "offset": offset,
+            "is_truncated": False,
+            "next_offset": 0,
+            "method": method,
+        }

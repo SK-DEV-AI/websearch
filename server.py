@@ -29,7 +29,37 @@ from site_mapper import map_site
 from research import search_multi, enrich
 from extract import extract_content
 
-server = Server("websearch")
+INSTRUCTIONS = """# WebSearch MCP — Web Intelligence Toolkit
+
+A multi-engine search and content extraction server for AI agents.
+
+## Tools
+
+**search** — multi-engine web search (DDG, Tavily, GNews, Wikipedia, arXiv, AnySearch, TinyFish, GAI). Use `depth=2+` to auto-fetch full pages + rerank. `synthesize=True` (default) returns Groq answer with citations. `google_ai_only` skips all engines for a Google AI Mode answer. For code questions, use the code-search MCP server instead.
+
+**fetch** — URL fetching with auto CDP fallback. Supports PDF/EPUB/DOCX. Use `focus="query"` to BM25-filter the page to relevant sections. Use `offset=N + max_chars=N` for paginated reads (response includes `is_truncated`/`next_offset`). Use `actions=[...]` for page interactions (click, fill, press, wait, scroll) before extraction. Results are cached for 1h — `cache_ttl=0` forces fresh.
+
+**screenshot** — CDP screenshot or ARIA accessibility snapshot (LLM-optimized). Use `type=snapshot` for structured DOM text; `type=screenshot` for visual.
+
+**crawl** — recursive site crawl with BFS/DFS. Content filters: `""` (full markdown), `"pruning"` (article), `"bm25"` + `filter_query` (query-relevant).
+
+**extract** — crawl4ai LLM extraction: describe what you want in natural language → structured JSON. Uses `groq/openai/gpt-oss-120b` unless overridden.
+
+**pdf_extract** — opendataloader-pdf with OCR, tables, formulas. Use `hybrid=docling-fast` for scanned PDFs.
+
+**wikipedia/arxiv/map_site/ddgs_extract** — dedicated single-source tools.
+
+## Workflow
+
+1. Start with **search** for broad discovery.
+2. Fetch relevant pages with **fetch** (add `focus` or `offset` for large pages).
+3. Extract structured data with **extract**.
+4. Use **crawl** when you need every page on a domain.
+
+Tip: CDP-based tools connect to Helium browser at :9222 — they have real cookies and session state. GAI uses the same connection.
+"""
+
+server = Server("websearch", instructions=INSTRUCTIONS)
 
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
@@ -53,10 +83,14 @@ async def handle_list_tools() -> list[Tool]:
                 "anysearch_language": {"type": "string", "description": "AnySearch content language (e.g. en, zh-CN)"},
                 "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"}},
                 "required": ["query"]}),
-        Tool(name="fetch",
-            description="URL to markdown/text. Auto-fallback: fast httpx+trafilatura first, then CDP for Cloudflare/JS-heavy pages. Supports PDF, EPUB, DOCX (default path only). Default: fast (domcontentloaded only). Use network_idle=True for JS-heavy pages. Use start_line/end_line for range reads instead of guessing max_chars.",
+         Tool(name="fetch",
+            description="URL to markdown/text. Auto-fallback: httpx+trafilatura then CDP for Cloudflare/JS pages. Supports PDF, EPUB, DOCX. Use focus=\"query\" to BM25-filter content. Use offset + max_chars for paginated reads (response has next_offset/is_truncated). Use actions=[...] for page interactions before extraction. Results cached 1h; cache_ttl=0 force fresh.",
             inputSchema={"type": "object", "properties": {
-                "url": {"type": "string"}, "max_chars": {"type": "integer", "default": 5000},
+                "url": {"type": "string"}, "max_chars": {"type": "integer", "default": 5000, "description": "Chars to return per call (for pagination)"},
+                "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated + next_offset."},
+                "focus": {"type": "string", "description": "BM25 relevance filter — extract only content blocks relevant to this query. Runs on cached content too."},
+                "actions": {"type": "array", "items": {"type": "object"}, "description": "Page interaction actions before extraction: [{\"click\": \"#btn\"}, {\"wait\": 500}, {\"fill\": {\"selector\": \"input#q\", \"text\": \"query\"}}, {\"press\": \"Enter\"}, {\"wait_selector\": \".results\"}]"},
+                "cache_ttl": {"type": "integer", "default": 3600, "description": "Cache TTL in seconds (0 = force fresh fetch). Cache keyed by URL+extraction_type+css_selector, not focus/offset."},
                 "css_selector": {"type": "string"},
                 "extraction_type": {"type": "string", "enum": ["markdown","text","html"]},
                 "target_language": {"type": "string"},
@@ -275,55 +309,78 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                     pass
             return _res(r)
         elif name == "fetch":
-            r = await fetch_url(arguments["url"],
-                    max_chars=safe_int(arguments.get("max_chars",5000)),
-                    target_language=str(arguments.get("target_language","")),
-                    fast=bool(arguments.get("fast",False)),
-                    output_format=str(arguments.get("output_format","markdown")),
-                    include_images=bool(arguments.get("include_images",True)),
-                    include_tables=bool(arguments.get("include_tables",True)),
-                    include_formatting=bool(arguments.get("include_formatting",True)),
-                    include_links=bool(arguments.get("include_links",True)),
-                    raw=bool(arguments.get("raw", False)))
-            # Auto-fallback: if Cloudflare/403/blocked/empty content, retry via CDP
-            content = (r.get("content", "") or "").strip()
-            status = r.get("status", 0)
-            r_error = (r.get("error", "") or "").lower()
-            content_lower = content.lower()
-            # Scan content for Cloudflare indicators even if httpx path missed them
-            cf_hits = sum(1 for kw in ["just a moment", "checking your browser",
-                           "cf-challenge", "__cf_chl_", "cf-turnstile",
-                           "verify you are human", "attention required"]
-                          if kw in content_lower[:800])
-            should_retry = (
-                not r.get("success") and "cloudflare" in r_error
-            ) or status in (403, 429, 503) or cf_hits >= 2 or (
-                len(content) < 300 and (
-                    "blocked" in content_lower or "access denied" in content_lower
-                    or "network security" in content_lower or "rate limit" in content_lower
-                    or "too many requests" in content_lower
-                )
-            ) or (
-                len(content) < 100
-            )
-            if should_retry:
-                r = await scrapling_stealthy_fetch(arguments["url"],
+            url = arguments["url"]
+            actions = arguments.get("actions")
+            offset = safe_int(arguments.get("offset", 0))
+            max_chars = safe_int(arguments.get("max_chars", 5000))
+
+            # When actions are given, go CDP-first (skip httpx tier)
+            if actions:
+                r = await scrapling_stealthy_fetch(url,
                     css_selector=arguments.get("css_selector"),
-                    extraction_type=str(arguments.get("extraction_type","markdown")),
-                    cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle",True)))
-            # Line range slicing after fetch
+                    extraction_type=str(arguments.get("extraction_type", "markdown")),
+                    cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle", True)),
+                    page_action=actions)
+            else:
+                r = await fetch_url(url,
+                    max_chars=max_chars,
+                    offset=offset,
+                    focus=str(arguments.get("focus", "")),
+                    actions=None,  # Handled above
+                    cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
+                    target_language=str(arguments.get("target_language", "")),
+                    fast=bool(arguments.get("fast", False)),
+                    output_format=str(arguments.get("output_format", "markdown")),
+                    include_images=bool(arguments.get("include_images", True)),
+                    include_tables=bool(arguments.get("include_tables", True)),
+                    include_formatting=bool(arguments.get("include_formatting", True)),
+                    include_links=bool(arguments.get("include_links", True)),
+                    raw=bool(arguments.get("raw", False)))
+
+                # Auto-fallback: httpx failed/blocked → retry via CDP
+                if not actions and not r.get("success"):
+                    content = (r.get("content", "") or "").strip()
+                    status = r.get("status", 0)
+                    r_error = (r.get("error", "") or "").lower()
+                    content_lower = content.lower()
+                    cf_hits = sum(1 for kw in ["just a moment", "checking your browser",
+                                   "cf-challenge", "__cf_chl_", "cf-turnstile",
+                                   "verify you are human", "attention required"]
+                                  if kw in content_lower[:800])
+                    should_retry = (
+                        "cloudflare" in r_error
+                    ) or status in (403, 429, 503) or cf_hits >= 2 or (
+                        len(content) < 300 and (
+                            "blocked" in content_lower or "access denied" in content_lower
+                            or "network security" in content_lower or "rate limit" in content_lower
+                            or "too many requests" in content_lower
+                        )
+                    ) or (len(content) < 100)
+
+                    if should_retry:
+                        cdp_r = await scrapling_stealthy_fetch(url,
+                            css_selector=arguments.get("css_selector"),
+                            extraction_type=str(arguments.get("extraction_type", "markdown")),
+                            cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle", True)))
+                        if cdp_r.get("success"):
+                            r = cdp_r
+                            # Re-apply focus on CDP result if we had one
+                            focus_q = str(arguments.get("focus", ""))
+                            if focus_q and r.get("content"):
+                                from focus import filter_by_relevance as _focus_filter
+                                r["content"] = _focus_filter(r["content"], focus_q)
+
+            # Backward compat: start_line/end_line line-range slicing
             start_line = safe_int(arguments.get("start_line", 0))
             end_line = safe_int(arguments.get("end_line", 0))
-            if r.get("content"):
+            if start_line > 0 and r.get("content"):
                 all_lines = r["content"].split("\n")
                 r["total_lines"] = len(all_lines)
-                r["total_chars"] = len(r["content"])
-                if start_line > 0:
-                    if end_line > 0:
-                        r["content"] = "\n".join(all_lines[start_line - 1:end_line])
-                    else:
-                        r["content"] = "\n".join(all_lines[start_line - 1:])
-                    r["returned_lines"] = r["content"].count("\n") + 1
+                if end_line > 0:
+                    r["content"] = "\n".join(all_lines[start_line - 1:end_line])
+                else:
+                    r["content"] = "\n".join(all_lines[start_line - 1:])
+                r["returned_lines"] = r["content"].count("\n") + 1
             return _res(r)
         elif name == "crawl":
             r = await crawl_url(arguments["url"],
