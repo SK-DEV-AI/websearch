@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import urllib.parse
+from collections import Counter
 
 from config import cached
 from search_ddg import search_ddg, search_google_rss
@@ -27,6 +29,99 @@ _ddg_breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=60)
 # TinyFish intent detection
 _TINYFISH_NEWS = re.compile(r"(?i)\b(news|headlines?|breaking|latest|today|update|coverage|event)\b")
 _TINYFISH_ACADEMIC = re.compile(r"(?i)\b(paper|research|study|arxiv|doi|survey|review|implementation|method|experiment)\b")
+
+
+_STOPWORDS = {
+    "the","and","for","with","from","that","this","are","was","were",
+    "has","have","had","you","your","its","our","not","but","can",
+    "will","into","via","using","use","how","what","when","why","who",
+    "which","about","also","more","most","than","then","them","they",
+    "their","there","here","such","each","other","some","any","all",
+    "one","two","new","get","got","may","might","could","should",
+    "would","does","did","done","been","being","very","just","like",
+}
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'+-]{2,}")
+
+# Engines expected in a non-GAI-only search (for engine_blocked reporting)
+_ALL_ENGINES = {"google-news-rss", "tavily", "reddit", "wikipedia", "arxiv",
+                "anysearch", "tinyfish", "duckduckgo"}
+
+
+def _query_tokens(query: str) -> set[str]:
+    return {w.lower() for w in _WORD_RE.findall(query or "") if w.lower() not in _STOPWORDS}
+
+
+def _related_queries(query: str, results: list[dict], *, n: int = 6) -> list[str]:
+    """Mine follow-up queries from result titles+snippets via bigram doc-frequency.
+    Zero API cost — pure text extraction. Returns up to n phrases."""
+    if not results:
+        return []
+    q_tokens = _query_tokens(query)
+    docs: list[list[str]] = []
+    for r in results:
+        text = (f"{r.get('title', '')} {r.get('snippet', '')}").lower()
+        words = [w for w in _WORD_RE.findall(text) if w not in _STOPWORDS]
+        docs.append(words)
+    if not docs:
+        return []
+
+    bigram_docfreq: Counter[str] = Counter()
+    for words in docs:
+        uniq_bi = set()
+        for i in range(len(words) - 1):
+            a, b = words[i], words[i + 1]
+            if len(a) < 3 or len(b) < 3:
+                continue
+            uniq_bi.add(f"{a} {b}")
+        for bi in uniq_bi:
+            bigram_docfreq[bi] += 1
+
+    def _overlaps_query(phrase: str) -> bool:
+        toks = phrase.split()
+        if not toks:
+            return True
+        if not [t for t in toks if t not in q_tokens]:
+            return True
+        return query.lower() in phrase or phrase in query.lower()
+
+    scored = [(df, bi) for bi, df in bigram_docfreq.items() if df >= 2 and not _overlaps_query(bi)]
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    out: list[str] = []
+    seen_words: set[str] = set()
+    for _df, bi in scored:
+        if len(set(bi.split()) & seen_words) >= 2:
+            continue
+        out.append(bi)
+        seen_words.update(bi.split())
+        if len(out) >= n:
+            break
+    return out[:n]
+
+
+def _normalize_scores(results: list[dict]) -> list[dict]:
+    """Normalize _rerank scores to 0-1 relevance_score range."""
+    if not results:
+        return results
+    scores = [r.get("_rerank", 0) or 0 for r in results]
+    if not scores:
+        return results
+    lo, hi = min(scores), max(scores)
+    span = hi - lo if hi > lo else 1.0
+    for r, s in zip(results, scores):
+        normalized = round((s - lo) / span, 4)
+        r["relevance_score"] = normalized
+        if normalized >= 0.7:
+            r["fetch_relevance"] = "high"
+        elif normalized >= 0.4:
+            r["fetch_relevance"] = "med"
+        else:
+            r["fetch_relevance"] = "low"
+        # Clean up internal keys
+        r.pop("_rerank", None)
+        r.pop("_embedding", None)
+        r.pop("_rel", None)
+    return results
 
 
 def _detect_tinyfish_type(query: str) -> str:
@@ -60,7 +155,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                        exact_phrase: bool = False,
                        anysearch_tag: str = "", anysearch_zone: str = "",
                        anysearch_language: str = "",
-                       anysearch_params: dict | None = None) -> dict:
+                        anysearch_params: dict | None = None) -> dict:
+    _start = time.monotonic()
     engines_used: list[str] = []
     results: list[dict] = []
     ai_answer = ""
@@ -195,6 +291,9 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                             "engine": "google-ai-mode"})
         else:
             gai_future.cancel()
+    # Track which engines were expected but didn't contribute
+    engine_blocked = sorted(_ALL_ENGINES - set(engines_used))
+
     if results:
         texts = [(r.get("snippet", "") or "")[:300] + " " +
                  (r.get("title", "") or "")[:100] for r in results]
@@ -208,12 +307,18 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             deduped = _dedup_rank(results, q_emb[0])
         else:
             deduped = results
-        deduped = await _rerank(query, deduped, top_k=count)
+        deduped = await _rerank(query, deduped, top_k=min(count, len(deduped) + 1))
+        deduped = _normalize_scores(deduped)
+        related = _related_queries(query, deduped)
     else:
         deduped = results
+        related = []
     out: dict = {"success": True, "engines_used": engines_used,
+                 "engine_blocked": engine_blocked,
                  "ai_answer": ai_answer, "follow_up": follow_up,
-                 "results": deduped[:count], "total": len(deduped[:count])}
+                 "related_queries": related,
+                 "results": deduped[:count], "total": len(deduped[:count]),
+                 "duration_ms": round((time.monotonic() - _start) * 1000)}
     return out
 
 
@@ -266,4 +371,5 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
                     seen_emb.append(emb)
             fetched = deduped
         fetched = await _rerank(query, fetched, top_k=depth * 2)
+        fetched = _normalize_scores(fetched)
     return {"fetched_content": fetched}

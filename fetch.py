@@ -11,6 +11,7 @@ import trafilatura
 from scrapling.fetchers import AsyncFetcher, AsyncStealthySession
 
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
+from security import SecurityError, validate_url as _validate_url
 import cache as cache_mod
 import focus as focus_mod
 from actions import run_actions
@@ -154,6 +155,11 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
     Cache keyed by URL+extraction_type+css_selector (focus and offset
     are NOT part of the key — different queries share one cache entry).
     """
+    # SSRF validation — reject internal/private/reserved URLs
+    try:
+        url = await _validate_url(url)
+    except SecurityError as e:
+        return {"success": False, "error": str(e), "url": url}
     try:
         url_lower = url.lower()
         extraction_type = output_format  # Backward compat
@@ -437,6 +443,11 @@ async def scrapling_stealthy_fetch(
     init_script: str = "", extra_headers: dict | None = None,
     useragent: str = "", load_dom: bool = False,
     page_action=None, page_setup=None) -> dict:
+    # SSRF validation
+    try:
+        url = await _validate_url(url)
+    except SecurityError as e:
+        return {"success": False, "error": str(e), "url": url}
     # ── CDP-first path (primary) ──────────────────────────────────
     if cdp_url:
         last_err = None

@@ -35,28 +35,66 @@ A multi-engine search and content extraction server for AI agents.
 
 ## Tools
 
-**search** — multi-engine web search (DDG, Tavily, GNews, Wikipedia, arXiv, AnySearch, TinyFish, GAI). Use `depth=2+` to auto-fetch full pages + rerank. `synthesize=True` (default) returns Groq answer with citations. `google_ai_only` skips all engines for a Google AI Mode answer. For code questions, use the code-search MCP server instead.
+**search** — multi-engine web search (DDG, Tavily, GNews, Wikipedia, arXiv, AnySearch, TinyFish, GAI). Pipeline: query_expand → parallel search → NIM dedup → cross-encoder rerank → Groq synthesis. Each result carries `relevance_score` (0-1), `fetch_relevance` (high/med/low), `engine` (source). `engine_blocked` lists engines that failed. `related_queries` has follow-up suggestions. Use `depth=2+` to auto-fetch full pages + rerank. `synthesize=True` (default) returns Groq answer with `[N]` citations. `google_ai_only` skips all engines for Google AI Mode. For code questions use codesearch MCP.
 
-**fetch** — URL fetching with auto CDP fallback. Supports PDF/EPUB/DOCX. Use `focus="query"` to BM25-filter the page to relevant sections. Use `offset=N + max_chars=N` for paginated reads (response includes `is_truncated`/`next_offset`). Use `actions=[...]` for page interactions (click, fill, press, wait, scroll) before extraction. Results are cached for 1h — `cache_ttl=0` forces fresh.
+**fetch** — URL fetching with auto CDP fallback (httpx→trafilatura→CDP on Cloudflare/Turnstile blocks). Supports PDF/EPUB/DOCX. Use `focus="query"` to BM25-filter to relevant sections. Use `offset=N + max_chars=N` for paginated reads (response includes `is_truncated`/`next_offset`). Use `actions=[...]` for JS interaction (click, fill, press, wait, scroll). Results cached 1h — `cache_ttl=0` forces fresh. SSRF validation blocks internal/private IPs, DNS rebinding, non-http schemes.
 
-**screenshot** — CDP screenshot or ARIA accessibility snapshot (LLM-optimized). Use `type=snapshot` for structured DOM text; `type=screenshot` for visual.
+**screenshot** — CDP screenshot or ARIA snapshot. `type=snapshot` returns structured accessibility tree (LLM-optimized for text extraction); `type=screenshot` returns visual. Use `start_line`/`end_line` for snapshot range.
 
-**crawl** — recursive site crawl with BFS/DFS. Content filters: `""` (full markdown), `"pruning"` (article), `"bm25"` + `filter_query` (query-relevant).
+**crawl** — recursive BFS/DFS site crawl. Content filters: `""` (full markdown for docs/API refs), `"pruning"` (article stripping for blog posts), `"bm25"`+`filter_query` (query-relevant sections, requires filter_query), `"bm25_hq"` (stemmed BM25). Use when you need every page on a domain.
 
-**extract** — crawl4ai LLM extraction: describe what you want in natural language → structured JSON. Uses `groq/openai/gpt-oss-120b` unless overridden.
+**extract** — crawl4ai LLM extraction: describe what you want in natural language → structured JSON. Uses groq/openai/gpt-oss-120b unless overridden.
 
-**pdf_extract** — opendataloader-pdf with OCR, tables, formulas. Use `hybrid=docling-fast` for scanned PDFs.
+**pdf_extract** — opendataloader-pdf with OCR, tables, formulas. `hybrid=docling-fast` for scanned PDFs.
 
-**wikipedia/arxiv/map_site/ddgs_extract** — dedicated single-source tools.
+**map_site** — sitemap/site discovery. Use first on unfamiliar domains to discover URL tree.
 
-## Workflow
+**ddgs_extract** — lightweight page text via DuckDuckGo. Faster than fetch for simple pages, no JS rendering.
 
-1. Start with **search** for broad discovery.
-2. Fetch relevant pages with **fetch** (add `focus` or `offset` for large pages).
-3. Extract structured data with **extract**.
-4. Use **crawl** when you need every page on a domain.
+**wikipedia/arxiv** — dedicated single-source tools with full API param access.
 
-Tip: CDP-based tools connect to Helium browser at :9222 — they have real cookies and session state. GAI uses the same connection.
+## Content extraction — which tool when
+
+- **map_site(url)** → discover all URLs on an unfamiliar site first (sitemap + link extraction fallback).
+- **fetch(url)** → single page content. Fast for simple pages (trafilatura); auto-falls to CDP for Cloudflare/JS.
+- **crawl(url, max_depth=N)** → every page on a domain. Default `max_depth=1`.
+- **screenshot(type="snapshot")** → ARIA accessibility tree (best for LLM).
+- **ddgs_extract(url)** → text-only skims faster than fetch.
+- **pdf_extract** → PDFs with tables/formulas.
+- **extract(url, instruction="...")** → structured JSON from any page.
+
+## Pipeline (search)
+
+1. Query expansion (Groq) — generates 3-4 search variants for short queries.
+2. Multi-engine parallel search — GAI + DDG + GNews RSS + Tavily + Wikipedia + arXiv + AnySearch + TinyFish + Reddit.
+3. NVIDIA NIM embedding dedup — removes near-duplicates by cosine similarity.
+4. gte-reranker cross-encoder — reranks survivors by query relevance (2048 token cap, relevance_score/fetch_relevance output).
+5. Groq synthesis — top 3 results → concise answer with `[N]` citations (~256 tokens).
+
+`depth>=2`: additionally fetches full page content from top results, runs second dedup+rerank pass.
+
+## CDP details
+
+All CDP tools share a singleton Helium browser (Chromium 150+) at `http://127.0.0.1:9222` with real cookies/login/extensions. Fetch auto-detects Cloudflare (403/429/503, Turnstile checkbox, Managed Challenge, content <300 chars with block keywords) and falls back to CDP. GAI uses the same connection.
+
+## Qualifier hints
+
+- `language` for Wikipedia/arXiv content language.
+- `domain` / `anysearch_tag` / `anysearch_zone` for AnySearch vertical routing.
+- `start_date`/`end_date` for Tavily time range.
+- `upload_urls` for GAI file upload (.avif .bmp .heic .heif .jpeg .pdf .png .webp, 10MB max, one per call).
+- `raw=True` on fetch for raw file URLs (raw.githubusercontent.com, gitlab, gist).
+- `safesearch` for DDG content filtering.
+- `actions=[{"wait_selector": ".result"}]` for pages needing JS interaction before content extraction.
+
+## API key impact
+
+All keys pre-configured in run script. Graceful degradation:
+- `NV_KEY` — dedup disabled if missing
+- `GROQ_API_KEYS` — query expansion + synthesis disabled
+- `TAVILY_KEYS` — Tavily results skipped
+- `TINYFISH_KEYS` — TinyFish skipped
+- `ANYSEARCH_KEY` — AnySearch skipped
 """
 
 server = Server("websearch", instructions=INSTRUCTIONS)
@@ -65,7 +103,7 @@ server = Server("websearch", instructions=INSTRUCTIONS)
 async def handle_list_tools() -> list[Tool]:
     return [
         Tool(name="search",
-            description="Multi-engine web search with dedup and reranking. depth=1 returns snippets; depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns a Groq-synthesized answer with [N] citations.",
+            description="Multi-engine web search with dedup and reranking. Pipeline: query_expand -> 8 parallel engines -> NIM dedup -> reranker (scores). depth=1 returns snippets with relevance_score+fetch_relevance per result and engine_blocked list. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode answer.",
             inputSchema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 10},
                 "depth": {"type": "integer", "default": 1, "description": "1=snippets, 2+=fetch full pages + rerank"},
@@ -84,7 +122,7 @@ async def handle_list_tools() -> list[Tool]:
                 "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"}},
                 "required": ["query"]}),
          Tool(name="fetch",
-            description="URL to markdown/text. Auto-fallback: httpx+trafilatura then CDP for Cloudflare/JS pages. Supports PDF, EPUB, DOCX. Use focus=\"query\" to BM25-filter content. Use offset + max_chars for paginated reads (response has next_offset/is_truncated). Use actions=[...] for page interactions before extraction. Results cached 1h; cache_ttl=0 force fresh.",
+            description="URL to markdown/text. Auto-fallback: httpx+trafilatura then CDP for Cloudflare/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected (blocks internal/private IPs, DNS rebinding). Use focus=\"query\" to BM25-filter content. Use offset + max_chars for paginated reads (response has next_offset/is_truncated). Use actions=[...] for page interactions before extraction. Results cached 1h; cache_ttl=0 force fresh.",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "max_chars": {"type": "integer", "default": 5000, "description": "Chars to return per call (for pagination)"},
                 "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated + next_offset."},
