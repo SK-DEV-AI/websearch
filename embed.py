@@ -66,8 +66,7 @@ async def _embed(texts: list[str], input_type: str = "passage",
                         await _set_cache(f"emb:{input_type}:{encoding_format}:{uncached[idx][:200]}", emb)
         except (httpx.HTTPError, ValueError, KeyError):
             pass
-    final = [r for r in results if r is not None]
-    return final if len(final) == len(texts) else None
+    return results
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:

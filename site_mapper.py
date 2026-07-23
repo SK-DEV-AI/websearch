@@ -51,7 +51,12 @@ async def map_site(
 ) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    exclude = re.compile("|".join(exclude_patterns)) if exclude_patterns else None
+    exclude = None
+    if exclude_patterns:
+        try:
+            exclude = re.compile("|".join(exclude_patterns))
+        except re.error:
+            pass
     seen: set[str] = set()
     results: list[dict[str, Any]] = []
     source = "none"
@@ -86,7 +91,7 @@ async def map_site(
         for su in sitemap_urls:
             await _parse_sitemap_recursive(
                 su, c, seen, results, exclude,
-                base if same_domain else "", max_urls, set(), 0,
+                base if same_domain else "", max_urls, set(), 0, max_depth if max_depth > 0 else MAX_RECURSION,
             )
         if results:
             source = "sitemap"
@@ -140,8 +145,9 @@ async def _parse_sitemap_recursive(
     max_urls: int,
     parent_urls: set[str],
     depth: int,
+    max_depth: int = MAX_RECURSION,
 ) -> None:
-    if depth > MAX_RECURSION:
+    if depth > max_depth:
         return
     if sitemap_url in parent_urls:
         return
@@ -156,7 +162,7 @@ async def _parse_sitemap_recursive(
         # XML — could be sitemap index, urlset, RSS, or Atom
         try:
             import xml.etree.ElementTree as ET
-            root = ET.fromstring(content[:2000])
+            root = ET.fromstring(content[:10000])
             root_tag = _strip_ns(root.tag)
         except Exception:
             root_tag = ""
@@ -165,7 +171,7 @@ async def _parse_sitemap_recursive(
         if root_tag in ("sitemapindex", "urlset"):
             parsed = await _parse_xml_sitemap(
                 content, sitemap_url, seen, results,
-                exclude, domain_filter, max_urls, c, new_parents, depth + 1,
+                exclude, domain_filter, max_urls, c, new_parents, depth + 1, max_depth,
             )
         elif root_tag == "rss":
             parsed = await _parse_rss_sitemap(
@@ -231,6 +237,7 @@ async def _parse_xml_sitemap(
     c: httpx.AsyncClient,
     parent_urls: set[str],
     depth: int,
+    max_depth: int = MAX_RECURSION,
 ) -> bool:
     try:
         import xml.etree.ElementTree as ET
@@ -248,7 +255,7 @@ async def _parse_xml_sitemap(
                 url = _clean_url(loc.text.strip())
                 await _parse_sitemap_recursive(
                     url, c, seen, results, exclude,
-                    domain_filter, max_urls, parent_urls, depth,
+                    domain_filter, max_urls, parent_urls, depth + 1, max_depth,
                 )
         return True
 

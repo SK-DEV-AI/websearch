@@ -151,8 +151,8 @@ async def _cleanup_orphan_tabs():
         for t in result.get("targetInfos", []):
             if t["url"] == "about:blank":
                 await session.send("Target.closeTarget", {"targetId": t["targetId"]})
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("orphan tab cleanup: %s", e)
 
 
 # ── GoogleAIClient ────────────────────────────────────────────────
@@ -399,7 +399,7 @@ class GoogleAIClient:
                 pass
             await asyncio.sleep(0.5)
         await p.terminate_execution()
-        return CompletionResult(True, "timeout")
+        return CompletionResult(False, "timeout")
 
     # ── HTML → markdown ───────────────────────────────────────────
 

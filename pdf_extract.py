@@ -1,6 +1,7 @@
 """PDF extraction via opendataloader-pdf."""
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from pathlib import Path
@@ -48,7 +49,7 @@ async def extract_pdf(
     sources = [input_path] if isinstance(input_path, str) else input_path
     local_files: list[str] = []
     tmpdir = ""
-
+    out_tmpdir = ""
     try:
         for src in sources:
             src = src.strip()
@@ -73,6 +74,8 @@ async def extract_pdf(
             return {"success": False, "error": "No valid PDF files provided"}
 
         out = output_dir.strip() or tempfile.mkdtemp(prefix="odl_out_")
+        if not output_dir.strip():
+            out_tmpdir = out
 
         kwargs: dict[str, Any] = {
             "input_path": local_files if len(local_files) > 1 else local_files[0],
@@ -119,7 +122,7 @@ async def extract_pdf(
         if replace_invalid_chars:
             kwargs["replace_invalid_chars"] = replace_invalid_chars
 
-        opendataloader_pdf.convert(**kwargs)
+        await asyncio.to_thread(opendataloader_pdf.convert, **kwargs)
 
         result_files: dict[str, str] = {}
         out_dir = Path(out)
@@ -145,6 +148,8 @@ async def extract_pdf(
     except Exception as e:
         return {"success": False, "error": f"PDF extraction failed: {e}"}
     finally:
+        import shutil
         if tmpdir and os.path.isdir(tmpdir):
-            import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
+        if out_tmpdir and os.path.isdir(out_tmpdir):
+            shutil.rmtree(out_tmpdir, ignore_errors=True)

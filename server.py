@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger("websearch")
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, TextContent, Tool
 
-from config import MAX_RESULTS, HELIUM_CDP
+from config import MAX_RESULTS, HELIUM_CDP, get_http_client, _KeyRotator
 from search_ddg import ddgs_extract
 from fetch import fetch_url, scrapling_stealthy_fetch
 from crawl import crawl_url
@@ -169,7 +172,7 @@ async def handle_list_tools() -> list[Tool]:
          Tool(name="wikipedia",
             description="Search Wikipedia: articles, summaries, geosearch, random. Actions: search, summary (REST API v1 fast), summary_action (Action API with images/sections), categories, links, extlinks, categorymembers, pageviews, revisions, backlinks, recentchanges.",
             inputSchema={"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["search","summary","summary_action","geosearch","random","categories","links","extlinks","categorymembers","pageviews","revisions","backlinks","recentchanges","langlinks","allpages"], "default": "search"},
+                "action": {"type": "string", "enum": ["search","summary","summary_action","geosearch","random","categories","links","extlinks","categorymembers","pageviews","revisions","backlinks","recentchanges","langlinks","allpages"], "default": "search", "description": "search=find articles, summary=REST fast extract, summary_action=Action API+images, categories=list page cats, links=page links, extlinks=external links, categorymembers=pages in cat, pageviews=traffic stats, revisions=edit history, backlinks=what links here, recentchanges=recent edits, geosearch=near coordinates, random=random pages, langlinks=cross-lang links, allpages=list all pages"},
                 "query": {"type": "string"},
                 "count": {"type": "integer", "default": 3},
                 "language": {"type": "string", "default": "en"},
@@ -299,8 +302,8 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                         cdp_url=HELIUM_CDP, count=count, language=lang)
                     if fetched.get("fetched_content"):
                         r["fetched_content"] = fetched["fetched_content"]
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("enrich failed: %s", e)
             # Skip Groq synthesis when GAI already returned a full answer
             skip_synthesis = google_ai_only and r.get("ai_answer")
             if r.get("success") and bool(arguments.get("synthesize", True)) and r.get("results") and not skip_synthesis:
@@ -308,24 +311,20 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                     top = r["results"][:3]
                     ctx = "\n\n".join(f"[{i+1}] {x.get('title','')}: {x.get('content','')[:400]}"
                                      for i, x in enumerate(top))
-                    key = None
-                    for k in os.environ.get("GROQ_API_KEYS", "").split(","):
-                        k = k.strip()
-                        if k: key = k; break
-                    if key:
-                        from config import get_http_client
+                    _groq_keys = _KeyRotator("GROQ_API_KEYS")
+                    if _groq_keys.has_keys:
                         c = get_http_client()
                         resp = await c.post(
                             "https://api.groq.com/openai/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                            headers={"Authorization": f"Bearer {_groq_keys.next()}", "Content-Type": "application/json"},
                             json={"model": "openai/gpt-oss-120b",
                                   "messages": [{"role": "system", "content": "Answer concisely from sources. Use [N] citations like [1][2]."},
                                                {"role": "user", "content": f"Query: {query}\n\nResults:\n{ctx}"}],
                                   "temperature": 0.3, "max_tokens": 256}, timeout=15)
                         if resp.status_code == 200:
                             r["synthesis"] = {"answer": resp.json()["choices"][0]["message"]["content"].strip()}
-                except Exception:
-                    pass
+                except Exception as e:
+                    r["synthesis_error"] = str(e)
             return _res(r)
         elif name == "fetch":
             url = arguments["url"]
@@ -428,7 +427,7 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
             if cap_type in ("snapshot","both"):
                 snap = await cdpa11y_snapshot(url, verbose=bool(arguments.get("verbose",False)),
                     max_chars=safe_int(arguments.get("max_chars",10000)),
-                    depth=arguments.get("depth"),
+                    depth=arguments.get("depth") or 5,
                     boxes=bool(arguments.get("boxes",False)))
             if cap_type in ("screenshot","both"):
                 ss = await screenshot_cdp(url, full_page=full,

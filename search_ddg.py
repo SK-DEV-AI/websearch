@@ -133,4 +133,4 @@ async def search_google_rss(query: str, count: int = 10, region: str = "en",
             last_err = e
             if attempt < retries:
                 await asyncio.sleep(1 * (attempt + 1))
-    return [{"error": str(last_err)}]
+    return []

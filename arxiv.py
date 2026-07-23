@@ -62,6 +62,6 @@ async def search_arxiv(query: str, count: int = 3, search_field: str = "all",
                 "categories": categories, "primary_category": primary_cat,
                 "comment": comment, "journal_ref": journal_ref, "doi": doi,
             })
-        return [{"total": int(total)}] + results
+        return results
     except Exception:
         return []

@@ -210,25 +210,20 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     await _wait_cf_resolution(page)
 
                     # Run page interactions before extraction
+                    html_c = await page.document_html()
+                    extracted = trafilatura.extract(
+                        html_c, output_format='markdown', include_links=include_links,
+                        include_images=include_images, include_tables=include_tables,
+                        deduplicate=deduplicate, fast=True, url=url,
+                    ) or await page.inner_text()
                     if actions:
                         action_content = await run_actions(page, actions, timeout=30)
                         if action_content:
                             full_content = action_content
                         else:
-                            text = await page.evaluate(_CDP_EXTRACT_MARKDOWN_JS)
-                            full_content = text.strip() if text and text.strip() else ""
+                            full_content = extracted.strip()
                     else:
-                        text = await page.evaluate(_CDP_EXTRACT_MARKDOWN_JS)
-                        if text and text.strip():
-                            full_content = text.strip()
-                        else:
-                            html_c = await page.document_html()
-                            extracted = trafilatura.extract(
-                                html_c, output_format='markdown', include_links=include_links,
-                                include_images=include_images, include_tables=include_tables,
-                                deduplicate=deduplicate, fast=True, url=url,
-                            ) or await page.inner_text()
-                            full_content = extracted
+                        full_content = extracted.strip()
 
                     if isinstance(full_content, bytes):
                         full_content = full_content.decode("utf-8", errors="replace")
@@ -397,16 +392,6 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         return {"success": False, "url": url, "error": str(e)}
 
 
-_CDP_EXTRACT_MARKDOWN_JS = """
-() => {
-    const clone = document.cloneNode(true);
-    clone.querySelectorAll('script, style, noscript, iframe[src*="ads"], nav, footer, aside').forEach(e => e.remove());
-    const article = clone.querySelector('article') || clone.querySelector('[role="main"]') || clone.querySelector('main') || clone.body;
-    return article ? article.innerText : '';
-}
-"""
-
-
 async def _cdp_extract_content(page, css_selector: str | None, extraction_type: str,
                                page_url: str = "") -> str:
     if css_selector:
@@ -422,9 +407,6 @@ async def _cdp_extract_content(page, css_selector: str | None, extraction_type: 
     if extraction_type == "html":
         return await page.document_html()
     if extraction_type == "markdown":
-        text = await page.evaluate(_CDP_EXTRACT_MARKDOWN_JS)
-        if text and text.strip():
-            return text.strip()
         html_c = await page.document_html()
         content = trafilatura.extract(html_c, output_format='markdown', fast=True, url=page_url or None)
         return content or await page.inner_text()

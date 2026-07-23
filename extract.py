@@ -12,17 +12,14 @@ from crawl4ai.extraction_strategy import (
     RegexExtractionStrategy,
 )
 
-_GROQ_KEY: str = ""
+_DEFAULT_LLM = "groq/openai/gpt-oss-120b"
 
-def _init() -> None:
-    global _GROQ_KEY
+
+def _groq_key() -> str:
     raw = os.environ.get("GROQ_API_KEYS", "")
     if raw:
-        _GROQ_KEY = raw.split(",")[0].strip()
-
-_init()
-
-_DEFAULT_LLM = "groq/openai/gpt-oss-120b"
+        return raw.split(",")[0].strip()
+    return ""
 
 
 async def extract_content(
@@ -39,11 +36,12 @@ async def extract_content(
         extraction_strategy = None
 
         if strategy == "llm":
-            if not _GROQ_KEY:
+            groq_key = _groq_key()
+            if not groq_key:
                 return {"success": False, "error": "No GROQ_API_KEYS configured for LLM extraction"}
             instruction_text = instruction or "Extract all important content from this page as structured JSON"
             extraction_strategy = LLMExtractionStrategy(
-                llm_config=LLMConfig(provider=provider, api_token=_GROQ_KEY),
+                llm_config=LLMConfig(provider=provider, api_token=groq_key),
                 instruction=instruction_text,
                 extraction_type="block",
                 chunk_token_threshold=chunk_threshold,
@@ -118,5 +116,5 @@ def _guess_selector(field: str) -> str:
     name = field.lower().replace(" ", "-").replace("_", "-")
     return (
         f"[class*='{name}'], [id*='{name}'], .{name}, #{name}, "
-        f"[class*='{field.lower()}'], th:text-is('{field}')"
+        f"[class*='{field.lower()}']"
     )

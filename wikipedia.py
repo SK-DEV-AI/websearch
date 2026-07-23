@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import urllib.parse
+from datetime import datetime, timedelta
 from typing import Any
 
 from config import get_http_client
@@ -157,13 +158,15 @@ async def fetch_wikipedia_extlinks(title: str, language: str = "en", count: int 
 
 
 async def fetch_wikipedia_pageviews(title: str, language: str = "en",
-                                     days: int = 30) -> list[dict]:
+                                      days: int = 30) -> list[dict]:
     """Get daily pageview stats for the last N days."""
     try:
         encoded = urllib.parse.quote(title.replace(" ", "_"))
         c = get_http_client()
+        end = datetime.now()
+        start = end - timedelta(days=days)
         r = await c.get(
-            _REST_BASE.format(lang=language) + f"page/per-day/{encoded}/daily/{days}",
+            _REST_BASE.format(lang=language) + f"page/per-day/{encoded}/daily/{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}",
             headers={"User-Agent": _UA}, timeout=10)
         if r.status_code != 200:
             return []
@@ -321,7 +324,7 @@ async def fetch_wikipedia_langlinks(title: str, language: str = "en",
                      "langname": ll.get("langname", ""),
                      "autonym": ll.get("autonym", ""),
                      "title": ll.get("*", ""),
-                     "url": ll.get("*", "")} for ll in langlinks[:count]]
+                     "url": ll.get("url", "")} for ll in langlinks[:count]]
         return []
     except Exception:
         return []

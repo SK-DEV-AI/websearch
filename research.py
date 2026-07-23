@@ -19,11 +19,7 @@ from arxiv import search_arxiv
 from reddit import search_reddit
 from query_expand import expand_query
 from reranker import rerank as _rerank
-from resilience import CircuitBreaker
 
-
-# Circuit breakers for external APIs (shared across calls)
-_ddg_breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=60)
 
 
 # TinyFish intent detection
@@ -196,15 +192,10 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             queries = expanded[:4]
         ddg_count = max(count * 2 // len(queries), 5)
 
-        async def _ddg_with_breaker(q, n, **kw):
-            if not _ddg_breaker.allow():
-                return []
+        async def _ddg_search(q, n, **kw):
             try:
-                r = await search_ddg(q, n, **kw)
-                _ddg_breaker.record_success()
-                return r
+                return await search_ddg(q, n, **kw)
             except Exception:
-                _ddg_breaker.record_failure()
                 return []
 
         async def _reddit_search(q, n, **kw):
@@ -213,13 +204,28 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             except Exception:
                 return []
 
+        # Run each engine with the best query variants for broader recall
+        async def _multi_search(search_fn, variants, **kw):
+            """Run a search function across multiple query variants and merge results."""
+            results = await asyncio.gather(
+                *[search_fn(q, **kw) for q in variants],
+                return_exceptions=True,
+            )
+            out = []
+            for r in results:
+                if isinstance(r, list):
+                    out.extend(r)
+            return out
+
+        multi_variants = queries[:2]  # original query + best expanded variant
+
         tr_map = {"d": "day", "w": "week", "m": "month", "y": "year"}
         tavily_tr = tr_map.get(timelimit, "")
 
         ddg_tasks = {}
         for i, q in enumerate(queries):
             k = f"ddg_{i}"
-            ddg_tasks[k] = asyncio.create_task(_ddg_with_breaker(
+            ddg_tasks[k] = asyncio.create_task(_ddg_search(
                 q, ddg_count, search_type=search_type, backend=backend,
                 timelimit=timelimit, page=page, region=region, safesearch=safesearch,
                 size=size, color=color, type_image=type_image, layout=layout,
@@ -227,21 +233,27 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 license_videos=license_videos))
 
         tasks = {
-            "rss": asyncio.create_task(search_google_rss(query, count, region=region, timelimit=timelimit)),
-            "tavily": asyncio.create_task(search_tavily(query, n=count, topic=tavily_topic,
-                time_range=tavily_tr or tbs, search_depth=tavily_depth, include_raw_content=True,
+            "rss": asyncio.create_task(_multi_search(search_google_rss, multi_variants,
+                count=count, region=region, timelimit=timelimit)),
+            "tavily": asyncio.create_task(_multi_search(search_tavily, multi_variants,
+                n=count, topic=tavily_topic, time_range=tavily_tr or tbs,
+                search_depth=tavily_depth, include_raw_content=True,
                 start_date=start_date, end_date=end_date, exact_phrase=exact_phrase,
                 country=country, include_domains=include_domains, exclude_domains=exclude_domains)),
-            "wiki": asyncio.create_task(search_wikipedia(query, count=min(count, 8), language=language)),
-            "reddit": asyncio.create_task(_reddit_search(query, count,
+            "wiki": asyncio.create_task(_multi_search(search_wikipedia, multi_variants,
+                count=min(count, 8), language=language)),
+            "reddit": asyncio.create_task(_multi_search(
+                lambda q, **kw: _reddit_search(q, count, **kw), multi_variants,
                 subreddit=reddit_subreddit or None, include_comments=reddit_comments,
                 include_ai_summary=True)),
-            "arxiv": asyncio.create_task(search_arxiv(query, count=min(count, 10))),
-            "anysearch": asyncio.create_task(search_anysearch(query, count=min(count, 20), domain=domain,
+            "arxiv": asyncio.create_task(_multi_search(search_arxiv, multi_variants,
+                count=min(count, 10))),
+            "anysearch": asyncio.create_task(_multi_search(search_anysearch, multi_variants,
+                count=min(count, 20), domain=domain,
                 tag=anysearch_tag, zone=anysearch_zone, language=anysearch_language,
                 params=anysearch_params)),
-            "tinyfish": asyncio.create_task(tinyfish_search(query, count=min(count, 50),
-                domain_type=_detect_tinyfish_type(query), goal=query)),
+            "tinyfish": asyncio.create_task(_multi_search(tinyfish_search, multi_variants,
+                count=min(count, 50), domain_type=_detect_tinyfish_type(query), goal=query)),
             **ddg_tasks,
         }
         done = await asyncio.gather(*tasks.values(), return_exceptions=True)
