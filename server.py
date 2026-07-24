@@ -344,7 +344,6 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                     max_chars=max_chars,
                     offset=offset,
                     focus=str(arguments.get("focus", "")),
-                    actions=None,  # Handled above
                     cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
                     target_language=str(arguments.get("target_language", "")),
                     fast=bool(arguments.get("fast", False)),

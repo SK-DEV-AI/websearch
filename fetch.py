@@ -145,15 +145,13 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     include_comments: bool = True,
                     include_formatting: bool = True, include_links: bool = True,
                     prune_xpath: str = "", url_blacklist: str = "",
-                    author_blacklist: str = "", cdp_url: str = "",
-                    min_output_size: int = 0, raw: bool = False,
-                    # New params
-                    offset: int = 0, focus: str = "", actions: list | None = None,
+                    author_blacklist: str = "", min_output_size: int = 0,
+                    raw: bool = False, offset: int = 0, focus: str = "",
                     cache_ttl: int = 3600) -> dict:
-    """Fetch a URL with cache, focus filtering, actions, and pagination.
+    """Fetch a URL with cache, focus filtering, and pagination via httpx + trafilatura.
 
-    Cache keyed by URL+extraction_type+css_selector (focus and offset
-    are NOT part of the key — different queries share one cache entry).
+    Cache keyed by URL+extraction_type (focus and offset are NOT part of the key).
+    CDP-fetching (Cloudflare bypass, actions) should use ``scrapling_stealthy_fetch``.
     """
     # SSRF validation — reject internal/private/reserved URLs
     try:
@@ -164,8 +162,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         url_lower = url.lower()
         extraction_type = output_format  # Backward compat
 
-        # ── Cache check (skip when actions change state or cache_ttl=0) ──
-        if cache_ttl > 0 and not actions:
+        # ── Cache check ─────────────────────────────────────────────
+        if cache_ttl > 0:
             cached = await cache_mod.get_cached(
                 url, extraction_type=extraction_type, ttl=cache_ttl)
             if cached:
@@ -195,61 +193,6 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                                   offset, max_chars, method="raw")
             except Exception as e:
                 return {"success": False, "url": url, "error": f"Raw fetch failed: {e}"}
-
-        # ── CDP-first path (when cdp_url provided OR actions given) ──
-        if cdp_url or actions:
-            try:
-                page = await _get_optimized_page(block_resources=True)
-                try:
-                    await page.goto(url, wait_until="commit", timeout=15)
-                    await page.wait_for_load_state("domcontentloaded", timeout=15)
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=15)
-                    except Exception:
-                        pass
-                    await _wait_cf_resolution(page)
-
-                    # Run page interactions before extraction
-                    html_c = await page.document_html()
-                    extracted = trafilatura.extract(
-                        html_c, output_format='markdown', include_links=include_links,
-                        include_images=include_images, include_tables=include_tables,
-                        deduplicate=deduplicate, fast=True, url=url,
-                    ) or await page.inner_text()
-                    if actions:
-                        action_content = await run_actions(page, actions, timeout=30)
-                        if action_content:
-                            full_content = action_content
-                        else:
-                            full_content = extracted.strip()
-                    else:
-                        full_content = extracted.strip()
-
-                    if isinstance(full_content, bytes):
-                        full_content = full_content.decode("utf-8", errors="replace")
-                    title = await page.title()
-
-                    # Cache the full content
-                    if cache_ttl > 0:
-                        asyncio.ensure_future(cache_mod.set_cached(
-                            url, full_content, extraction_type=extraction_type,
-                            title=title or "", ttl=cache_ttl))
-
-                    if focus:
-                        full_content = focus_mod.filter_by_relevance(full_content, focus)
-                    return _build_paginated_response(url, full_content, 200,
-                                                      title or "", {}, "",
-                                                      offset, max_chars, method="cdp")
-                finally:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                    asyncio.ensure_future(_cleanup_orphan_tabs())
-            except Exception:
-                if actions:
-                    return {"success": False, "url": url, "error": "CDP actions fetch failed"}
-                pass  # Fall through to httpx
 
         # ── PDF / EPUB / DOCX ───────────────────────────────────────
         if url_lower.endswith('.pdf'):
@@ -393,7 +336,11 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
 
 async def _cdp_extract_content(page, css_selector: str | None, extraction_type: str,
-                               page_url: str = "") -> str:
+                               page_url: str = "",
+                               include_links: bool = True,
+                               include_images: bool = True,
+                               include_tables: bool = True,
+                               deduplicate: bool = True) -> str:
     if css_selector:
         text = await page.evaluate(f"""
             (() => {{
@@ -408,9 +355,103 @@ async def _cdp_extract_content(page, css_selector: str | None, extraction_type: 
         return await page.document_html()
     if extraction_type == "markdown":
         html_c = await page.document_html()
-        content = trafilatura.extract(html_c, output_format='markdown', fast=True, url=page_url or None)
+        content = trafilatura.extract(html_c, output_format='markdown', fast=True,
+                                      include_links=include_links, include_images=include_images,
+                                      include_tables=include_tables, deduplicate=deduplicate,
+                                      url=page_url or None)
         return content or await page.inner_text()
     return await page.inner_text()
+
+
+async def _cdp_fetch_page(
+    url: str,
+    *,
+    block_resources: bool = True,
+    network_idle: bool = True,
+    init_script: str = "",
+    blocked_domains: list | None = None,
+    wait_selector: str = "",
+    actions: list | None = None,
+    css_selector: str | None = None,
+    extraction_type: str = "markdown",
+    retries: int = 3,
+    timeout: int = 15,
+    include_links: bool = True,
+    include_images: bool = True,
+    include_tables: bool = True,
+    deduplicate: bool = True,
+) -> dict:
+    """Navigate to *url* via CDP, run actions or extract content, then close.
+
+    Returns ``{"success": True, "url": ..., "title": ..., "content": ...}``
+    on success, or ``{"success": False, "url": ..., "error": ...}``
+    after all retries are exhausted.
+    """
+    last_err = None
+    for attempt in range(max(retries, 1)):
+        page = None
+        try:
+            page = await _get_optimized_page(block_resources=block_resources)
+            if blocked_domains:
+                try:
+                    await page.set_blocked_resources(list(blocked_domains))
+                except Exception:
+                    pass
+            if init_script:
+                try:
+                    await page.add_init_script(init_script)
+                except Exception:
+                    pass
+            await page.goto(url, wait_until="commit", timeout=timeout)
+            await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+            if network_idle:
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=timeout)
+                except Exception:
+                    pass
+            if wait_selector:
+                try:
+                    await _cdp_wait_for_selector(page, wait_selector, timeout=10)
+                except Exception:
+                    pass
+            try:
+                await _wait_cf_resolution(page)
+            except Exception:
+                pass
+
+            if actions:
+                content = await run_actions(page, actions, timeout=30)
+            else:
+                content = await _cdp_extract_content(
+                    page, css_selector, extraction_type, page_url=url,
+                    include_links=include_links, include_images=include_images,
+                    include_tables=include_tables, deduplicate=deduplicate)
+
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            title = await page.title()
+
+            return {"success": True, "url": url,
+                    "title": title or "", "content": (content or "")}
+        except Exception as e:
+            last_err = e
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if attempt < retries - 1:
+                await asyncio.sleep(min(0.5 * (attempt + 1), 2.0))
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            asyncio.ensure_future(_cleanup_orphan_tabs())
+
+    return {"success": False, "url": url,
+            "error": str(last_err) if last_err else "CDP fetch failed"}
 
 
 async def scrapling_stealthy_fetch(
@@ -432,74 +473,27 @@ async def scrapling_stealthy_fetch(
         return {"success": False, "error": str(e), "url": url}
     # ── CDP-first path (primary) ──────────────────────────────────
     if cdp_url:
-        last_err = None
-        for attempt in range(max(retries, 1)):
-            page = None
-            try:
-                page = await _get_optimized_page(block_resources=disable_resources)
-                if blocked_domains:
-                    try:
-                        await page.set_blocked_resources(list(blocked_domains))
-                    except Exception:
-                        pass
-                if init_script:
-                    try:
-                        await page.add_init_script(init_script)
-                    except Exception:
-                        pass
-                goto_timeout = min(timeout, 15000) / 1000
-                await page.goto(url, wait_until="commit", timeout=goto_timeout)
-                dc_timeout = min(timeout, 15000) / 1000
-                await page.wait_for_load_state("domcontentloaded", timeout=dc_timeout)
-                if network_idle:
-                    try:
-                        ni_timeout = min(timeout, 15000) / 1000
-                        await page.wait_for_load_state("networkidle", timeout=ni_timeout)
-                    except Exception:
-                        pass
-                if wait_selector:
-                    try:
-                        await _cdp_wait_for_selector(page, wait_selector, timeout=10)
-                    except Exception:
-                        pass
-                try:
-                    await _wait_cf_resolution(page)
-                except Exception:
-                    pass
-                # Run page interactions before extraction
-                if page_action:
-                    action_content = await run_actions(page, page_action, timeout=30)
-                    if action_content:
-                        content = action_content
-                    else:
-                        content = await _cdp_extract_content(page, css_selector, extraction_type, page_url=url)
-                else:
-                    content = await _cdp_extract_content(page, css_selector, extraction_type, page_url=url)
-                if isinstance(content, bytes):
-                    content = content.decode("utf-8", errors="replace")
-                title = await page.title()
-                return {"success": True, "url": url, "title": title or "",
-                        "content": (content or "")[:50000], "method": "cdp",
-                        "attempt": attempt + 1}
-            except Exception as e:
-                last_err = e
-                if page:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                if attempt < retries - 1:
-                    await asyncio.sleep(min(0.5 * (attempt + 1), 2.0))
-                    continue
-                break
-            finally:
-                if page:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                asyncio.ensure_future(_cleanup_orphan_tabs())
-        # CDP failed after all retries — fall through to scrapling
+        result = await _cdp_fetch_page(
+            url=url,
+            block_resources=disable_resources,
+            network_idle=network_idle,
+            init_script=init_script,
+            blocked_domains=blocked_domains,
+            wait_selector=wait_selector,
+            actions=page_action if page_action else None,
+            css_selector=css_selector,
+            extraction_type=extraction_type,
+            retries=retries,
+            timeout=min(timeout, 15000) / 1000,
+        )
+        if result.get("success"):
+            return {
+                "success": True, "url": url,
+                "title": result.get("title", ""),
+                "content": (result.get("content", "") or "")[:50000],
+                "method": "cdp", "attempt": 1,
+            }
+        # CDP failed — fall through to scrapling
 
     # ── Scrapling AsyncStealthySession (last resort fallback) ──────
     try:
