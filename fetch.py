@@ -252,9 +252,11 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             full_content = content
             if focus:
                 full_content = focus_mod.filter_by_relevance(full_content, focus)
-            return _build_paginated_response(url, full_content, resp.status,
+            result = _build_paginated_response(url, full_content, resp.status,
                                               "", {}, "",
                                               offset, max_chars, method="httpx")
+            result["raw_size"] = len(raw_html)
+            return result
 
         kw: dict[str, Any] = {
             "output_format": output_format, "with_metadata": True,
@@ -303,6 +305,14 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             return {"success": False, "url": url,
                     "error": "Cloudflare challenge detected — auto-fallback to CDP in progress."}
 
+        # Generic bot challenge detection (CreepJS, BotD, Anubis, PerimeterX, etc.)
+        # These serve JS-heavy pages with minimal readable text — trafilatura extracts
+        # very little despite a large raw HTML payload.
+        raw_len = len(raw_html)
+        if raw_len > 5000 and len(full_content) < 500:
+            return {"success": False, "url": url,
+                    "error": f"Bot challenge detected ({raw_len} bytes HTML, {len(full_content)} chars text)"}
+
         if min_output_size and len(full_content) < min_output_size:
             return {"success": False, "url": url,
                     "error": f"Content too short ({len(full_content)} < {min_output_size} chars)"}
@@ -326,10 +336,12 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
         if focus:
             full_content = focus_mod.filter_by_relevance(full_content, focus)
-        return _build_paginated_response(url, full_content, resp.status,
+        result = _build_paginated_response(url, full_content, resp.status,
                                           title or meta.get("title", ""),
                                           {k: v for k, v in meta.items() if v}, "",
                                           offset, max_chars, method="httpx")
+        result["raw_size"] = raw_len
+        return result
     except Exception as e:
         return {"success": False, "url": url, "error": str(e)}
 
