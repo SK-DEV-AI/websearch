@@ -10,6 +10,7 @@ import trafilatura
 
 from scrapling.fetchers import AsyncFetcher, AsyncStealthySession
 
+from bot_detection import detect_antibot
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
 from security import SecurityError, validate_url as _validate_url
 import cache as cache_mod
@@ -297,21 +298,29 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 full_content = raw_html.strip()
         full_content = full_content.strip()
 
-        # Cloudflare challenge detection
-        cf_keywords = ["just a moment", "checking your browser", "cf-challenge",
-                       "cloudflare ray id", "__cf_chl_", "cf-turnstile",
-                       "verify you are human", "attention required"]
-        if full_content and sum(1 for kw in cf_keywords if kw in full_content[:600].lower()) >= 2:
+        # Bot challenge detection via vendor-specific patterns (is-antibot port)
+        # Covers Cloudflare, Akamai, DataDome, PerimeterX, Anubis, reCAPTCHA,
+        # Turnstile, hCaptcha, and 25+ more — all from static HTTP response data.
+        headers_dict = getattr(resp, "headers", {})
+        set_cookie = headers_dict.get("set-cookie", headers_dict.get("Set-Cookie"))
+        detected, provider, detection_type = detect_antibot(
+            html=raw_html,
+            url=url,
+            status_code=resp.status,
+            headers=headers_dict,
+            set_cookie=set_cookie,
+        )
+        if detected:
             return {"success": False, "url": url,
-                    "error": "Cloudflare challenge detected — auto-fallback to CDP in progress."}
+                    "error": f"{provider} challenge detected ({detection_type}) — auto-fallback to CDP in progress."}
 
-        # Generic bot challenge detection (CreepJS, BotD, Anubis, PerimeterX, etc.)
-        # These serve JS-heavy pages with minimal readable text — trafilatura extracts
-        # very little despite a large raw HTML payload.
+        # Generic density-based fallback for unknown challenge vendors
+        # (is-antibot patterns only cover known vendors — new/obscure challenge
+        # pages also serve massive JS payloads with near-empty extracted text.)
         raw_len = len(raw_html)
         if raw_len > 5000 and len(full_content) < 500:
             return {"success": False, "url": url,
-                    "error": f"Bot challenge detected ({raw_len} bytes HTML, {len(full_content)} chars text)"}
+                    "error": f"Unknown bot challenge detected ({raw_len} bytes HTML, {len(full_content)} chars text)"}
 
         if min_output_size and len(full_content) < min_output_size:
             return {"success": False, "url": url,
