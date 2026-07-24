@@ -14,7 +14,6 @@ from search_gai import _get_optimized_page, _cleanup_orphan_tabs
 from security import SecurityError, validate_url as _validate_url
 import cache as cache_mod
 import focus as focus_mod
-from actions import run_actions
 
 logger = logging.getLogger("fetch")
 
@@ -371,7 +370,6 @@ async def _cdp_fetch_page(
     init_script: str = "",
     blocked_domains: list | None = None,
     wait_selector: str = "",
-    actions: list | None = None,
     css_selector: str | None = None,
     extraction_type: str = "markdown",
     retries: int = 3,
@@ -419,13 +417,10 @@ async def _cdp_fetch_page(
             except Exception:
                 pass
 
-            if actions:
-                content = await run_actions(page, actions, timeout=30)
-            else:
-                content = await _cdp_extract_content(
-                    page, css_selector, extraction_type, page_url=url,
-                    include_links=include_links, include_images=include_images,
-                    include_tables=include_tables, deduplicate=deduplicate)
+            content = await _cdp_extract_content(
+                page, css_selector, extraction_type, page_url=url,
+                include_links=include_links, include_images=include_images,
+                include_tables=include_tables, deduplicate=deduplicate)
 
             if isinstance(content, bytes):
                 content = content.decode("utf-8", errors="replace")
@@ -465,7 +460,7 @@ async def scrapling_stealthy_fetch(
     wait_selector_state: str = "attached", blocked_domains: list | None = None,
     init_script: str = "", extra_headers: dict | None = None,
     useragent: str = "", load_dom: bool = False,
-    page_action=None, page_setup=None) -> dict:
+    page_setup=None) -> dict:
     # SSRF validation
     try:
         url = await _validate_url(url)
@@ -480,7 +475,6 @@ async def scrapling_stealthy_fetch(
             init_script=init_script,
             blocked_domains=blocked_domains,
             wait_selector=wait_selector,
-            actions=page_action if page_action else None,
             css_selector=css_selector,
             extraction_type=extraction_type,
             retries=retries,
@@ -530,8 +524,6 @@ async def scrapling_stealthy_fetch(
             if wait_selector:
                 fk["wait_selector"] = wait_selector
                 fk["wait_selector_state"] = wait_selector_state
-            if page_action:
-                fk["page_action"] = page_action
             if page_setup:
                 fk["page_setup"] = page_setup
             p = await session.fetch(**fk)
