@@ -160,8 +160,12 @@ async def _get_ai_summary(page, query: str) -> dict | None:
         try:
             await page.goto(answers_url, referrer=search_url)
 
-            # Poll for streaming content to appear in shadow root (up to 20s)
+            # Poll for streaming content to appear in shadow root (up to 20s).
+            # After first chunk appears (>100 chars), wait for content-length
+            # stability (3x no-growth = stream complete) before extracting.
             full = None
+            prev = 0
+            stable = 0
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 chunk = await page.evaluate('''
@@ -173,8 +177,15 @@ async def _get_ai_summary(page, query: str) -> dict | None:
 })()
 ''')
                 if chunk and isinstance(chunk, str):
-                    full = chunk
-                    break
+                    cur = len(chunk)
+                    if cur == prev:
+                        stable += 1
+                        if stable >= 3:
+                            full = chunk
+                            break
+                    else:
+                        prev = cur
+                        stable = 0
                 await asyncio.sleep(0.5)
             if full and isinstance(full, str) and len(full.strip()) > 100:
                 result["full_answer"] = full.strip()
