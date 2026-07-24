@@ -87,7 +87,7 @@ server = Server("websearch", instructions=INSTRUCTIONS)
 async def handle_list_tools() -> list[Tool]:
     return [
         Tool(name="search",
-            description="Multi-engine web search with dedup and reranking. Pipeline: query_expand -> 8 parallel engines -> NIM dedup -> reranker (scores). depth=1 returns snippets with relevance_score+fetch_relevance per result and engine_blocked list. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode answer.",
+            description="Multi-engine web search with dedup and reranking. Pipeline: query_expand -> 8 parallel engines -> NIM dedup -> reranker (scores). depth=1 returns snippets with relevance_score+fetch_relevance per result and engine_blocked list. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode answer. e.g. search(query='latest AI models', depth=1)",
             inputSchema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 10},
                 "depth": {"type": "integer", "default": 1, "description": "1=snippets, 2+=fetch full pages + rerank"},
@@ -106,10 +106,10 @@ async def handle_list_tools() -> list[Tool]:
                 "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"}},
                 "required": ["query"]}),
          Tool(name="fetch",
-            description="URL to markdown/text. Auto-fallback: httpx+trafilatura then CDP for Cloudflare/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected (blocks internal/private IPs, DNS rebinding). Use focus=\"query\" to BM25-filter content. Use offset + max_chars for paginated reads (response has next_offset/is_truncated). Use actions=[...] for page interactions before extraction. Results cached 1h; cache_ttl=0 force fresh.",
+            description="URL to markdown/text. Auto-fallback: httpx+trafilatura then CDP for Cloudflare/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected (blocks internal/private IPs, DNS rebinding). Use focus=\"query\" to BM25-filter content. Use offset + max_chars for paginated reads (response has next_offset/is_truncated/total_extracted_chars). Use actions=[...] for page interactions before extraction. Results cached 1h; cache_ttl=0 force fresh. e.g. fetch(url='https://example.com')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "max_chars": {"type": "integer", "default": 5000, "description": "Chars to return per call (for pagination)"},
-                "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated + next_offset."},
+                "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated, next_offset, total_extracted_chars (full page size)."},
                 "focus": {"type": "string", "description": "BM25 relevance filter — extract only content blocks relevant to this query. Runs on cached content too."},
                 "actions": {"type": "array", "items": {"type": "object"}, "description": "Page interaction actions before extraction: [{\"click\": \"#btn\"}, {\"wait\": 500}, {\"fill\": {\"selector\": \"input#q\", \"text\": \"query\"}}, {\"press\": \"Enter\"}, {\"wait_selector\": \".results\"}]"},
                 "cache_ttl": {"type": "integer", "default": 3600, "description": "Cache TTL in seconds (0 = force fresh fetch). Cache keyed by URL+extraction_type+css_selector, not focus/offset."},
@@ -129,7 +129,7 @@ async def handle_list_tools() -> list[Tool]:
                    },
                 "required": ["url"]}),
         Tool(name="crawl",
-            description="BFS/DFS deep crawl. Returns per-page markdown + combined text.",
+            description="BFS/DFS deep crawl. Returns per-page markdown + combined text. e.g. crawl(url='https://example.com', max_depth=2)",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "max_depth": {"type": "integer", "default": 1},
                 "max_pages": {"type": "integer", "default": 10},
@@ -148,7 +148,7 @@ async def handle_list_tools() -> list[Tool]:
                 "exclude_external_images": {"type": "boolean", "default": False}},
                 "required": ["url"]}),
          Tool(name="screenshot",
-            description="CDP screenshot or ARIA accessibility snapshot (AI-optimized for LLMs). Use start_line/end_line for snapshot text range reads.",
+            description="CDP screenshot or ARIA accessibility snapshot (AI-optimized for LLMs). Use start_line/end_line for snapshot text range reads. e.g. screenshot(url='https://example.com', type='snapshot')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "full_page": {"type": "boolean", "default": True},
                 "type": {"type": "string", "enum": ["screenshot","snapshot","both"]},
@@ -170,7 +170,7 @@ async def handle_list_tools() -> list[Tool]:
                 "end_line": {"type": "integer", "description": "1-based end line (inclusive) for snapshot text range"}},
                 "required": ["url"]}),
          Tool(name="wikipedia",
-            description="Search Wikipedia: articles, summaries, geosearch, random. Actions: search, summary (REST API v1 fast), summary_action (Action API with images/sections), categories, links, extlinks, categorymembers, pageviews, revisions, backlinks, recentchanges.",
+            description="Search Wikipedia: articles, summaries, geosearch, random. Actions: search, summary (REST API v1 fast), summary_action (Action API with images/sections), categories, links, extlinks, categorymembers, pageviews, revisions, backlinks, recentchanges. e.g. wikipedia(query='Python', action='summary')",
             inputSchema={"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["search","summary","summary_action","geosearch","random","categories","links","extlinks","categorymembers","pageviews","revisions","backlinks","recentchanges","langlinks","allpages"], "default": "search", "description": "search=find articles, summary=REST fast extract, summary_action=Action API+images, categories=list page cats, links=page links, extlinks=external links, categorymembers=pages in cat, pageviews=traffic stats, revisions=edit history, backlinks=what links here, recentchanges=recent edits, geosearch=near coordinates, random=random pages, langlinks=cross-lang links, allpages=list all pages"},
                 "query": {"type": "string"},
@@ -185,7 +185,7 @@ async def handle_list_tools() -> list[Tool]:
                 "distance": {"type": "integer", "default": 1000, "description": "Search radius in meters for geosearch"}},
                 "required": []}),
         Tool(name="arxiv",
-            description="Search arXiv academic papers. Use raw_query for boolean operators (AND, OR, ANDNOT), phrase search (ti:\"exact phrase\"), wildcards (au:smith*).",
+            description="Search arXiv academic papers. Use raw_query for boolean operators (AND, OR, ANDNOT), phrase search (ti:\"exact phrase\"), wildcards (au:smith*). e.g. arxiv(query='cs.AI transformer', count=5)",
             inputSchema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 3},
                 "search_field": {"type": "string", "enum": ["all","ti","au","abs","cat","co","jr","id"], "default": "all"},
@@ -197,7 +197,7 @@ async def handle_list_tools() -> list[Tool]:
                 "raw_query": {"type": "string", "description": "Raw arXiv search_query syntax with boolean operators (AND/OR/ANDNOT), phrase, wildcards. Overrides query+search_field."}},
                 "required": ["query"]}),
         Tool(name="map_site",
-            description="Discover all pages on a website via sitemap XML (primary) and HTML link extraction (fallback). Returns the base domain, source type, total count, and an array of discovered URLs with metadata (last_modified, priority, changefreq when available).",
+            description="Discover all pages on a website via sitemap XML (primary) and HTML link extraction (fallback). Returns the base domain, source type, total count, and an array of discovered URLs with metadata (last_modified, priority, changefreq when available). e.g. map_site(url='https://example.com')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "Full URL of the site to map (e.g. https://example.com)"},
                 "max_urls": {"type": "integer", "default": 1000, "description": "Cap on returned URLs"},
@@ -208,12 +208,12 @@ async def handle_list_tools() -> list[Tool]:
                 "exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex patterns to exclude matching URLs"}},
                 "required": ["url"]}),
          Tool(name="ddgs_extract",
-            description="Lightweight URL content extraction via DuckDuckGo's extract endpoint. Faster than fetch for simple pages — markdown or plain text. Best for search snippets and quick page reads where trafilatura is overkill.",
+            description="Lightweight URL content extraction via DuckDuckGo's extract endpoint. Faster than fetch for simple pages — markdown or plain text. Best for search snippets and quick page reads where trafilatura is overkill. e.g. ddgs_extract(url='https://example.com')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "extract_type": {"type": "string", "enum": ["markdown","text_plain","raw"], "default": "markdown"}},
                 "required": ["url"]}),
          Tool(name="extract",
-            description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Uses crawl4ai to crawl the page and apply the chosen extraction strategy. For LLM strategy, describe what you want (e.g., 'extract product name, price, and rating') and get clean JSON back. For CSS strategy, provide field names to extract via heuristic selectors. No CSS selector maintenance needed.",
+            description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Uses crawl4ai to crawl the page and apply the chosen extraction strategy. For LLM strategy, describe what you want and get clean JSON back. For CSS strategy, provide field names. Examples: extract(url='...', instruction='extract product name and price') or extract(url='...', fields=['name','price'], strategy='css')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "Target URL to extract data from"},
                 "instruction": {"type": "string", "description": "Natural language extraction instruction (used with strategy=llm). Example: 'extract all product names, prices, and ratings from this page'"},
@@ -224,7 +224,7 @@ async def handle_list_tools() -> list[Tool]:
                 "provider": {"type": "string", "default": "groq/openai/gpt-oss-120b", "description": "LLM provider string in LiteLLM format (e.g. groq/openai/gpt-oss-120b, openai/gpt-4o, ollama/llama2)"}},
                 "required": ["url"]}),
          Tool(name="pdf_extract",
-            description="PDF to structured data via opendataloader-pdf. Extracts text, tables, formulas, images with bounding boxes. Supports scanned PDFs (OCR), complex tables, and accessibility tagging.",
+            description="PDF to structured data via opendataloader-pdf. Extracts text, tables, formulas, images with bounding boxes. Supports scanned PDFs (OCR), complex tables, and accessibility tagging. e.g. pdf_extract(input_path='/path/to/doc.pdf', format='markdown')",
             inputSchema={"type": "object", "properties": {
                 "input_path": {"type": "array", "items": {"type": "string"}, "description": "PDF file paths or URLs (local files, http/https, file://)"},
                 "format": {"type": "string", "enum": ["markdown","json","html","tagged-pdf","markdown,json","markdown,json,html"], "default": "markdown"},
