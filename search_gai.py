@@ -389,7 +389,7 @@ class GoogleAIClient:
                         cur = len(await p.evaluate("document.body.innerText"))
                         if cur == prev_len:
                             stable_count += 1
-                            if stable_count >= 3:
+                            if stable_count >= 6:
                                 return CompletionResult(True, "svg")
                         else:
                             prev_len = cur
@@ -406,7 +406,7 @@ class GoogleAIClient:
                     cur = len(body)
                     if cur == prev_len:
                         stable_count += 1
-                        if stable_count >= 3:
+                        if stable_count >= 6:
                             return CompletionResult(True, "text")
                     else:
                         prev_len = cur

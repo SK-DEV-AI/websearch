@@ -180,7 +180,7 @@ async def _get_ai_summary(page, query: str) -> dict | None:
                     cur = len(chunk)
                     if cur == prev:
                         stable += 1
-                        if stable >= 3:
+                        if stable >= 6:
                             full = chunk
                             break
                     else:
