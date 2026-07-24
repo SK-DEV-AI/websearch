@@ -71,7 +71,7 @@ async def extract_content(
 
         config = CrawlerRunConfig(
             extraction_strategy=extraction_strategy,
-            cache_mode=None,
+            cache_mode=None,  # None → CacheMode.ENABLED (persistent SQLite cache)
             verbose=False,
             page_timeout=30000,
         )

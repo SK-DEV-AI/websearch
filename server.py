@@ -106,7 +106,7 @@ async def handle_list_tools() -> list[Tool]:
                 "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"}},
                 "required": ["query"]}),
          Tool(name="fetch",
-            description="URL to markdown/text. Auto-fallback: httpx+trafilatura then CDP for Cloudflare/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected (blocks internal/private IPs, DNS rebinding). Use focus=\"query\" to BM25-filter content. Use offset + max_chars for paginated reads (response has next_offset/is_truncated/total_extracted_chars). Use actions=[...] for page interactions before extraction. Results cached 1h; cache_ttl=0 force fresh. e.g. fetch(url='https://example.com')",
+            description="URL to markdown/text. Auto-fallback: httpx+trafilatura then CDP for Cloudflare/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected (blocks internal/private IPs, DNS rebinding). Use focus=\"query\" to BM25-filter content. Use offset + max_chars for paginated reads (response has next_offset/is_truncated/total_extracted_chars). Use actions=[...] for page interactions before extraction. Results cached 1h; cache_ttl=0 force fresh. For structured JSON extraction (LLM-driven or CSS), use `extract` instead. e.g. fetch(url='https://example.com')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "max_chars": {"type": "integer", "default": 5000, "description": "Chars to return per call (for pagination)"},
                 "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated, next_offset, total_extracted_chars (full page size)."},
@@ -213,7 +213,7 @@ async def handle_list_tools() -> list[Tool]:
                 "url": {"type": "string"}, "extract_type": {"type": "string", "enum": ["markdown","text_plain","raw"], "default": "markdown"}},
                 "required": ["url"]}),
          Tool(name="extract",
-            description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Uses crawl4ai to crawl the page and apply the chosen extraction strategy. For LLM strategy, describe what you want and get clean JSON back. For CSS strategy, provide field names. Examples: extract(url='...', instruction='extract product name and price') or extract(url='...', fields=['name','price'], strategy='css')",
+            description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Uses crawl4ai (persistent cache — repeat calls are free). For LLM strategy, describe what you want and get clean JSON back. For CSS strategy, provide field names. For raw page content (markdown/text), use `fetch` instead. Examples: extract(url='...', instruction='extract product name and price') or extract(url='...', fields=['name','price'], strategy='css')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "Target URL to extract data from"},
                 "instruction": {"type": "string", "description": "Natural language extraction instruction (used with strategy=llm). Example: 'extract all product names, prices, and ratings from this page'"},
