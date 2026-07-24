@@ -155,6 +155,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     _start = time.monotonic()
     engines_used: list[str] = []
     results: list[dict] = []
+    engine_totals: dict[str, int] = {}
     ai_answer = ""
     follow_up = ""
 
@@ -206,16 +207,25 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
 
         # Run each engine with the best query variants for broader recall
         async def _multi_search(search_fn, variants, **kw):
-            """Run a search function across multiple query variants and merge results."""
+            """Run a search function across multiple query variants and merge results.
+
+            Returns a dict with ``results`` (merged list) and ``total_available``
+            (0 if the underlying function only returns a plain list).
+            """
             results = await asyncio.gather(
                 *[search_fn(q, **kw) for q in variants],
                 return_exceptions=True,
             )
             out = []
+            total_available = 0
             for r in results:
-                if isinstance(r, list):
+                if isinstance(r, dict):
+                    out.extend(r.get("results", []))
+                    if r.get("total_available", 0) > total_available:
+                        total_available = r["total_available"]
+                elif isinstance(r, list):
                     out.extend(r)
-            return out
+            return {"results": out, "total_available": total_available}
 
         multi_variants = queries[:2]  # original query + best expanded variant
 
@@ -260,9 +270,21 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         done_map = dict(zip(tasks.keys(), done))
         for key in ("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish") + tuple(ddg_tasks.keys()):
             val = done_map[key]
-            if isinstance(val, BaseException) or not isinstance(val, list):
+            if isinstance(val, BaseException):
                 continue
-            for r in val:
+            if isinstance(val, dict):
+                results_list = val.get("results", [])
+                ta = val.get("total_available", 0)
+            elif isinstance(val, list):
+                results_list = val
+                ta = 0
+            else:
+                continue
+            if ta > 0:
+                eng_name = "duckduckgo" if key.startswith("ddg") else (
+                    "google-news-rss" if key == "rss" else key)
+                engine_totals[eng_name] = ta
+            for r in results_list:
                 if isinstance(r, dict) and "error" not in r and r.get("url"):
                     if not any(e.get("url") == r["url"] for e in results):
                         if key != "reddit" or r.get("engine") in ("reddit", "reddit-comment", "reddit-ai-summary"):
@@ -276,9 +298,15 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish"}
         for key, name in eng.items():
             val = done_map.get(key)
-            if isinstance(val, list) and any(isinstance(r, dict) and "error" not in r for r in val):
+            if isinstance(val, dict):
+                rl = val.get("results", [])
+            elif isinstance(val, list):
+                rl = val
+            else:
+                continue
+            if any(isinstance(r, dict) and "error" not in r for r in rl):
                 engines_used.append(name)
-        if any(isinstance(done_map[k], list) for k in ddg_tasks):
+        if any(isinstance(done_map.get(k), (list, dict)) for k in ddg_tasks):
             engines_used.append("duckduckgo")
 
         try:
@@ -327,6 +355,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         related = []
     out: dict = {"success": True, "engines_used": engines_used,
                  "engine_blocked": engine_blocked,
+                 "engine_totals": engine_totals,
                  "ai_answer": ai_answer, "follow_up": follow_up,
                  "related_queries": related,
                  "results": deduped[:count], "total": len(deduped[:count]),

@@ -37,14 +37,15 @@ async def search_wikipedia(query: str, count: int = 3, language: str = "en",
         data = await _get(params, language)
         if not data:
             return []
-        return [{"title": h.get("title", ""),
+        return {"results": [{"title": h.get("title", ""),
                  "url": _page_url(h.get("title", ""), language),
                  "snippet": _clean_snippet(h.get("snippet", "")),
                  "source": "wikipedia", "timestamp": h.get("timestamp", ""),
                  "wordcount": h.get("wordcount", 0)}
-                for h in data.get("query", {}).get("search", [])]
+                for h in data.get("query", {}).get("search", [])],
+                "total_available": data.get("query", {}).get("searchinfo", {}).get("totalhits", 0)}
     except Exception:
-        return []
+        return {"results": [], "total_available": 0}
 
 
 async def fetch_wikipedia_summary(query: str, language: str = "en",

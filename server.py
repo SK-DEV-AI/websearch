@@ -38,7 +38,7 @@ Multi-engine search + content extraction.
 
 ## Tools
 
-**search**(query, depth, synthesize=true, google_ai_only) — DDG+Tavily+GNews+Wikipedia+arXiv+AnySearch+TinyFish+Reddit+GAI. depth>=2 fetches pages + rerank. Returns relevance_score(0-1), fetch_relevance(high/med/low), engine_blocked, related_queries, duration_ms. Synthesize=true → Groq answer with [N] citations.
+**search**(query, depth, synthesize=true, google_ai_only) — DDG+Tavily+GNews+Wikipedia+arXiv+AnySearch+TinyFish+Reddit+GAI. depth>=2 fetches pages + rerank. Returns relevance_score(0-1), fetch_relevance(high/med/low), engine_blocked, engine_totals (per-engine total available counts), related_queries, duration_ms. Synthesize=true → Groq answer with [N] citations.
 
 **fetch**(url, focus, offset+max_chars, actions, css_selector, cache_ttl, raw) — auto CDP fallback on Cloudflare/JS. PDF/EPUB/DOCX. BM25 focus filter. Paginated via offset (response: next_offset). Actions: click/fill/type/press/wait/scroll. SSRF protected. Cached 1h; cache_ttl=0 fresh.
 
@@ -87,7 +87,7 @@ server = Server("websearch", instructions=INSTRUCTIONS)
 async def handle_list_tools() -> list[Tool]:
     return [
         Tool(name="search",
-            description="Multi-engine web search with dedup and reranking. Pipeline: query_expand -> 8 parallel engines -> NIM dedup -> reranker (scores). depth=1 returns snippets with relevance_score+fetch_relevance per result and engine_blocked list. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode answer. e.g. search(query='latest AI models', depth=1)",
+            description="Multi-engine web search with dedup and reranking. Pipeline: query_expand -> 8 parallel engines -> NIM dedup -> reranker (scores). depth=1 returns snippets with relevance_score+fetch_relevance per result, engine_blocked list, engine_totals (per-engine total available counts). depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode answer. e.g. search(query='latest AI models', depth=1)",
             inputSchema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 10},
                 "depth": {"type": "integer", "default": 1, "description": "1=snippets, 2+=fetch full pages + rerank"},
