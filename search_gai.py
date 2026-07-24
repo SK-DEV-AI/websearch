@@ -367,12 +367,16 @@ class GoogleAIClient:
     # ── Completion detection ──────────────────────────────────────
 
     async def _wait_for_completion(self, p: CDPPage, deadline_seconds: float) -> CompletionResult:
-        """4-stage detection: SVG thumbs-up → aria-label → text indicators → timeout.
+        """5-stage detection: SVG → aimc → content-settled → text → timeout.
 
-        Also detects GAI error messages and returns early with failure.
-        Returns at the deadline or when detection succeeds.
+        The SVG thumbs-up + [data-subtree=aimc] check fires when the *first*
+        answer chunk renders, but GAI streams progressively. After SVG+aimc
+        detect, we poll for content-length stability (3x no-growth = settled)
+        before proceeding to extraction.
         """
         deadline = time.monotonic() + deadline_seconds
+        prev_len = 0
+        stable_count = 0
         while time.monotonic() < deadline:
             try:
                 has_svg = await p.evaluate(
@@ -381,7 +385,15 @@ class GoogleAIClient:
                     has_aimc = await p.evaluate(
                         "!!document.querySelector('[data-subtree=aimc]')")
                     if has_aimc:
-                        return CompletionResult(True, "svg")
+                        # Content-settled check — wait for stream to finish
+                        cur = len(await p.evaluate("document.body.innerText"))
+                        if cur == prev_len:
+                            stable_count += 1
+                            if stable_count >= 3:
+                                return CompletionResult(True, "svg")
+                        else:
+                            prev_len = cur
+                            stable_count = 0
             except Exception:
                 pass
             try:
@@ -391,10 +403,14 @@ class GoogleAIClient:
                         await p.terminate_execution()
                         return CompletionResult(False, err)
                 if any(ind in body for ind in AI_COMPLETION_TEXT_INDICATORS):
-                    has_aimc = await p.evaluate(
-                        "!!document.querySelector('[data-subtree=aimc]')")
-                    if has_aimc:
-                        return CompletionResult(True, "text")
+                    cur = len(body)
+                    if cur == prev_len:
+                        stable_count += 1
+                        if stable_count >= 3:
+                            return CompletionResult(True, "text")
+                    else:
+                        prev_len = cur
+                        stable_count = 0
             except Exception:
                 pass
             await asyncio.sleep(0.5)

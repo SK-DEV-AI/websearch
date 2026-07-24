@@ -21,6 +21,32 @@ NV_BASE = "https://integrate.api.nvidia.com/v1"
 NV_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2"
 
 
+class _KeyRotator:
+    """Thread-safe round-robin key rotator for API keys."""
+
+    def __init__(self, env_var: str, fallback_var: str = ""):
+        raw = os.environ.get(env_var, os.environ.get(fallback_var, "")) if fallback_var else os.environ.get(env_var, "")
+        self._keys: list[str] = [k.strip() for k in raw.split(",") if k.strip()] if raw else []
+        self._idx = 0
+        self._lock = asyncio.Lock()
+
+    async def next(self) -> str | None:
+        if not self._keys:
+            return None
+        async with self._lock:
+            k = self._keys[self._idx % len(self._keys)]
+            self._idx = (self._idx + 1) % len(self._keys)
+            return k
+
+    @property
+    def first(self) -> str:
+        return self._keys[0] if self._keys else ""
+
+    @property
+    def has_keys(self) -> bool:
+        return bool(self._keys)
+
+
 TAVILY_KEYS = [k.strip() for k in os.environ.get("TAVILY_KEYS", "").split(",") if k.strip()]
 _tavily_idx = 0
 
