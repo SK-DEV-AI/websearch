@@ -376,7 +376,8 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                             from focus import filter_by_relevance as _focus_filter
                             r["content"] = _focus_filter(r["content"], focus_q)
 
-            # Backward compat: start_line/end_line line-range slicing            start_line = safe_int(arguments.get("start_line", 0))
+            # Backward compat: start_line/end_line line-range slicing
+            start_line = safe_int(arguments.get("start_line", 0))
             end_line = safe_int(arguments.get("end_line", 0))
             if start_line > 0 and r.get("content"):
                 all_lines = r["content"].split("\n")
