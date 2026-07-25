@@ -36,38 +36,19 @@ INSTRUCTIONS = """# WebSearch MCP
 
 Multi-engine search + content extraction.
 
-## Tools
+## When to use what
 
-**search**(query, depth, synthesize=true, google_ai_only) — DDG+Tavily+GNews+Wikipedia+arXiv+AnySearch+TinyFish+Reddit+GAI. depth>=2 fetches pages + rerank. Returns relevance_score(0-1), fetch_relevance(high/med/low), engine_blocked, engine_totals (per-engine total available counts), related_queries, duration_ms. Synthesize=true → Groq answer with [N] citations.
+- **search** for finding information (9 engines, dedup+rerank+synthesis). **synthesize=false** when you only need raw results.
+- **fetch** to read a specific page (auto-CDP fallback on blocked pages. PDF/EPUB/DOCX support). **ddgs_extract** for a fast lightweight skim.
+- **screenshot type=snapshot** for LLM-readable page text. **type=screenshot** for visual capture.
+- **extract** for structured JSON: **strategy=css** fastest+free (simple fields), **strategy=llm** works on any content (costs quota).
+- **crawl** for site exploration (BFS/DFS). **map_site** for sitemap discovery.
+- **pdf_extract** for PDFs (OCR+formulas+tables). **wikipedia/arxiv** for those dedicated sources.
 
-**fetch**(url, focus, offset+max_chars, css_selector, cache_ttl, raw) — auto CDP fallback on Cloudflare/JS. PDF/EPUB/DOCX. BM25 focus filter. Paginated via offset (response: next_offset). SSRF protected. Cached 1h; cache_ttl=0 fresh.
+## Pipeline (search)
 
-**screenshot**(url, type=snapshot|screenshot) — ARIA AX tree or visual capture. snapshot best for LLM text extraction.
-
-**crawl**(url, max_depth, max_pages, content_filter="", filter_query) — BFS/DFS. Filters: ""(full markdown), "pruning"(article), "bm25"+filter_query(query-relevant), "bm25_hq"(stemmed).
-
-**extract**(url, instruction, fields, strategy=llm|css|regex) — crawl4ai → structured JSON. Describe what to extract in natural language.
-
-**pdf_extract**(input_path, format=markdown, pages, hybrid=docling-fast for scans) — OCR, tables, formulas.
-
-**map_site**(url, max_urls) — sitemap discovery. Use on unfamiliar domains.
-
-**ddgs_extract**(url) — fast text-only skim, no JS.
-
-**wikipedia/arxiv** — full API param access for dedicated sources.
-
-## Pipeline
-
-1. Groq expansion: 3-4 search variants for short queries.
-2. Parallel multi-engine: all search engines concurrently.
-3. NIM embedding dedup: cosine near-dup removal.
-4. gte-reranker (704 tokens) → relevance_score + fetch_relevance tier.
-5. Groq synthesis: top 3 → concise answer with [N] citations.
-depth>=2: extra full-page fetch + second dedup+rerank.
-
-## CDP
-
-Singleton Helium at :9222 — real cookies, login, extensions. Shared across all CDP tools. Fetch detects Cloudflare (403/429/503, Turnstile, content<300+block words) → CDP fallback. GAI uses same connection.
+search → multiple engines → dedup → reranker → synthesis (Groq for top 3).
+depth≥2: fetches full pages for better scoring.
 
 ## Params
 
@@ -86,7 +67,7 @@ server = Server("websearch", instructions=INSTRUCTIONS)
 async def handle_list_tools() -> list[Tool]:
     return [
         Tool(name="search",
-            description="Multi-engine web search with dedup and reranking. Pipeline: query_expand -> 8 parallel engines -> NIM dedup -> reranker (scores). depth=1 returns snippets with relevance_score+fetch_relevance per result, engine_blocked list, engine_totals (per-engine total available counts). depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode answer. e.g. search(query='latest AI models', depth=1)",
+            description="Multi-engine web search with dedup, reranking, and synthesis. depth=1 returns snippets with relevance_score+fetch_relevance per result. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode. e.g. search(query='latest AI models', depth=1)",
             inputSchema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 10},
                 "depth": {"type": "integer", "default": 1, "description": "1=snippets, 2+=fetch full pages + rerank"},
@@ -105,7 +86,7 @@ async def handle_list_tools() -> list[Tool]:
                 "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"}},
                 "required": ["query"]}),
          Tool(name="fetch",
-            description="URL to markdown/text. Auto-fallback: httpx+trafilatura then CDP for Cloudflare/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected (blocks internal/private IPs, DNS rebinding). Use focus=\"query\" to BM25-filter content. Use offset + max_chars for paginated reads (response has next_offset/is_truncated/total_extracted_chars). Results cached 1h; cache_ttl=0 force fresh. For structured JSON extraction (LLM-driven or CSS), use `extract` instead. e.g. fetch(url='https://example.com')",
+            description="URL to markdown/text. Auto-fallback: direct fetch → CDP for blocked/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected. Use focus=\"query\" to filter content by relevance. Paginated via offset (response: next_offset). Results cached 1h; cache_ttl=0 fresh. For structured JSON extraction use `extract` instead. e.g. fetch(url='https://example.com')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "max_chars": {"type": "integer", "default": 5000, "description": "Chars to return per call (for pagination)"},
                 "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated, next_offset, total_extracted_chars (full page size)."},
@@ -146,7 +127,7 @@ async def handle_list_tools() -> list[Tool]:
                 "exclude_external_images": {"type": "boolean", "default": False}},
                 "required": ["url"]}),
          Tool(name="screenshot",
-            description="CDP screenshot or ARIA accessibility snapshot (AI-optimized for LLMs). Use start_line/end_line for snapshot text range reads. e.g. screenshot(url='https://example.com', type='snapshot')",
+            description="Screenshot or ARIA accessibility snapshot (AI-optimized for LLMs). Use type=snapshot for LLM-readable text, type=screenshot for visual capture. start_line/end_line for range reads. e.g. screenshot(url='https://example.com', type='snapshot')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "full_page": {"type": "boolean", "default": True},
                 "type": {"type": "string", "enum": ["screenshot","snapshot","both"]},
@@ -211,7 +192,7 @@ async def handle_list_tools() -> list[Tool]:
                 "url": {"type": "string"}, "extract_type": {"type": "string", "enum": ["markdown","text_plain","raw"], "default": "markdown"}},
                 "required": ["url"]}),
          Tool(name="extract",
-            description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Uses crawl4ai (persistent cache — repeat calls are free). For LLM strategy, describe what you want and get clean JSON back. For CSS strategy, provide field names. For raw page content (markdown/text), use `fetch` instead. Examples: extract(url='...', instruction='extract product name and price') or extract(url='...', fields=['name','price'], strategy='css')",
+            description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Persistent cache — repeat calls free. For LLM strategy, describe what you want and get clean JSON back. For CSS strategy, provide field names (fastest, free). For raw page content, use `fetch` instead. Examples: extract(url='...', instruction='extract product name and price') or extract(url='...', fields=['name','price'], strategy='css')",
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "Target URL to extract data from"},
                 "instruction": {"type": "string", "description": "Natural language extraction instruction (used with strategy=llm). Example: 'extract all product names, prices, and ratings from this page'"},
@@ -222,7 +203,7 @@ async def handle_list_tools() -> list[Tool]:
                 "provider": {"type": "string", "default": "groq/openai/gpt-oss-120b", "description": "LLM provider string in LiteLLM format (e.g. groq/openai/gpt-oss-120b, openai/gpt-4o, ollama/llama2)"}},
                 "required": ["url"]}),
          Tool(name="pdf_extract",
-            description="PDF to structured data via opendataloader-pdf. Extracts text, tables, formulas, images with bounding boxes. Supports scanned PDFs (OCR), complex tables, and accessibility tagging. e.g. pdf_extract(input_path='/path/to/doc.pdf', format='markdown')",
+            description="PDF to structured data (text, tables, formulas, images with bounding boxes). Supports scanned PDFs (OCR), complex tables. e.g. pdf_extract(input_path='/path/to/doc.pdf', format='markdown')",
             inputSchema={"type": "object", "properties": {
                 "input_path": {"type": "array", "items": {"type": "string"}, "description": "PDF file paths or URLs (local files, http/https, file://)"},
                 "format": {"type": "string", "enum": ["markdown","json","html","tagged-pdf","markdown,json","markdown,json,html"], "default": "markdown"},
