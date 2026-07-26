@@ -66,6 +66,10 @@ server = Server("websearch", instructions=INSTRUCTIONS)
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     return [
+        Tool(name="ping",
+            description="Lightweight connectivity check — verifies internet and key search endpoints are reachable. Use before expensive calls when connectivity is uncertain. No params needed. e.g. ping()",
+            inputSchema={"type": "object", "properties": {}},
+        ),
         Tool(name="search",
             description="Multi-engine web search with dedup, reranking, and synthesis. depth=1 returns snippets with relevance_score+fetch_relevance per result. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode. e.g. search(query='latest AI models', depth=1)",
             inputSchema={"type": "object", "properties": {
@@ -255,6 +259,17 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, default=str))], isError=not ok)
 
     try:
+        if name == "ping":
+            c = get_http_client()
+            results = {}
+            for target, url in [("cloudflare", "https://1.1.1.1"), ("google", "https://www.google.com"), ("archive", "https://archive.org")]:
+                try:
+                    r = await c.get(url, timeout=5)
+                    results[target] = {"reachable": True, "status": r.status_code, "ms": int(r.elapsed * 1000)}
+                except Exception as e:
+                    results[target] = {"reachable": False, "error": str(e)[:60]}
+            return _res({"success": True, "connectivity": results})
+
         if name == "search":
             query = arguments["query"]
             count = min(safe_int(arguments.get("count",10)), MAX_RESULTS)
