@@ -196,7 +196,7 @@ async def handle_list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "Target URL to extract data from"},
                 "instruction": {"type": "string", "description": "Natural language extraction instruction (used with strategy=llm). Example: 'extract all product names, prices, and ratings from this page'"},
-                "strategy": {"type": "string", "enum": ["llm", "css", "regex"], "default": "llm", "description": "llm=AI-powered extraction (needs GROQ_API_KEYS), css=CSS-selector-based extraction (fast, free), regex=pattern-based extraction (emails, phones, URLs)"},
+                "strategy": {"type": "string", "enum": ["llm", "css", "regex"], "default": "css", "description": "css=CSS-selector-based extraction (fast, free), llm=AI-powered (costs quota), regex=pattern-based (emails, phones, URLs)"},
                 "fields": {"type": "array", "items": {"type": "string"}, "description": "List of field names for extraction (e.g. ['name', 'price', 'rating']). Used with strategy=css or strategy=llm"},
                 "chunk_threshold": {"type": "integer", "default": 2000, "description": "Max tokens per chunk for LLM extraction (lower = cheaper, higher = more context)"},
                 "css_selector": {"type": "string", "description": "CSS selector for the container element (used with strategy=css). Defaults to 'body'"},
