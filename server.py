@@ -38,7 +38,7 @@ Multi-engine search + content extraction.
 
 ## When to use what
 
-- **search** for finding information (9 engines, dedup+rerank+synthesis). **synthesize=false** when you only need raw results.
+- **search** for finding information (9 engines, dedup+rerank+synthesis). **synthesize=false** when you only need raw results. Set `domain` for vertical search (code, academic, finance, health, travel, legal).
 - **fetch** to read a specific page (auto-CDP fallback on blocked pages. PDF/EPUB/DOCX support). **ddgs_extract** for a fast lightweight skim.
 - **screenshot type=snapshot** for LLM-readable page text. **type=screenshot** for visual capture.
 - **extract** for structured JSON: **strategy=css** fastest+free (simple fields), **strategy=llm** works on any content (costs quota).
