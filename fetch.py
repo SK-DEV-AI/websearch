@@ -168,16 +168,31 @@ async def _try_wayback(original_url: str) -> dict | None:
         content = wr.text
         if not content or len(content.strip()) < 50:
             return None
+        # Run through trafilatura like the normal path — model gets clean text, not raw HTML
+        extracted = trafilatura.extract(content, output_format="markdown", with_metadata=True,
+                                         include_links=False, include_tables=False,
+                                         url=original_url)
+        title = ""
+        final_content = extracted or trafilatura.extract(content, output_format="txt",
+                                                          with_metadata=False, url=original_url) or ""
+        if isinstance(extracted, str) and extracted.startswith("{"):
+            try:
+                d = json.loads(extracted)
+                final_content = d.get("text", "")
+                title = d.get("title", "")
+            except Exception:
+                pass
+        final_content = final_content.strip()
         # Format a human-readable date from the timestamp
         date_str = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else ts
         return {
             "success": True,
-            "content": content,
+            "content": final_content,
             "url": original_url,
             "cached_from": f"web.archive.org ({date_str})",
             "snapshot_url": snap_url,
             "snapshot_timestamp": ts,
-            "title": "",
+            "title": title,
             "method": "wayback",
         }
     except Exception:
