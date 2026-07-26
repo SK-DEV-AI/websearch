@@ -137,6 +137,53 @@ def _extract_docx(content: bytes, max_chars: int = 50000) -> str:
         return f"[DOCX extraction error: {e}]"
 
 
+async def _try_wayback(original_url: str) -> dict | None:
+    """Check Wayback Machine for an archived copy of original_url.
+
+    Returns fetch-like dict with cached_from set, or None if no snapshot exists.
+    """
+    try:
+        from config import get_http_client
+        c = get_http_client()
+        r = await c.get(
+            "https://archive.org/wayback/available",
+            params={"url": original_url},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        snap = data.get("archived_snapshots", {}).get("closest", {})
+        if not snap.get("available"):
+            return None
+        ts = snap.get("timestamp", "")
+        snap_url = snap.get("url", "")
+        if not snap_url:
+            return None
+        # Strip the Wayback banner by appending id_ modifier to timestamp
+        raw_url = snap_url.replace(f"/web/{ts}/", f"/web/{ts}id_/")
+        wr = await c.get(raw_url, timeout=15, follow_redirects=True)
+        if wr.status_code != 200:
+            return None
+        content = wr.text
+        if not content or len(content.strip()) < 50:
+            return None
+        # Format a human-readable date from the timestamp
+        date_str = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else ts
+        return {
+            "success": True,
+            "content": content,
+            "url": original_url,
+            "cached_from": f"web.archive.org ({date_str})",
+            "snapshot_url": snap_url,
+            "snapshot_timestamp": ts,
+            "title": "",
+            "method": "wayback",
+        }
+    except Exception:
+        return None
+
+
 async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = True,
                     target_language: str = "", favor_precision: bool = False,
                     favor_recall: bool = False, fast: bool = False,
@@ -246,7 +293,20 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                               offset, max_chars, method="docx")
 
         # ── httpx + trafilatura (primary path) ──────────────────────
-        resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True)
+        try:
+            resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True)
+        except Exception as e:
+            wayback = await _try_wayback(url)
+            if wayback:
+                return wayback
+            return {"success": False, "url": url, "error": f"Fetch failed: {e}"}
+
+        # If the page is dead (404, 410, 5xx), try Wayback Machine
+        if resp.status in (404, 410) or resp.status >= 500:
+            wayback = await _try_wayback(url)
+            if wayback:
+                return wayback
+            # No snapshot — let content extraction continue for error page info
         raw_html = resp.body if isinstance(resp.body, str) else resp.body.decode("utf-8", errors="replace")
         if not main_content_only:
             content = (resp.get_all_text() or "").strip()
