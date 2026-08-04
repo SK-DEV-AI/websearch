@@ -94,7 +94,7 @@ async def handle_list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {
                 "url": {"type": "string"}, "max_chars": {"type": "integer", "default": 5000, "description": "Chars to return per call (for pagination)"},
                 "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated, next_offset, total_extracted_chars (full page size)."},
-                "focus": {"type": "string", "description": "BM25 relevance filter — extract only content blocks relevant to this query. Runs on cached content too."},
+                "focus": {"type": "string", "description": "BM25 relevance filter — extract only content blocks relevant to this query. Use ONLY to pull specific sections from a large page (e.g. focus='pricing'). On crucial pages INSTEAD omit focus and fetch the whole content. Misses drop content the page's own Ctrl-F would find (focus is semantic, not literal) — never use focus when the full content is the deliverable."},
                 "cache_ttl": {"type": "integer", "default": 3600, "description": "Cache TTL in seconds (0 = force fresh fetch). Cache keyed by URL+extraction_type+css_selector, not focus/offset."},
                 "css_selector": {"type": "string"},
                 "extraction_type": {"type": "string", "enum": ["markdown","text","html"]},

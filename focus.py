@@ -147,11 +147,18 @@ def filter_by_relevance(content: str, query: str,
             keep = True  # Always keep first paragraph (summary/intro)
         if keep:
             h = blk["heading"]
-            if h and h in seen_headings:
-                continue
+            block_lines = blk["lines"]
             if h:
-                seen_headings.add(h)
-            selected.extend(blk["lines"])
+                if h in seen_headings:
+                    # Heading already emitted — keep content, drop only the
+                    # duplicated heading line so we don't re-announce it.
+                    block_lines = [ln for ln in block_lines
+                                   if not ln.lstrip().startswith("#")]
+                    if not block_lines:
+                        block_lines = blk["lines"]
+                else:
+                    seen_headings.add(h)
+            selected.extend(block_lines)
             selected.append("")
             block_count += 1
 
