@@ -33,7 +33,7 @@ _STOPWORDS = frozenset({
 
 def _tokenize(text: str) -> list[str]:
     """Tokenize text into lowercase words, filter stopwords."""
-    words = re.findall(r"[a-zA-Z][a-zA-Z0-9'+-]{2,}", text.lower())
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9'+-]{1,}", text.lower())
     return [w for w in words if w not in _STOPWORDS and len(w) >= 2]
 
 

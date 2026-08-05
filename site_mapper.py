@@ -198,7 +198,7 @@ async def _fetch_sitemap_content(url: str, c: httpx.AsyncClient) -> str | None:
         if not raw:
             return None
         if len(raw) > MAX_SITEMAP_BYTES:
-            log.warning(f"Sitemap at {url} exceeds {MAX_SITEMAP_BYTES} bytes, skipping")
+            log.warning("Sitemap at %s exceeds %d bytes, skipping", url, MAX_SITEMAP_BYTES)
             return None
         if url.endswith(".gz") or raw[:2] == b"\x1f\x8b":
             try:

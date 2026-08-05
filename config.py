@@ -105,7 +105,8 @@ def cached(ttl: int = CACHE_TTL):
                 _cache[key] = (now, result)
                 if len(_cache) > _MAX_CACHE:
                     cutoff = now - 300
-                    stale = [k for k, (t, _) in _cache.items() if t < cutoff]
+                    stale = [k for k, (t, _) in _cache.items()
+                             if now - t > _CACHE_TTL.get(k.split(":")[0], 300)]
                     for k in stale:
                         del _cache[k]
             return result

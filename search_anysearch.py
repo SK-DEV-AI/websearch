@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Any
@@ -7,6 +8,8 @@ from typing import Any
 import httpx
 
 from config import get_http_client
+
+logger = logging.getLogger("anysearch")
 
 ANYSEARCH_URL = "https://api.anysearch.com/v1/search"
 ANYSEARCH_KEY = os.environ.get("ANYSEARCH_KEY", "")
@@ -83,28 +86,6 @@ async def search_anysearch(query: str, count: int = 10, domain: str = "",
                 entry["content"] = content[:3000]
             results.append(entry)
         return results
-    except (httpx.HTTPError, ValueError, KeyError):
-        return []
-
-
-async def get_anysearch_sub_domains(domain: str) -> list[str]:
-    """Discover valid sub_domains for a given domain via the directory endpoint."""
-    if not ANYSEARCH_KEY or not domain:
-        return []
-    try:
-        c = get_http_client()
-        r = await c.post(
-            "https://api.anysearch.com/v1/get_sub_domains",
-            json={"domain": domain},
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {ANYSEARCH_KEY}",
-            },
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        return data.get("data", {}).get("sub_domains", []) or []
-    except (httpx.HTTPError, ValueError, KeyError):
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        logger.warning("AnySearch search failed: %s", e)
         return []

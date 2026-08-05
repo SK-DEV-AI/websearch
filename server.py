@@ -214,6 +214,9 @@ async def handle_list_tools() -> list[Tool]:
                 "password": {"type": "string", "description": "PDF password for protected files"},
                 "pages": {"type": "string", "description": "Page range e.g. 1-5,8,10-12"},
                 "hybrid": {"type": "string", "enum": ["", "docling-fast", "docling-enterprise", "marker"], "description": "AI hybrid mode for complex layouts, scanned PDFs, tables"},
+                "force_ocr": {"type": "boolean", "default": False, "description": "Shortcut: run full OCR hybrid (docling-fast, full mode)"},
+                "enrich_formula": {"type": "boolean", "default": False, "description": "Shortcut: enable formula extraction (docling-fast, full mode)"},
+                "enrich_picture": {"type": "boolean", "default": False, "description": "Shortcut: enable picture/table enrichment (docling-fast, full mode)"},
             },
                 "required": ["input_path"]}),
     ]
@@ -253,7 +256,9 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
             return _res({"success": True, "connectivity": results})
 
         if name == "search":
-            query = arguments["query"]
+            query = str(arguments.get("query", "")).strip()
+            if not query:
+                return _res({"success": False, "error": "query must not be empty"})
             count = min(safe_int(arguments.get("count",10)), MAX_RESULTS)
             depth = safe_int(arguments.get("depth",1))
             lang = str(arguments.get("language","en"))
@@ -289,10 +294,11 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                                      for i, x in enumerate(top))
                     _groq_keys = _KeyRotator("GROQ_API_KEYS")
                     if _groq_keys.has_keys:
+                        groq_key = await _groq_keys.next()
                         c = get_http_client()
                         resp = await c.post(
                             "https://api.groq.com/openai/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {_groq_keys.next()}", "Content-Type": "application/json"},
+                            headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
                             json={"model": "openai/gpt-oss-120b",
                                   "messages": [{"role": "system", "content": "Answer concisely from sources. Use [N] citations like [1][2]."},
                                                {"role": "user", "content": f"Query: {query}\n\nResults:\n{ctx}"}],
@@ -387,6 +393,8 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
         elif name == "screenshot":
             url = arguments["url"]
             cap_type = str(arguments.get("type","screenshot"))
+            if cap_type not in ("screenshot", "snapshot", "both"):
+                return _res({"success": False, "error": f"invalid type {cap_type!r}; expected screenshot, snapshot, or both"})
             full = bool(arguments.get("full_page",True))
             snap = None
             ss = None
@@ -505,6 +513,8 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
         elif name == "ddgs_extract":
             r = await ddgs_extract(url=str(arguments.get("url", "")),
                 extract_type=str(arguments.get("extract_type", "markdown")))
+            if r is None:
+                return _res({"success": False, "error": "ddgs_extract: extraction returned no content (URL unreachable or blocked)"})
             return _res({"success": True, "result": r})
         elif name == "extract":
             r = await extract_content(

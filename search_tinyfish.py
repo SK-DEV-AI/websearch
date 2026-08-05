@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 
 from config import TINYFISH_KEYS as _TINYFISH_KEYS, get_http_client
+
+logger = logging.getLogger("tinyfish")
 
 _TINYFISH_IDX = 0
 
@@ -77,5 +80,6 @@ async def tinyfish_search(
                 r["pdf_url"] = item.get("pdf_url", "")
             results.append(r)
         return results[:count]
-    except Exception:
+    except Exception as e:
+        logger.warning("Tinyfish search failed: %s", e)
         return []

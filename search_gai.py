@@ -22,6 +22,7 @@ from typing import Any
 
 from config import GOOGLE_AI_URL, HELIUM_CDP, get_http_client
 from cdp_client import CDPPage, get_cdp_session, close_cdp
+from security import validate_url
 
 logger = logging.getLogger("gai")
 
@@ -549,6 +550,7 @@ class GoogleAIClient:
                     await asyncio.sleep(1)
                     continue
                 # Fallback: server-side download
+                url = await validate_url(url)
                 c = get_http_client()
                 resp = await c.get(url, headers={
                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},

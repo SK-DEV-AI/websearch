@@ -8,12 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from config import get_http_client
+from security import validate_url
 import opendataloader_pdf
 
 __all__ = ["extract_pdf"]
 
 
 async def _download_pdf(url: str, dst: Path) -> Path:
+    url = await validate_url(url)
     c = get_http_client()
     r = await c.get(url, follow_redirects=True, timeout=60)
     r.raise_for_status()
@@ -124,7 +126,7 @@ async def extract_pdf(
 
         await asyncio.to_thread(opendataloader_pdf.convert, **kwargs)
 
-        result_files: dict[str, str] = {}
+        result_files: dict[str, dict[str, str]] = {}
         out_dir = Path(out)
         if out_dir.is_dir():
             for fmt_dir in sorted(out_dir.iterdir()):

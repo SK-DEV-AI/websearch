@@ -12,6 +12,8 @@ from scrapling.fetchers import AsyncFetcher
 
 from config import GNEWS_RSS
 
+DDGS.threads = 8  # parallelize across 8 metasearch engines
+
 
 async def search_ddg(
     query: str, count: int = 10, search_type: str = "auto", backend: str = "auto",
@@ -22,7 +24,6 @@ async def search_ddg(
     license_videos: str = "",
 ) -> list[dict]:
     try:
-        DDGS.threads = 8  # parallelize across 8 metasearch engines
         ddgs = DDGS(proxy=proxy or None, timeout=timeout)
         if search_type == "news":
             kw = dict(query=query, max_results=count, region=region, safesearch=safesearch,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import math
 import struct
 from typing import Any
@@ -34,7 +35,7 @@ async def _embed(texts: list[str], input_type: str = "passage",
     uncached = []
     uncached_idx = []
     for i, t in enumerate(texts):
-        k = f"emb:{input_type}:{encoding_format}:{t[:200]}"
+        k = f"emb:{input_type}:{encoding_format}:{hashlib.sha256(t.encode()).hexdigest()}"
         entry = await _cached(k)
         if entry is not None:
             results[i] = entry
@@ -52,7 +53,7 @@ async def _embed(texts: list[str], input_type: str = "passage",
         try:
             c = get_http_client()
             r = await c.post(f"{NV_BASE}/embeddings", json=body_payload,
-                             headers={"Authorization": f"Bearer {nv_key}"})
+                             headers={"Authorization": f"Bearer {nv_key}"}, timeout=30)
             if r.status_code == 200:
                 data = r.json()
                 for idx, row in zip(range(len(uncached)), data.get("data", [])):
@@ -63,7 +64,7 @@ async def _embed(texts: list[str], input_type: str = "passage",
                             emb = list(map(float, struct.unpack(f'{len(decoded)//4}f', decoded)))
                         orig_idx = uncached_idx[idx]
                         results[orig_idx] = emb
-                        await _set_cache(f"emb:{input_type}:{encoding_format}:{uncached[idx][:200]}", emb)
+                        await _set_cache(f"emb:{input_type}:{encoding_format}:{hashlib.sha256(uncached[idx].encode()).hexdigest()}", emb)
         except (httpx.HTTPError, ValueError, KeyError):
             pass
     return results

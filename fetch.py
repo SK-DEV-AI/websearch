@@ -161,6 +161,8 @@ async def _try_wayback(original_url: str) -> dict | None:
         if not snap_url:
             return None
         # Strip the Wayback banner by appending id_ modifier to timestamp
+        if not snap_url.startswith("https://web.archive.org/"):
+            return None
         raw_url = snap_url.replace(f"/web/{ts}/", f"/web/{ts}id_/")
         wr = await c.get(raw_url, timeout=15, follow_redirects=True)
         if wr.status_code != 200:
@@ -189,6 +191,7 @@ async def _try_wayback(original_url: str) -> dict | None:
             "success": True,
             "content": final_content,
             "url": original_url,
+            "status": 200,
             "cached_from": f"web.archive.org ({date_str})",
             "snapshot_url": snap_url,
             "snapshot_timestamp": ts,
@@ -413,10 +416,13 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
         # Cache the full content
         if cache_ttl > 0:
-            asyncio.ensure_future(cache_mod.set_cached(
+            _cache_task = asyncio.ensure_future(cache_mod.set_cached(
                 url, full_content, extraction_type=extraction_type,
                 status=resp.status, title=title or "",
                 metadata={k: v for k, v in meta.items() if v}, ttl=cache_ttl))
+            _cache_task.add_done_callback(
+                lambda t: t.exception() and logger.warning(
+                    f"fetch: cache write failed for {url}: {t.exception()}"))
 
         if focus:
             full_content = focus_mod.filter_by_relevance(full_content, focus)

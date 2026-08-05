@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 
 from config import _next_tavily_key, get_http_client
+
+logger = logging.getLogger("tavily")
 
 TAVILY_SEARCH = "https://api.tavily.com/search"
 
@@ -71,7 +74,8 @@ async def search_tavily(query: str, n: int = 10, topic: str = "general",
                 entry["score"] = item["score"]
             results.append(entry)
         return results
-    except httpx.HTTPError:
+    except httpx.HTTPError as e:
+        logger.warning("Tavily search failed: %s", e)
         return []
 
 

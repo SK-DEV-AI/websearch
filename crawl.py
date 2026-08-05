@@ -146,7 +146,15 @@ async def crawl_url(
         run_kw["exclude_external_images"] = True
     run_config = CrawlerRunConfig(**run_kw)
     async with AsyncWebCrawler(config=cfg) as crawler:
-        results = await crawler.arun(url, config=run_config)
+        # ponytail: per-page timeout * page budget as an overall cap,
+        # generous ceiling so legitimately long crawls still finish
+        overall_timeout = max(60, int(max_pages * page_timeout / 1000))
+        try:
+            results = await asyncio.wait_for(
+                crawler.arun(url, config=run_config), timeout=overall_timeout)
+        except asyncio.TimeoutError:
+            return {"success": False, "url": url,
+                    "error": f"crawl timed out after {overall_timeout}s"}
         if isinstance(results, list):
             pages = []
             combined = []
@@ -167,7 +175,7 @@ async def crawl_url(
             if len(pages) > 1:
                 texts = [(p.get("url", "") or "")[:200] for p in pages]
                 item_emb = await _embed(texts, "passage")
-                if item_emb:
+                if item_emb and all(e is not None for e in item_emb):
                     deduped_pages = []
                     deduped_indices = []
                     seen_emb: list[list[float]] = []

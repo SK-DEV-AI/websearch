@@ -9,8 +9,11 @@ Generates diverse search query variations by combining:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
+
+logger = logging.getLogger("query_expand")
 
 _GROQ_KEYS: list[str] = []
 _key_idx = 0
@@ -97,6 +100,6 @@ async def expand_query(query: str) -> list[str]:
                     unique.append(q)
             if unique:
                 return [query] + unique[:3]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"query_expand failed: {type(e).__name__}: {e}")
     return [query]

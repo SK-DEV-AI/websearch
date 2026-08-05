@@ -89,11 +89,11 @@ def _normalize_ip_notation(host: str) -> str | None:
 async def resolve_hostname(hostname: str, timeout: float = 5.0) -> list[str]:
     """Resolve hostname to IP addresses via DNS."""
     try:
-        _, _, ip_list = await asyncio.wait_for(
-            asyncio.get_event_loop().getaddrinfo(hostname, None, type=...),
+        infos = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(hostname, None),
             timeout=timeout
         )
-        return [addr[4][0] for addr in ip_list]
+        return sorted({info[4][0] for info in infos})
     except Exception:
         return []
 
