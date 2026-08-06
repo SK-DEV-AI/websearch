@@ -112,7 +112,6 @@ def _is_private_address(ip_str: str) -> bool:
         except ValueError:
             return False
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
-        ip_str_v4 = str(addr.ipv4_mapped)
         for net in _PRIVATE_NETWORKS:
             if isinstance(net, ipaddress.IPv4Network) and addr.ipv4_mapped in net:
                 return True

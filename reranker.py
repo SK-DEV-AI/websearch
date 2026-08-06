@@ -158,12 +158,14 @@ async def rerank(query: str, passages: list[dict], top_k: int = 20) -> list[dict
         try:
             result = json.loads(r)
         except json.JSONDecodeError:
+            logger.warning("reranker: invalid JSON response from worker")
+            await _close_connection()
             return fallback_sort(passages, top_k)
-    if result.get("error"):
-        logger.warning(f"reranker error: {result['error']}")
-        return fallback_sort(passages, top_k)
-    scored = result.get("scores", [])
-    for s in scored:
-        if "score" in s:
-            s["_rerank"] = s.pop("score")
-    return scored
+        if result.get("error"):
+            logger.warning(f"reranker error: {result['error']}")
+            return fallback_sort(passages, top_k)
+        scored = result.get("scores", [])
+        for s in scored:
+            if "score" in s:
+                s["_rerank"] = s.pop("score")
+        return scored
