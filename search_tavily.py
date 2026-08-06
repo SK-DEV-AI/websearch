@@ -56,6 +56,7 @@ async def search_tavily(query: str, n: int = 10, topic: str = "general",
                                   "Content-Type": "application/json"},
                          timeout=15)
         if r.status_code != 200:
+            logger.warning("Tavily non-200: %s %s", r.status_code, r.text[:200])
             return []
         data = r.json()
         results: list[dict] = []

@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from typing import Any, Callable
 
 import httpx
@@ -449,7 +450,6 @@ class CDPPage:
             return False
         # Arrow functions: () =>, (a) =>, async () =>, async (a) =>
         # Matches both block-body () => { ... } and expression-body () => expr
-        import re
         if re.match(
             r"^(async\s+)?(\([^)]*\)|\w+)\s*=>",
             expr,

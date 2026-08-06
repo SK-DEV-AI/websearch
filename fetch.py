@@ -287,8 +287,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 return _build_paginated_response(url, full_content, 200,
                                                   url.split("/")[-1], {}, "",
                                                   offset, max_chars, method="pdf")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("PDF extraction failed for %s: %s", url, e)
         if url_lower.endswith('.epub'):
             resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
             content = _extract_epub(
@@ -361,9 +361,15 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         result = trafilatura.extract(raw_html, **kw)
         title = None
         if isinstance(result, str) and result.startswith('{'):
-            d = json.loads(result)
-            full_content = d.get('text', '')
-            title = d.get('title')
+            try:
+                d = json.loads(result)
+            except (json.JSONDecodeError, ValueError):
+                d = None
+            if d:
+                full_content = d.get('text', '')
+                title = d.get('title')
+            else:
+                full_content = result
         else:
             full_content = result or ''
         if not full_content:
@@ -532,11 +538,6 @@ async def _cdp_fetch_page(
                     "title": title or "", "content": (content or "")}
         except Exception as e:
             last_err = e
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
             if attempt < retries - 1:
                 await asyncio.sleep(min(0.5 * (attempt + 1), 2.0))
         finally:

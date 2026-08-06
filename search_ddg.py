@@ -83,7 +83,8 @@ async def search_ddg(
                      "source": urllib.parse.urlparse(r.get("href", "")).netloc or ""}
                     for r in raw if r.get("href")]
     except Exception as e:
-        return [{"error": str(e)}]
+        logger.warning("DDG search failed: %s", e)
+        raise
 
 
 

@@ -71,7 +71,7 @@ async def extract_content(
 
         config = CrawlerRunConfig(
             extraction_strategy=extraction_strategy,
-            cache_mode=None,  # None → CacheMode.ENABLED (persistent SQLite cache)
+            cache_mode=None,
             verbose=False,
             page_timeout=30000,
         )
@@ -94,7 +94,8 @@ async def extract_content(
                 data = json.loads(raw) if isinstance(raw, str) else raw
                 output["data"] = data
             except (json.JSONDecodeError, TypeError):
-                output["data"] = str(raw)[:10000]
+                s = str(raw)
+                output["data"] = s[:10000] + ("\n\n[... truncated ...]" if len(s) > 10000 else "")
 
         # Include markdown if short
         if hasattr(result, "markdown") and result.markdown:
@@ -103,7 +104,7 @@ async def extract_content(
                 text = md.raw_markdown
             else:
                 text = str(md)
-            output["markdown"] = text[:5000]
+            output["markdown"] = text[:5000] + ("\n\n[... truncated ...]" if len(text) > 5000 else "")
 
         return output
 

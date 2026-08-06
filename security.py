@@ -165,7 +165,7 @@ async def validate_url(url: str, allow_internal: bool = False) -> str:
     Returns the validated URL string or raises SecurityError."""
     url = _validate_syntax(url, allow_internal)
     parsed = urlparse(url)
-    hostname = parsed.hostname.lower()
+    hostname = parsed.hostname.lower().rstrip(".")  # strip FQDN trailing dot
 
     if allow_internal:
         return url

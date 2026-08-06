@@ -6,6 +6,7 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from config import get_http_client
 from security import validate_url
@@ -63,7 +64,7 @@ async def extract_pdf(
             if src.startswith(("http://", "https://", "file://")):
                 if not tmpdir:
                     tmpdir = tempfile.mkdtemp(prefix="odl_")
-                fname = src.rsplit("/", 1)[-1] or f"download_{len(local_files)}.pdf"
+                fname = os.path.basename(urlsplit(src).path) or f"download_{len(local_files)}.pdf"
                 if not fname.lower().endswith(".pdf"):
                     fname += ".pdf"
                 dl = Path(tmpdir) / fname
@@ -124,7 +125,12 @@ async def extract_pdf(
         if replace_invalid_chars:
             kwargs["replace_invalid_chars"] = replace_invalid_chars
 
-        await asyncio.to_thread(opendataloader_pdf.convert, **kwargs)
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(opendataloader_pdf.convert, **kwargs),
+                timeout=300)
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "PDF conversion timed out after 300s"}
 
         result_files: dict[str, dict[str, str]] = {}
         out_dir = Path(out)
@@ -137,9 +143,11 @@ async def extract_pdf(
                 for f in sorted(fmt_dir.iterdir()):
                     if f.is_file() and f.stat().st_size > 0:
                         content = f.read_text(encoding="utf-8", errors="replace")
+                        if len(content) > 50000:
+                            content = content[:50000] + "\n\n[... truncated at 50000 chars ...]"
                         content_key = result_files[fmt_name]
                         if isinstance(content_key, dict):
-                            content_key[f.name] = content[:50000]
+                            content_key[f.name] = content
 
         return {
             "success": True,
