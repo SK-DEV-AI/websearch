@@ -39,11 +39,11 @@ async def tinyfish_search(
     if not key:
         return []
     headers = {"X-API-Key": key}
-    params: dict[str, Any] = {"q": query, "n": min(count, 50)}
+    params: dict[str, Any] = {"query": query}
     if domain_type in ("web", "news", "research_paper"):
         params["domain_type"] = domain_type
     if goal:
-        params["goal"] = goal[:200]
+        params["purpose"] = goal[:2000]
     if location:
         params["location"] = location
     if language:
@@ -70,13 +70,13 @@ async def tinyfish_search(
             r: dict[str, Any] = {
                 "title": item.get("title", ""),
                 "url": url,
-                "snippet": item.get("description", item.get("snippet", "")),
+                "snippet": item.get("snippet", item.get("description", "")),
             }
             if domain_type == "research_paper":
-                r["authors"] = item.get("author", [])
+                r["authors"] = item.get("authors", [])
                 r["venue"] = item.get("venue", "")
                 r["year"] = item.get("year", "")
-                r["citations"] = item.get("citation_count", 0)
+                r["citations"] = item.get("cited_by_count", 0)
                 r["pdf_url"] = item.get("pdf_url", "")
             results.append(r)
         return results[:count]
