@@ -1,18 +1,21 @@
-"""PDF extraction via opendataloader-pdf."""
+"""PDF extraction: PyMuPDF fast path (text layer) -> Docling OCR fallback (scanned)."""
 from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from config import get_http_client
 from security import validate_url
-import opendataloader_pdf
 
 __all__ = ["extract_pdf"]
+
+_OCR_PAGE_BUDGET = 300  # seconds for a whole docling run
 
 
 async def _download_pdf(url: str, dst: Path) -> Path:
@@ -22,6 +25,69 @@ async def _download_pdf(url: str, dst: Path) -> Path:
     r.raise_for_status()
     dst.write_bytes(r.content)
     return dst
+
+
+def _pymupdf_open(path: str, password: str = ""):
+    import pymupdf
+
+    return pymupdf.open(path, password=password) if password else pymupdf.open(path)
+
+
+def _pymupdf_extract(path: str, pages: str = "", password: str = "") -> tuple[str, int]:
+    """Fast text-layer extraction. Returns (text, page_count); text empty => scanned."""
+    doc = _pymupdf_open(path, password)
+    try:
+        total = doc.page_count
+        parts: list[str] = []
+        if pages:
+            sep = pages.replace(" ", "")
+            for rng in sep.split(","):
+                if not rng:
+                    continue
+                if "-" in rng:
+                    a, _, b = rng.partition("-")
+                    lo = max(1, int(a))
+                    hi = min(total, int(b)) if b else total
+                    for p in range(lo, hi + 1):
+                        parts.append(doc[p - 1].get_text("text"))
+                else:
+                    p = int(rng)
+                    if 1 <= p <= total:
+                        parts.append(doc[p - 1].get_text("text"))
+        else:
+            for i in range(total):
+                parts.append(doc[i].get_text("text"))
+        text = "\n\n".join(parts).strip()
+        return text, total
+    finally:
+        doc.close()
+
+
+def _docling_extract(path: str) -> str:
+    """Full OCR pipeline (CPU, rapidocr backend). Called only when no text layer exists."""
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import (
+        AcceleratorDevice,
+        AcceleratorOptions,
+        PdfPipelineOptions,
+        RapidOcrOptions,
+    )
+
+    opts = PdfPipelineOptions()
+    opts.accelerator_options = AcceleratorOptions(device=AcceleratorDevice.CPU, num_threads=2)
+    opts.do_table_structure = False
+    opts.do_formula_enrichment = False
+    opts.do_code_enrichment = False
+    opts.do_picture_classification = False
+    opts.do_picture_description = False
+    opts.ocr_options = RapidOcrOptions()
+
+    conv = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
+    res = conv.convert(path)
+    md = res.document.export_to_markdown()
+    return (md or "").strip()
 
 
 async def extract_pdf(
@@ -53,6 +119,8 @@ async def extract_pdf(
     local_files: list[str] = []
     tmpdir = ""
     out_tmpdir = ""
+    force_ocr = bool(hybrid) or bool(hybrid_mode)
+    results: dict[str, Any] = {}
     try:
         for src in sources:
             src = src.strip()
@@ -63,7 +131,7 @@ async def extract_pdf(
                 continue
             if src.startswith(("http://", "https://", "file://")):
                 if not tmpdir:
-                    tmpdir = tempfile.mkdtemp(prefix="odl_")
+                    tmpdir = tempfile.mkdtemp(prefix="pdfx_")
                 fname = os.path.basename(urlsplit(src).path) or f"download_{len(local_files)}.pdf"
                 if not fname.lower().endswith(".pdf"):
                     fname += ".pdf"
@@ -76,89 +144,51 @@ async def extract_pdf(
         if not local_files:
             return {"success": False, "error": "No valid PDF files provided"}
 
-        out = output_dir.strip() or tempfile.mkdtemp(prefix="odl_out_")
-        if not output_dir.strip():
-            out_tmpdir = out
+        for fp in local_files:
+            path = Path(fp)
+            t0 = time.monotonic()
+            method = "pymupdf"
+            try:
+                text, page_count = _pymupdf_extract(str(path), pages, password)
+                # Below a threshold the PDF is scanned/image-only: no text layer.
+                if force_ocr or len(text) < 30:
+                    text = await asyncio.wait_for(
+                        asyncio.to_thread(_docling_extract, str(path)),
+                        timeout=_OCR_PAGE_BUDGET)
+                    method = "docling-ocr"
+            except asyncio.TimeoutError:
+                return {"success": False, "error": f"OCR timed out after {_OCR_PAGE_BUDGET}s: {path.name}"}
+            except Exception as e:
+                return {"success": False, "error": f"PDF extraction failed: {path.name}: {e}"}
+            if len(text) > 50000:
+                text = text[:50000] + "\n\n[... truncated at 50000 chars ...]"
+            results[path.name] = {
+                "content": text,
+                "method": method,
+                "pages": page_count,
+                "elapsed_s": round(time.monotonic() - t0, 1),
+            }
 
-        kwargs: dict[str, Any] = {
-            "input_path": local_files if len(local_files) > 1 else local_files[0],
-            "output_dir": out,
-            "format": format,
-            "quiet": quiet,
-        }
-        if password:
-            kwargs["password"] = password
-        if sanitize:
-            kwargs["sanitize"] = True
-        if keep_line_breaks:
-            kwargs["keep_line_breaks"] = True
-        if pages:
-            kwargs["pages"] = pages
-        if hybrid:
-            kwargs["hybrid"] = hybrid
-        if hybrid_mode:
-            kwargs["hybrid_mode"] = hybrid_mode
-        if hybrid_url:
-            kwargs["hybrid_url"] = hybrid_url
-        if hybrid_timeout:
-            kwargs["hybrid_timeout"] = hybrid_timeout
-        if table_method:
-            kwargs["table_method"] = table_method
-        if reading_order:
-            kwargs["reading_order"] = reading_order
-        if image_output:
-            kwargs["image_output"] = image_output
-        if image_format:
-            kwargs["image_format"] = image_format
-        if include_header_footer:
-            kwargs["include_header_footer"] = True
-        if detect_strikethrough:
-            kwargs["detect_strikethrough"] = True
-        if markdown_with_html:
-            kwargs["markdown_with_html"] = True
-        if use_struct_tree:
-            kwargs["use_struct_tree"] = True
-        if content_safety_off:
-            kwargs["content_safety_off"] = content_safety_off
-        if threads:
-            kwargs["threads"] = threads
-        if replace_invalid_chars:
-            kwargs["replace_invalid_chars"] = replace_invalid_chars
-
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(opendataloader_pdf.convert, **kwargs),
-                timeout=300)
-        except asyncio.TimeoutError:
-            return {"success": False, "error": "PDF conversion timed out after 300s"}
-
-        result_files: dict[str, dict[str, str]] = {}
-        out_dir = Path(out)
-        if out_dir.is_dir():
-            for fmt_dir in sorted(out_dir.iterdir()):
-                if not fmt_dir.is_dir():
-                    continue
-                fmt_name = fmt_dir.name
-                result_files[fmt_name] = {}
-                for f in sorted(fmt_dir.iterdir()):
-                    if f.is_file() and f.stat().st_size > 0:
-                        content = f.read_text(encoding="utf-8", errors="replace")
-                        if len(content) > 50000:
-                            content = content[:50000] + "\n\n[... truncated at 50000 chars ...]"
-                        content_key = result_files[fmt_name]
-                        if isinstance(content_key, dict):
-                            content_key[f.name] = content
+        if output_dir.strip():
+            out = Path(output_dir.strip())
+            out.mkdir(parents=True, exist_ok=True)
+            for name, r in results.items():
+                (out / f"{Path(name).stem}.md").write_text(r["content"], encoding="utf-8")
+        else:
+            out_tmpdir = tempfile.mkdtemp(prefix="pdfx_out_")
+            out = Path(out_tmpdir)
+            for name, r in results.items():
+                (out / f"{Path(name).stem}.md").write_text(r["content"], encoding="utf-8")
 
         return {
             "success": True,
-            "files": str(out_dir),
-            "results": result_files,
+            "files": str(out),
+            "results": results,
             "input_count": len(local_files),
         }
     except Exception as e:
         return {"success": False, "error": f"PDF extraction failed: {e}"}
     finally:
-        import shutil
         if tmpdir and os.path.isdir(tmpdir):
             shutil.rmtree(tmpdir, ignore_errors=True)
         if out_tmpdir and os.path.isdir(out_tmpdir):

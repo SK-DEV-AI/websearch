@@ -261,27 +261,14 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
         # ── PDF / EPUB / DOCX ───────────────────────────────────────
         if url_lower.endswith('.pdf'):
+            from pdf_extract import extract_pdf
             try:
-                import os, shutil, tempfile, opendataloader_pdf  # noqa: F811
-                from pathlib import Path
-                resp = await AsyncFetcher.get(url, timeout=60, stealthy_headers=True)
-                body = resp.body if isinstance(resp.body, bytes) else resp.body.encode()
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-                tmp.write(body)
-                tmp.close()
-                out_dir = tempfile.mkdtemp()
-                try:
-                    await asyncio.to_thread(
-                        opendataloader_pdf.convert,
-                        input_path=[tmp.name], output_dir=out_dir,
-                        format="markdown", quiet=True)
-                    stem = Path(tmp.name).stem
-                    md = next(Path(out_dir).glob(f"{stem}/output.md"), None)
-                finally:
-                    os.unlink(tmp.name)
-                    shutil.rmtree(out_dir, ignore_errors=True)
-                md_text = md.read_text("utf-8", errors="replace") if md else "[empty PDF]"
-                full_content = md_text
+                r = await extract_pdf(url, format="markdown", quiet=True)
+                if r.get("success"):
+                    full_content = "\n\n---\n\n".join(
+                        v["content"] for v in r["results"].values())
+                else:
+                    full_content = f"[PDF extraction failed: {r.get('error')}]"
                 if focus:
                     full_content = focus_mod.filter_by_relevance(full_content, focus)
                 return _build_paginated_response(url, full_content, 200,
