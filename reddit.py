@@ -34,7 +34,10 @@ async def _new_reddit_page():
         if not session:
             return None
         page = await session.create_page()
-        await page.goto("https://www.reddit.com/", referrer="https://www.google.com/")
+        # domcontentloaded (not "load") — reddit.com homepage is heavy; fetch()
+        # only needs the document interactive, full load adds seconds for zero gain
+        await page.goto("https://www.reddit.com/", wait_until="domcontentloaded",
+                        referrer="https://www.google.com/")
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             try:
@@ -105,14 +108,35 @@ async def _get_ai_summary(page, query: str) -> dict | None:
 
     # --- Step 1: navigate to search results and poll for AI summary ---
     search_url = f"https://www.reddit.com/search/?q={_quote(query)}"
-    await page.goto(search_url, referrer="https://www.google.com/")
+    await page.goto(search_url, wait_until="domcontentloaded", referrer="https://www.google.com/")
 
-    # Poll for the AI summary to appear (up to 15s) instead of fixed sleep
+    # Poll for the AI summary AND stream settlement (up to 15s).
+    # The marker appears while the answer is still streaming — extract only
+    # after the section stops growing (3x no-growth), so no partial answers.
     deadline = time.monotonic() + 15
+    section_len = 0
+    stable = 0
+    section_js = (
+        "(() => {"
+        "  const t = document.body?.innerText || '';"
+        "  const sIdx = t.indexOf('What people are saying');"
+        "  if (sIdx < 0) return {ready: false, len: 0};"
+        "  const endIdx = t.indexOf('\\nPosts\\n', sIdx);"
+        "  const sec = endIdx > 0 ? t.substring(sIdx, endIdx) : t.substring(sIdx, 2500);"
+        "  return {ready: true, len: sec.length};"
+        "})()"
+    )
     while time.monotonic() < deadline:
-        ready = await page.evaluate('document.body?.innerText?.includes("What people are saying")')
-        if ready:
-            break
+        state = await page.evaluate(section_js)
+        if state and state.get("ready"):
+            cur = state.get("len", 0)
+            if cur == section_len:
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                section_len = cur
+                stable = 0
         await asyncio.sleep(0.5)
 
     extracted = await page.evaluate('''
@@ -158,7 +182,9 @@ async def _get_ai_summary(page, query: str) -> dict | None:
     answers_url = info.get("answers_url")
     if answers_url:
         try:
-            await page.goto(answers_url, referrer=search_url)
+            # "load" would block on reddit's heavy homepage scripts; the
+            # shadow-root stability poll below handles the streaming wait
+            await page.goto(answers_url, wait_until="domcontentloaded", referrer=search_url)
 
             # Poll for streaming content to appear in shadow root (up to 20s).
             # After first chunk appears (>100 chars), wait for content-length

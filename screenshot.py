@@ -93,7 +93,7 @@ async def screenshot_cdp(url: str, full_page: bool = True,
                          omit_background: bool = False,
                          caret: str = "initial") -> dict:
     try:
-        page = await _get_optimized_page(block_resources=True)
+        page = await _get_optimized_page(block_resources=False)
         try:
             await page.goto(url, wait_until="commit", timeout=30)
             await page.wait_for_load_state("domcontentloaded", timeout=10)

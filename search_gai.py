@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import re
@@ -21,7 +22,7 @@ import urllib.parse
 from typing import Any
 
 from config import GOOGLE_AI_URL, HELIUM_CDP, get_http_client
-from cdp_client import CDPPage, get_cdp_session, close_cdp
+from cdp_client import CDPPage, get_cdp_session, close_cdp, owned_targets
 from security import validate_url
 
 logger = logging.getLogger("gai")
@@ -143,15 +144,28 @@ async def _get_optimized_page(block_resources: bool = True) -> CDPPage:
 
 
 async def _cleanup_orphan_tabs():
-    """Close stale about:blank pages left by broken searches."""
+    """Close stale about:blank tabs WE created (never the user's own tabs).
+
+    A target is only closed if it is in our owned set (created by
+    ``create_page``) AND still about:blank AND older than 30s — the age
+    gate prevents racing a concurrent search whose page was created moments
+    ago and is about to navigate.
+    """
     try:
         session = await get_cdp_session()
         if not session:
             return
+        mine = owned_targets()
+        if not mine:
+            return
+        now = time.monotonic()
         result = await session.send("Target.getTargets")
-        for t in result.get("targetInfos", []):
-            if t["url"] == "about:blank":
-                await session.send("Target.closeTarget", {"targetId": t["targetId"]})
+        stale = [t["targetId"] for t in result.get("targetInfos", [])
+                 if t["url"] == "about:blank"
+                 and t["targetId"] in mine
+                 and now - mine[t["targetId"]] > 30]
+        for tid in stale:
+            await session.send("Target.closeTarget", {"targetId": tid})
     except Exception as e:
         logger.warning("orphan tab cleanup: %s", e)
 
@@ -370,50 +384,46 @@ class GoogleAIClient:
     async def _wait_for_completion(self, p: CDPPage, deadline_seconds: float) -> CompletionResult:
         """5-stage detection: SVG → aimc → content-settled → text → timeout.
 
-        The SVG thumbs-up + [data-subtree=aimc] check fires when the *first*
-        answer chunk renders, but GAI streams progressively. After SVG+aimc
-        detect, we poll for content-length stability (3x no-growth = settled)
-        before proceeding to extraction.
+        Vectorized: a SINGLE ``Runtime.evaluate`` per poll returns all state
+        (svg/aimc presence, error hit, AI-marker hit, text length) instead of
+        4 round-trips + 2 whole-body innerText transfers per 500ms.
         """
+        sniff_js = f"""() => {{
+            const out = {{svg: false, aimc: false, err: '', ai: false, len: 0}};
+            out.svg = !!document.querySelector('button svg[viewBox="3 3 18 18"]');
+            out.aimc = !!document.querySelector('[data-subtree=aimc]');
+            const text = document.body?.innerText || '';
+            out.len = text.length;
+            const low = text.toLowerCase();
+            for (const e of {json.dumps(GAI_ERROR_TEXT_INDICATORS)}) {{
+                if (low.includes(e)) {{ out.err = true; break; }}
+            }}
+            for (const i of {json.dumps(AI_COMPLETION_TEXT_INDICATORS)}) {{
+                if (text.includes(i)) {{ out.ai = true; break; }}
+            }}
+            return out;
+        }}"""
         deadline = time.monotonic() + deadline_seconds
         prev_len = 0
         stable_count = 0
         while time.monotonic() < deadline:
             try:
-                has_svg = await p.evaluate(
-                    "!!document.querySelector('button svg[viewBox=\"3 3 18 18\"]')")
-                if has_svg:
-                    has_aimc = await p.evaluate(
-                        "!!document.querySelector('[data-subtree=aimc]')")
-                    if has_aimc:
-                        # Content-settled check — wait for stream to finish
-                        cur = len(await p.evaluate("document.body.innerText"))
-                        if cur == prev_len:
-                            stable_count += 1
-                            if stable_count >= 6:
-                                return CompletionResult(True, "svg")
-                        else:
-                            prev_len = cur
-                            stable_count = 0
+                snap = await p.evaluate(sniff_js)
             except Exception:
-                pass
-            try:
-                body = await p.evaluate("document.body.innerText")
-                for err in GAI_ERROR_TEXT_INDICATORS:
-                    if err in body.lower():
-                        await p.terminate_execution()
-                        return CompletionResult(False, err)
-                if any(ind in body for ind in AI_COMPLETION_TEXT_INDICATORS):
-                    cur = len(body)
+                snap = None
+            if snap:
+                if snap.get("err"):
+                    await p.terminate_execution()
+                    return CompletionResult(False, "error-text")
+                if (snap.get("svg") and snap.get("aimc")) or snap.get("ai"):
+                    cur = snap.get("len", 0)
                     if cur == prev_len:
                         stable_count += 1
                         if stable_count >= 6:
-                            return CompletionResult(True, "text")
+                            return CompletionResult(True, "svg" if snap.get("svg") else "text")
                     else:
                         prev_len = cur
                         stable_count = 0
-            except Exception:
-                pass
             await asyncio.sleep(0.5)
         await p.terminate_execution()
         return CompletionResult(False, "timeout")

@@ -186,6 +186,7 @@ class CDPSession:
             {"url": "about:blank", "newWindow": False, "background": True},
         )
         target_id = result["targetId"]
+        _mark_owned(target_id)
         attach = await self.send(
             "Target.attachToTarget", {"targetId": target_id, "flatten": True}
         )
@@ -213,6 +214,24 @@ class CDPSession:
             if not fut.done():
                 fut.cancel()
         self._pending.clear()
+
+
+# Owned target IDs for orphan cleanup — tracks only tabs we created,
+# so cleanup never touches the user's own tabs in their Helium browser.
+_owned_targets: dict[str, float] = {}
+
+
+def _mark_owned(target_id: str):
+    import time as _t
+    _owned_targets[target_id] = _t.monotonic()
+
+
+def _unmark_owned(target_id: str):
+    _owned_targets.pop(target_id, None)
+
+
+def owned_targets() -> dict[str, float]:
+    return dict(_owned_targets)
 
 
 class CDPPage:
@@ -561,10 +580,12 @@ class CDPPage:
         )
 
     async def disable_images(self):
-        """Prevent image bytes from entering the renderer at the engine level.
+        """Skip decoding of avif/webp images at the engine level (RAM saver).
 
-        Saves RAM and bandwidth on text-only fetches by telling Chrome
-        to skip decoding all image types. Call before ``goto()``.
+        NOTE: ``Emulation.setDisabledImageTypes`` accepts ONLY ``avif`` and
+        ``webp`` (protocol-verified — png/jpeg/gif are rejected). For
+        text-only fetches pair with ``set_blocked_resources`` to keep image
+        *bytes* off the wire too. Call before ``goto()``.
         """
         await self._session.send(
             "Emulation.setDisabledImageTypes",
@@ -639,6 +660,7 @@ class CDPPage:
 
     async def close(self):
         """Close the tab."""
+        _unmark_owned(self._target_id)
         if self._nav_listener:
             self._session.off("Page.frameNavigated", self._nav_listener)
         try:
