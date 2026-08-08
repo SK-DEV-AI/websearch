@@ -11,7 +11,7 @@ Multi-engine web search MCP server for OpenCode. Searches DuckDuckGo, Google AI 
 - **wikipedia** — Search, summaries, geosearch, categories, pageviews, revisions
 - **arxiv** — Academic paper search with full metadata
 - **map_site** — URL structure discovery via sitemap XML (supports RSS/Atom/plain text/gzipped), robots.txt, and HTML link fallback
-- **pdf_extract** — Full PDF extraction (tables, OCR, formulas) via opendataloader-pdf
+- **pdf_extract** — PDF to markdown: PyMuPDF fast path for text-layer PDFs, Docling+OCR fallback for scanned PDFs
 
 ## Setup
 

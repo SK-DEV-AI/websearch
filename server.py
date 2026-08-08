@@ -207,16 +207,14 @@ async def handle_list_tools() -> list[Tool]:
                 "provider": {"type": "string", "default": "groq/openai/gpt-oss-120b", "description": "LLM provider string in LiteLLM format (e.g. groq/openai/gpt-oss-120b, openai/gpt-4o, ollama/llama2)"}},
                 "required": ["url"]}),
          Tool(name="pdf_extract",
-            description="PDF to structured data (text, tables, formulas, images with bounding boxes). Supports scanned PDFs (OCR), complex tables. e.g. pdf_extract(input_path='/path/to/doc.pdf', format='markdown')",
+            description="PDF to markdown: PyMuPDF fast text-layer extraction, Docling+OCR fallback for scanned/image-only PDFs (CPU). e.g. pdf_extract(input_path='/path/to/doc.pdf', format='markdown')",
             inputSchema={"type": "object", "properties": {
                 "input_path": {"type": "array", "items": {"type": "string"}, "description": "PDF file paths or URLs (local files, http/https, file://)"},
                 "format": {"type": "string", "enum": ["markdown","json","html","tagged-pdf","markdown,json","markdown,json,html"], "default": "markdown"},
                 "password": {"type": "string", "description": "PDF password for protected files"},
                 "pages": {"type": "string", "description": "Page range e.g. 1-5,8,10-12"},
-                "hybrid": {"type": "string", "enum": ["", "docling-fast", "docling-enterprise", "marker"], "description": "AI hybrid mode for complex layouts, scanned PDFs, tables"},
-                "force_ocr": {"type": "boolean", "default": False, "description": "Shortcut: run full OCR hybrid (docling-fast, full mode)"},
-                "enrich_formula": {"type": "boolean", "default": False, "description": "Shortcut: enable formula extraction (docling-fast, full mode)"},
-                "enrich_picture": {"type": "boolean", "default": False, "description": "Shortcut: enable picture/table enrichment (docling-fast, full mode)"},
+                "hybrid": {"type": "string", "enum": ["", "docling-fast"], "description": "Force the Docling OCR fallback regardless of text layer (upper bound: CPU cost only)"},
+                "force_ocr": {"type": "boolean", "default": False, "description": "Shortcut: force the Docling OCR fallback even when a text layer exists"},
             },
                 "required": ["input_path"]}),
     ]
@@ -536,12 +534,6 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
             if bool(arguments.get("force_ocr", False)):
                 hy = hy or "docling-fast"
                 hm = hm or "full"
-            if bool(arguments.get("enrich_formula", False)):
-                hy = hy or "docling-fast"
-                hm = "full"
-            if bool(arguments.get("enrich_picture", False)):
-                hy = hy or "docling-fast"
-                hm = "full"
             r = await extract_pdf(paths,
                 format=str(arguments.get("format", "markdown")),
                 password=str(arguments.get("password", "")),
