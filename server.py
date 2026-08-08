@@ -386,7 +386,8 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
                 capture_network_requests=bool(arguments.get("capture_network_requests",False)),
                 bypass_cache=bool(arguments.get("bypass_cache",False)),
                 exclude_all_images=bool(arguments.get("exclude_all_images",False)),
-                exclude_external_images=bool(arguments.get("exclude_external_images",False)))
+                exclude_external_images=bool(arguments.get("exclude_external_images",False)),
+                cdp_url=HELIUM_CDP)
             return _res(r)
         elif name == "screenshot":
             url = arguments["url"]
