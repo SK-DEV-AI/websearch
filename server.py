@@ -12,7 +12,7 @@ logger = logging.getLogger("websearch")
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import CallToolResult, TextContent, Tool
+from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
 from config import MAX_RESULTS, HELIUM_CDP, get_http_client, _KeyRotator
 from search_ddg import ddgs_extract
@@ -61,11 +61,8 @@ depth≥2: fetches full pages for better scoring.
 - `cache_ttl=0`: bypass cache
 """
 
-server = Server("websearch", instructions=INSTRUCTIONS)
-
-@server.list_tools()
-async def handle_list_tools() -> list[Tool]:
-    return [
+async def handle_list_tools(ctx, params) -> ListToolsResult:
+    return ListToolsResult(tools=[
         Tool(name="ping",
             description="Lightweight connectivity check — verifies internet and key search endpoints are reachable. Use before expensive calls when connectivity is uncertain. No params needed. e.g. ping()",
             inputSchema={"type": "object", "properties": {}},
@@ -217,11 +214,12 @@ async def handle_list_tools() -> list[Tool]:
                 "force_ocr": {"type": "boolean", "default": False, "description": "Shortcut: force the Docling OCR fallback even when a text layer exists"},
             },
                 "required": ["input_path"]}),
-    ]
+    ])
 
 
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
+async def handle_call_tool(ctx, params) -> CallToolResult:
+    name = params.name
+    arguments = params.arguments or {}
     if not isinstance(arguments, dict):
         return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": "arguments must be a dict"}))], isError=True)
 
@@ -248,7 +246,7 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
             for target, url in [("cloudflare", "https://1.1.1.1"), ("google", "https://www.google.com"), ("archive", "https://archive.org")]:
                 try:
                     r = await c.get(url, timeout=5)
-                    results[target] = {"reachable": True, "status": r.status_code, "ms": int(r.elapsed * 1000)}
+                    results[target] = {"reachable": True, "status": r.status_code, "ms": int(r.elapsed.total_seconds() * 1000)}
                 except Exception as e:
                     results[target] = {"reachable": False, "error": str(e)[:60]}
             return _res({"success": True, "connectivity": results})
@@ -577,6 +575,12 @@ async def handle_call_tool(name: str, arguments: dict) -> CallToolResult:
         return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], isError=True)
     except Exception as e:
         return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": f"{type(e).__name__}: {e}"}))], isError=True)
+
+
+server = Server("websearch", instructions=INSTRUCTIONS,
+    on_list_tools=handle_list_tools,
+    on_call_tool=handle_call_tool,
+)
 
 
 async def _warmup_reranker():
