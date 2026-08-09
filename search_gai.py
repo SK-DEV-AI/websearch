@@ -165,7 +165,11 @@ async def _cleanup_orphan_tabs():
                  and t["targetId"] in mine
                  and now - mine[t["targetId"]] > 30]
         for tid in stale:
-            await session.send("Target.closeTarget", {"targetId": tid})
+            try:
+                await session.send("Target.closeTarget", {"targetId": tid})
+            except Exception:
+                continue
+            _unmark_owned(tid)
     except Exception as e:
         logger.warning("orphan tab cleanup: %s", e)
 

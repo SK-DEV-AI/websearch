@@ -659,18 +659,28 @@ class CDPPage:
     # ── Close ──────────────────────────────────────────────────────
 
     async def close(self):
-        """Close the tab."""
-        _unmark_owned(self._target_id)
+        """Close the tab.
+
+        Unmark only AFTER the close succeeds — if closeTarget fails, the
+        tab stays open and must remain owned so cleanup can retry it.
+        """
         if self._nav_listener:
             self._session.off("Page.frameNavigated", self._nav_listener)
-        try:
-            await self._session.send(
-                "Target.closeTarget",
-                {"targetId": self._target_id},
-                timeout=5,
-            )
-        except Exception:
-            pass
+        for attempt in (1, 2):
+            try:
+                await self._session.send(
+                    "Target.closeTarget",
+                    {"targetId": self._target_id},
+                    timeout=5,
+                )
+                _unmark_owned(self._target_id)
+                return
+            except Exception:
+                if attempt == 1:
+                    await asyncio.sleep(1)
+        # Failed twice — keep ownership for _cleanup_orphan_tabs, which
+        # retries about:blank targets that never navigated.
+        logger.warning("closeTarget failed for tab %s; kept owned for cleanup retry", self._target_id)
 
 
 # ── Singleton management ──────────────────────────────────────────

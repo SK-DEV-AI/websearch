@@ -28,6 +28,7 @@ _reddit_sem = asyncio.Semaphore(3)
 
 async def _new_reddit_page():
     """Create a hidden CDP page navigated to reddit.com for same-origin CORS."""
+    page = None
     try:
         from cdp_client import get_cdp_session
         session = await get_cdp_session()
@@ -50,6 +51,11 @@ async def _new_reddit_page():
         return page
     except Exception as e:
         logger.warning("Failed to create Reddit page: %s", e)
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
         return None
 
 
@@ -406,6 +412,11 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
     finally:
         try:
             await page.close()
+        except Exception:
+            pass
+        try:
+            from search_gai import _cleanup_orphan_tabs
+            asyncio.ensure_future(_cleanup_orphan_tabs())
         except Exception:
             pass
 
