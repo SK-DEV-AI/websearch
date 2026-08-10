@@ -130,7 +130,6 @@ async def _get_optimized_page(block_resources: bool = True) -> CDPPage:
             await page.add_init_script(ANTI_DETECT_JS)
             # Protective defaults — save RAM, prevent leaks, avoid hangs
             await page.disable_images()
-            await page.set_download_behavior("deny")
             await page.ignore_certificate_errors(True)
             if block_resources:
                 try:

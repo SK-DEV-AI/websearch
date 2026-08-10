@@ -595,12 +595,6 @@ class CDPPage:
 
     # ── Security & behavior ──────────────────────────────────────
 
-    async def set_download_behavior(self, behavior: str = "deny"):
-        """Prevent stray file downloads from consuming disk/RAM."""
-        await self._session.send(
-            "Browser.setDownloadBehavior", {"behavior": behavior},
-        )
-
     async def ignore_certificate_errors(self, ignore: bool = True):
         """Ignore TLS certificate errors (for CDP fallback on HTTPS sites)."""
         await self._session.send(
