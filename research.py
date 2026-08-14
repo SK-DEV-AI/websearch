@@ -18,7 +18,7 @@ from wikipedia import search_wikipedia, fetch_wikipedia_summary_rest
 from arxiv import search_arxiv
 from reddit import search_reddit
 from query_expand import expand_query
-from reranker import rerank as _rerank
+from reranker import rerank as _rerank, killswitch_active as _reranker_disabled
 
 
 
@@ -360,6 +360,9 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                  "related_queries": related,
                  "results": deduped[:count], "total": len(deduped[:count]),
                  "duration_ms": round((time.monotonic() - _start) * 1000)}
+    if _reranker_disabled():
+        out["reranker"] = "disabled — results are engine-ranked only (not reranked). " \
+            "Enable with: rm ~/.local/share/reranker-rust/disabled"
     return out
 
 
@@ -413,4 +416,8 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
             fetched = deduped
         fetched = await _rerank(query, fetched, top_k=depth * 2)
         fetched = _normalize_scores(fetched)
-    return {"fetched_content": fetched}
+    result = {"fetched_content": fetched}
+    if _reranker_disabled():
+        result["reranker"] = "disabled — results are engine-ranked only (not reranked). " \
+            "Enable with: rm ~/.local/share/reranker-rust/disabled"
+    return result

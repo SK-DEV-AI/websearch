@@ -11,6 +11,14 @@ logger = logging.getLogger(__name__)
 _SOCKET_PATH = "/tmp/reranker_worker.sock"
 _RERANKER_PYTHON = "/usr/bin/python3"
 _RERANKER_WORKER = os.path.expanduser("~/.local/share/reranker-rust/worker.py")
+_RERANKER_KILLSWITCH = os.path.expanduser("~/.local/share/reranker-rust/disabled")
+
+
+def killswitch_active() -> bool:
+    """True when the reranker killswitch file exists — reranking is off and the
+    worker must not run (frees GPU VRAM). Enable with:
+    rm ~/.local/share/reranker-rust/disabled"""
+    return os.path.exists(_RERANKER_KILLSWITCH)
 
 _PROC = None
 _LOCK = asyncio.Lock()
@@ -57,6 +65,8 @@ async def _ensure_worker():
     connecting.
     """
     global _PROC, _READER, _WRITER
+    if killswitch_active():
+        return False
     # Kill any stale process and close old connection
     await _close_connection()
     # Remove stale socket so new worker can bind
@@ -100,6 +110,9 @@ async def _is_healthy() -> bool:
 
 
 async def warmup() -> bool:
+    if killswitch_active():
+        await _close_connection()  # free VRAM if worker still running
+        return False
     async with _LOCK:
         global _READER, _WRITER, _PROC
         if await _is_healthy():
@@ -131,6 +144,9 @@ def fallback_sort(passages: list[dict], top_k: int) -> list[dict]:
 async def rerank(query: str, passages: list[dict], top_k: int = 20) -> list[dict]:
     if not passages:
         return []
+    if killswitch_active():
+        await _close_connection()  # free VRAM if worker still running
+        return fallback_sort(passages, top_k)
     async with _LOCK:
         global _READER, _WRITER, _PROC
         if not await _is_healthy() and not await _ensure_worker():
