@@ -25,7 +25,7 @@ class _KeyRotator:
     """Thread-safe round-robin key rotator for API keys."""
 
     def __init__(self, env_var: str, fallback_var: str = ""):
-        raw = os.environ.get(env_var, os.environ.get(fallback_var, "")) if fallback_var else os.environ.get(env_var, "")
+        raw = os.environ.get(env_var) or os.environ.get(fallback_var, "")
         self._keys: list[str] = [k.strip() for k in raw.split(",") if k.strip()] if raw else []
         self._idx = 0
         self._lock = asyncio.Lock()

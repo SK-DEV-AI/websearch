@@ -9,7 +9,7 @@ from config import get_http_client
 async def search_arxiv(query: str, count: int = 3, search_field: str = "all",
                        sort_by: str = "relevance", sort_order: str = "descending",
                        start: int = 0, id_list: str = "",
-                       category: str = "", raw_query: str = "") -> list[dict]:
+                       category: str = "", raw_query: str = "") -> dict:
     try:
         if raw_query:
             params = {"search_query": raw_query, "start": start,
@@ -27,7 +27,7 @@ async def search_arxiv(query: str, count: int = 3, search_field: str = "all",
         r = await c.get("https://export.arxiv.org/api/query", params=params,
                         headers={"User-Agent": "mcp-codesearch/1.0"}, timeout=15)
         if r.status_code != 200:
-            return []
+            return {"results": [], "total_available": 0}
         ns = {"atom": "http://www.w3.org/2005/Atom",
               "arxiv": "http://arxiv.org/schemas/atom"}
         root = ET.fromstring(r.text)

@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from security import safe_fetch
 from config import get_http_client
 
 log = logging.getLogger("site_mapper")
@@ -65,7 +66,7 @@ async def map_site(
     if include_sitemap:
         sitemap_urls: list[str] = []
         try:
-            r = await c.get(f"{base}/robots.txt", timeout=10, follow_redirects=True)
+            r = await safe_fetch(c, f"{base}/robots.txt", timeout=10)
             if r.status_code == 200:
                 for line in r.text.splitlines():
                     line = line.strip()
@@ -76,7 +77,7 @@ async def map_site(
 
         for path in COMMON_SITEMAP_PATHS:
             try:
-                r = await c.get(f"{base}{path}", timeout=8, follow_redirects=True)
+                r = await safe_fetch(c, f"{base}{path}", timeout=8)
                 ctype = (r.headers.get("content-type", "") or "").lower()
                 if r.status_code != 200:
                     continue
@@ -191,7 +192,7 @@ async def _parse_sitemap_recursive(
 
 async def _fetch_sitemap_content(url: str, c: httpx.AsyncClient) -> str | None:
     try:
-        r = await c.get(url, timeout=15, follow_redirects=True)
+        r = await safe_fetch(c, url, timeout=15)
         if r.status_code != 200:
             return None
         raw = r.content
@@ -431,7 +432,7 @@ def _clean_url(url: str) -> str:
 
 async def _fetch_page_html(url: str, c: httpx.AsyncClient) -> str | None:
     try:
-        r = await c.get(url, timeout=10, follow_redirects=True)
+        r = await safe_fetch(c, url, timeout=10)
         ct = (r.headers.get("content-type", "") or "").lower()
         if r.status_code == 200 and "text/html" in ct:
             return r.text

@@ -12,7 +12,7 @@ from scrapling.fetchers import AsyncFetcher, AsyncStealthySession
 
 from bot_detection import detect_antibot
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
-from security import SecurityError, validate_url as _validate_url
+from security import SecurityError, safe_fetch, validate_url as _validate_url
 import cache as cache_mod
 import focus as focus_mod
 
@@ -164,7 +164,7 @@ async def _try_wayback(original_url: str) -> dict | None:
         if not snap_url.startswith("https://web.archive.org/"):
             return None
         raw_url = snap_url.replace(f"/web/{ts}/", f"/web/{ts}id_/")
-        wr = await c.get(raw_url, timeout=15, follow_redirects=True)
+        wr = await safe_fetch(c, raw_url, timeout=15)
         if wr.status_code != 200:
             return None
         content = wr.text
@@ -263,7 +263,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         if url_lower.endswith('.pdf'):
             from pdf_extract import extract_pdf
             try:
-                r = await extract_pdf(url, format="markdown", quiet=True)
+                r = await extract_pdf(url, format="markdown")
                 if r.get("success"):
                     full_content = "\n\n---\n\n".join(
                         v["content"] for v in r["results"].values())

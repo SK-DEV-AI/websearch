@@ -68,7 +68,7 @@ async def _ensure_worker():
         _PROC = await asyncio.create_subprocess_exec(
             _RERANKER_PYTHON, _RERANKER_WORKER,
             stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
         for _ in range(50):

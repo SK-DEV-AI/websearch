@@ -109,11 +109,17 @@ async def ddgs_extract(url: str, extract_type: str = "markdown") -> dict | None:
 async def search_google_rss(query: str, count: int = 10, region: str = "en",
                             retries: int = 2, timelimit: str = "") -> list[dict]:
     # Parse region ("us-en", "de-de", "in-en", "fr-fr", etc.) into hl/gl/ceid
+    # Google News expects hl=<language>, gl=<COUNTRY>, ceid=<COUNTRY>:<language>
+    # Single-token ("en") → language only; "wt-wt" (worldwide) → no locale params.
     parts = region.split("-")
-    hl = parts[0] if len(parts) > 0 else "en"
-    gl = parts[1].upper() if len(parts) > 1 else parts[0].upper()
-    ceid = f"{gl}:{hl}"
-    rss_url = f"{GNEWS_RSS}?q={urllib.parse.quote_plus(query)}&hl={hl}&gl={gl}&ceid={ceid}"
+    if len(parts) == 2 and parts[0] != "wt":
+        hl, gl = parts[1], parts[0].upper()
+        locale = f"&hl={hl}&gl={gl}&ceid={gl}:{hl}"
+    elif len(parts) == 1:
+        locale = f"&hl={parts[0]}"
+    else:
+        locale = ""
+    rss_url = f"{GNEWS_RSS}?q={urllib.parse.quote_plus(query)}{locale}"
     rss_time_map = {"d": "1d", "w": "7d", "m": "1m", "y": "1y"}
     when = rss_time_map.get(timelimit, "")
     if when:

@@ -1,7 +1,14 @@
-"""PDF extraction: PyMuPDF fast path (text layer) -> Docling OCR fallback (scanned)."""
+"""PDF extraction: PyMuPDF fast path (text layer) -> Docling OCR fallback (scanned).
+
+Formats: markdown (default), json (docling export_to_dict / per-page text dict),
+html (docling export_to_html / pymupdf per-page html). Comma-separated combos
+(e.g. "markdown,json") return every requested format.
+Note: docling 2.x removed export_to_tagged_pdf, so "tagged-pdf" is not offered.
+"""
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -11,17 +18,18 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from config import get_http_client
-from security import validate_url
+from security import safe_fetch, validate_url
 
 __all__ = ["extract_pdf"]
 
 _OCR_PAGE_BUDGET = 300  # seconds for a whole docling run
+_FORMATS = ("markdown", "json", "html")
+_EXT = {"markdown": "md", "json": "json", "html": "html"}
 
 
 async def _download_pdf(url: str, dst: Path) -> Path:
-    url = await validate_url(url)
     c = get_http_client()
-    r = await c.get(url, follow_redirects=True, timeout=60)
+    r = await safe_fetch(c, url, timeout=60)
     r.raise_for_status()
     dst.write_bytes(r.content)
     return dst
@@ -33,12 +41,13 @@ def _pymupdf_open(path: str, password: str = ""):
     return pymupdf.open(path, password=password) if password else pymupdf.open(path)
 
 
-def _pymupdf_extract(path: str, pages: str = "", password: str = "") -> tuple[str, int]:
-    """Fast text-layer extraction. Returns (text, page_count); text empty => scanned."""
+def _pymupdf_extract(path: str, pages: str = "", password: str = "",
+                     fmt: str = "markdown") -> tuple[str, int]:
+    """Fast text-layer extraction. Returns (content, page_count); text empty => scanned."""
     doc = _pymupdf_open(path, password)
     try:
         total = doc.page_count
-        parts: list[str] = []
+        wanted: list[int] = []
         if pages:
             sep = pages.replace(" ", "")
             for rng in sep.split(","):
@@ -48,22 +57,28 @@ def _pymupdf_extract(path: str, pages: str = "", password: str = "") -> tuple[st
                     a, _, b = rng.partition("-")
                     lo = max(1, int(a))
                     hi = min(total, int(b)) if b else total
-                    for p in range(lo, hi + 1):
-                        parts.append(doc[p - 1].get_text("text"))
+                    wanted.extend(range(lo, hi + 1))
                 else:
                     p = int(rng)
                     if 1 <= p <= total:
-                        parts.append(doc[p - 1].get_text("text"))
+                        wanted.append(p)
         else:
-            for i in range(total):
-                parts.append(doc[i].get_text("text"))
-        text = "\n\n".join(parts).strip()
-        return text, total
+            wanted = list(range(1, total + 1))
+        if fmt == "markdown":
+            parts = [doc[p - 1].get_text("text") for p in wanted]
+            return "\n\n".join(parts).strip(), total
+        if fmt == "json":
+            obj = [{"page": p, "text": doc[p - 1].get_text("text")} for p in wanted]
+            return json.dumps(obj, ensure_ascii=False), total
+        if fmt == "html":
+            parts = [doc[p - 1].get_text("html") for p in wanted]
+            return "\n".join(parts).strip(), total
+        raise ValueError(f"unsupported format: {fmt}")
     finally:
         doc.close()
 
 
-def _docling_extract(path: str) -> str:
+def _docling_extract(path: str, fmt: str = "markdown") -> str:
     """Full OCR pipeline (CPU, rapidocr backend). Called only when no text layer exists."""
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
     from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -86,8 +101,22 @@ def _docling_extract(path: str) -> str:
 
     conv = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
     res = conv.convert(path)
-    md = res.document.export_to_markdown()
-    return (md or "").strip()
+    doc = res.document
+    if fmt == "markdown":
+        return (doc.export_to_markdown() or "").strip()
+    if fmt == "json":
+        return json.dumps(doc.export_to_dict(), ensure_ascii=False)
+    if fmt == "html":
+        return (doc.export_to_html() or "").strip()
+    raise ValueError(f"unsupported format: {fmt}")
+
+
+def _formats_arg(raw: str) -> list[str]:
+    fmts = [f.strip() for f in raw.split(",") if f.strip()]
+    bad = [f for f in fmts if f not in _FORMATS]
+    if bad:
+        raise ValueError(f"unsupported format(s): {', '.join(bad)}; supported: {', '.join(_FORMATS)}")
+    return fmts or ["markdown"]
 
 
 async def extract_pdf(
@@ -95,25 +124,9 @@ async def extract_pdf(
     output_dir: str = "",
     format: str = "markdown",
     password: str = "",
-    quiet: bool = True,
-    sanitize: bool = False,
-    keep_line_breaks: bool = False,
     pages: str = "",
     hybrid: str = "",
     hybrid_mode: str = "",
-    hybrid_url: str = "",
-    hybrid_timeout: str = "",
-    table_method: str = "",
-    reading_order: str = "",
-    image_output: str = "",
-    image_format: str = "",
-    include_header_footer: bool = False,
-    detect_strikethrough: bool = False,
-    markdown_with_html: bool = False,
-    use_struct_tree: bool = False,
-    content_safety_off: str = "",
-    threads: str = "",
-    replace_invalid_chars: str = "",
 ) -> dict[str, Any]:
     sources = [input_path] if isinstance(input_path, str) else input_path
     local_files: list[str] = []
@@ -121,6 +134,7 @@ async def extract_pdf(
     out_tmpdir = ""
     force_ocr = bool(hybrid) or bool(hybrid_mode)
     results: dict[str, Any] = {}
+    fmts = _formats_arg(format)
     try:
         for src in sources:
             src = src.strip()
@@ -149,21 +163,39 @@ async def extract_pdf(
             t0 = time.monotonic()
             method = "pymupdf"
             try:
-                text, page_count = _pymupdf_extract(str(path), pages, password)
+                text, page_count = _pymupdf_extract(str(path), pages, password, "markdown")
                 # Below a threshold the PDF is scanned/image-only: no text layer.
                 if force_ocr or len(text) < 30:
                     text = await asyncio.wait_for(
-                        asyncio.to_thread(_docling_extract, str(path)),
+                        asyncio.to_thread(_docling_extract, str(path), fmts[0]),
                         timeout=_OCR_PAGE_BUDGET)
                     method = "docling-ocr"
+                if len(fmts) == 1:
+                    if method == "pymupdf" and fmts[0] != "markdown":
+                        text = (await asyncio.to_thread(
+                            _pymupdf_extract, str(path), pages, password, fmts[0]))[0]
+                    content: dict[str, str] | str = text
+                else:
+                    got: dict[str, str] = {}
+                    for f in fmts:
+                        got[f] = (await asyncio.to_thread(
+                            _docling_extract, str(path), f)) if method == "docling-ocr" \
+                            else (await asyncio.to_thread(
+                                _pymupdf_extract, str(path), pages, password, f))[0]
+                    content = got
             except asyncio.TimeoutError:
                 return {"success": False, "error": f"OCR timed out after {_OCR_PAGE_BUDGET}s: {path.name}"}
             except Exception as e:
                 return {"success": False, "error": f"PDF extraction failed: {path.name}: {e}"}
-            if len(text) > 50000:
-                text = text[:50000] + "\n\n[... truncated at 50000 chars ...]"
+            if isinstance(content, str):
+                if len(content) > 50000:
+                    content = content[:50000] + "\n\n[... truncated at 50000 chars ...]"
+            else:
+                for f, c in content.items():
+                    if len(c) > 50000:
+                        content[f] = c[:50000] + "\n\n[... truncated at 50000 chars ...]"
             results[path.name] = {
-                "content": text,
+                "content": content,
                 "method": method,
                 "pages": page_count,
                 "elapsed_s": round(time.monotonic() - t0, 1),
@@ -172,13 +204,15 @@ async def extract_pdf(
         if output_dir.strip():
             out = Path(output_dir.strip())
             out.mkdir(parents=True, exist_ok=True)
-            for name, r in results.items():
-                (out / f"{Path(name).stem}.md").write_text(r["content"], encoding="utf-8")
         else:
             out_tmpdir = tempfile.mkdtemp(prefix="pdfx_out_")
             out = Path(out_tmpdir)
-            for name, r in results.items():
-                (out / f"{Path(name).stem}.md").write_text(r["content"], encoding="utf-8")
+        for name, r in results.items():
+            if isinstance(r["content"], str):
+                (out / f"{Path(name).stem}.{_EXT[fmts[0]]}").write_text(r["content"], encoding="utf-8")
+            else:
+                for f, c in r["content"].items():
+                    (out / f"{Path(name).stem}.{_EXT[f]}").write_text(c, encoding="utf-8")
 
         return {
             "success": True,

@@ -65,11 +65,11 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
     return ListToolsResult(tools=[
         Tool(name="ping",
             description="Lightweight connectivity check — verifies internet and key search endpoints are reachable. Use before expensive calls when connectivity is uncertain. No params needed. e.g. ping()",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         Tool(name="search",
             description="Multi-engine web search with dedup, reranking, and synthesis. depth=1 returns snippets with relevance_score+fetch_relevance per result. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode. e.g. search(query='latest AI models', depth=1)",
-            inputSchema={"type": "object", "properties": {
+            input_schema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 10},
                 "depth": {"type": "integer", "default": 1, "description": "1=snippets, 2+=fetch full pages + rerank"},
                 "search_type": {"type": "string", "enum": ["auto","text","news","images","videos","books"]},
@@ -88,7 +88,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "required": ["query"]}),
          Tool(name="fetch",
             description="URL to markdown/text. Auto-fallback: direct fetch → CDP for blocked/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected. Use focus=\"query\" to filter content by relevance. Paginated via offset (response: next_offset). Results cached 1h; cache_ttl=0 fresh. For structured JSON extraction use `extract` instead. e.g. fetch(url='https://example.com')",
-            inputSchema={"type": "object", "properties": {
+            input_schema={"type": "object", "properties": {
                 "url": {"type": "string"}, "max_chars": {"type": "integer", "default": 5000, "description": "Chars to return per call (for pagination)"},
                 "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated, next_offset, total_extracted_chars (full page size)."},
                 "focus": {"type": "string", "description": "BM25 relevance filter — extract only content blocks relevant to this query. Use ONLY to pull specific sections from a large page (e.g. focus='pricing'). On crucial pages INSTEAD omit focus and fetch the whole content. Misses drop content the page's own Ctrl-F would find (focus is semantic, not literal) — never use focus when the full content is the deliverable."},
@@ -110,7 +110,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "required": ["url"]}),
         Tool(name="crawl",
             description="BFS/DFS deep crawl. Returns per-page markdown + combined text. e.g. crawl(url='https://example.com', max_depth=2)",
-            inputSchema={"type": "object", "properties": {
+            input_schema={"type": "object", "properties": {
                 "url": {"type": "string"}, "max_depth": {"type": "integer", "default": 1},
                 "max_pages": {"type": "integer", "default": 10},
                 "extract_links": {"type": "boolean", "default": True},
@@ -129,7 +129,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "required": ["url"]}),
          Tool(name="screenshot",
             description="Screenshot or ARIA accessibility snapshot (AI-optimized for LLMs). Use type=snapshot for LLM-readable text, type=screenshot for visual capture. start_line/end_line for range reads. e.g. screenshot(url='https://example.com', type='snapshot')",
-            inputSchema={"type": "object", "properties": {
+            input_schema={"type": "object", "properties": {
                 "url": {"type": "string"}, "full_page": {"type": "boolean", "default": True},
                 "type": {"type": "string", "enum": ["screenshot","snapshot","both"]},
                 "max_chars": {"type": "integer", "default": 10000},
@@ -151,7 +151,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "required": ["url"]}),
          Tool(name="wikipedia",
             description="Search Wikipedia: articles, summaries, geosearch, random. Actions: search, summary (REST API v1 fast), summary_action (Action API with images/sections), categories, links, extlinks, categorymembers, pageviews, revisions, backlinks, recentchanges. e.g. wikipedia(query='Python', action='summary')",
-            inputSchema={"type": "object", "properties": {
+            input_schema={"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["search","summary","summary_action","geosearch","random","categories","links","extlinks","categorymembers","pageviews","revisions","backlinks","recentchanges","langlinks","allpages"], "default": "search", "description": "search=find articles, summary=REST fast extract, summary_action=Action API+images, categories=list page cats, links=page links, extlinks=external links, categorymembers=pages in cat, pageviews=traffic stats, revisions=edit history, backlinks=what links here, recentchanges=recent edits, geosearch=near coordinates, random=random pages, langlinks=cross-lang links, allpages=list all pages"},
                 "query": {"type": "string"},
                 "count": {"type": "integer", "default": 3},
@@ -166,7 +166,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "required": []}),
         Tool(name="arxiv",
             description="Search arXiv academic papers. Use raw_query for boolean operators (AND, OR, ANDNOT), phrase search (ti:\"exact phrase\"), wildcards (au:smith*). e.g. arxiv(query='cs.AI transformer', count=5)",
-            inputSchema={"type": "object", "properties": {
+            input_schema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 3},
                 "search_field": {"type": "string", "enum": ["all","ti","au","abs","cat","co","jr","id"], "default": "all"},
                 "sort_by": {"type": "string", "enum": ["relevance","lastUpdatedDate","submittedDate"], "default": "relevance"},
@@ -178,7 +178,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "required": ["query"]}),
         Tool(name="map_site",
             description="Discover all pages on a website via sitemap XML (primary) and HTML link extraction (fallback). Returns the base domain, source type, total count, and an array of discovered URLs with metadata (last_modified, priority, changefreq when available). e.g. map_site(url='https://example.com')",
-            inputSchema={"type": "object", "properties": {
+            input_schema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "Full URL of the site to map (e.g. https://example.com)"},
                 "max_urls": {"type": "integer", "default": 1000, "description": "Cap on returned URLs"},
                 "max_depth": {"type": "integer", "default": 0, "description": "Recursive link extraction depth (0=homepage only). Only used when no sitemap exists."},
@@ -189,12 +189,12 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "required": ["url"]}),
          Tool(name="ddgs_extract",
             description="Lightweight URL content extraction via DuckDuckGo's extract endpoint. Faster than fetch for simple pages — markdown or plain text. Best for search snippets and quick page reads where trafilatura is overkill. e.g. ddgs_extract(url='https://example.com')",
-            inputSchema={"type": "object", "properties": {
+            input_schema={"type": "object", "properties": {
                 "url": {"type": "string"}, "extract_type": {"type": "string", "enum": ["markdown","text_plain","raw"], "default": "markdown"}},
                 "required": ["url"]}),
          Tool(name="extract",
             description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Persistent cache — repeat calls free. For LLM strategy, describe what you want and get clean JSON back. For CSS strategy, provide field names (fastest, free). For raw page content, use `fetch` instead. Examples: extract(url='...', instruction='extract product name and price') or extract(url='...', fields=['name','price'], strategy='css')",
-            inputSchema={"type": "object", "properties": {
+            input_schema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "Target URL to extract data from"},
                 "instruction": {"type": "string", "description": "Natural language extraction instruction (used with strategy=llm). Example: 'extract all product names, prices, and ratings from this page'"},
                 "strategy": {"type": "string", "enum": ["llm", "css", "regex"], "default": "css", "description": "css=CSS-selector-based extraction (fast, free), llm=AI-powered (costs quota), regex=pattern-based (emails, phones, URLs)"},
@@ -204,10 +204,10 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "provider": {"type": "string", "default": "groq/openai/gpt-oss-120b", "description": "LLM provider string in LiteLLM format (e.g. groq/openai/gpt-oss-120b, openai/gpt-4o, ollama/llama2)"}},
                 "required": ["url"]}),
          Tool(name="pdf_extract",
-            description="PDF to markdown: PyMuPDF fast text-layer extraction, Docling+OCR fallback for scanned/image-only PDFs (CPU). e.g. pdf_extract(input_path='/path/to/doc.pdf', format='markdown')",
-            inputSchema={"type": "object", "properties": {
+            description="PDF extraction: PyMuPDF fast text-layer path, Docling+OCR fallback for scanned/image-only PDFs (CPU). Formats: markdown (default), json, html, or comma combos like 'markdown,json'. e.g. pdf_extract(input_path='/path/to/doc.pdf', format='markdown')",
+            input_schema={"type": "object", "properties": {
                 "input_path": {"type": "array", "items": {"type": "string"}, "description": "PDF file paths or URLs (local files, http/https, file://)"},
-                "format": {"type": "string", "enum": ["markdown","json","html","tagged-pdf","markdown,json","markdown,json,html"], "default": "markdown"},
+                "format": {"type": "string", "enum": ["markdown","json","html","markdown,json","markdown,json,html"], "default": "markdown"},
                 "password": {"type": "string", "description": "PDF password for protected files"},
                 "pages": {"type": "string", "description": "Page range e.g. 1-5,8,10-12"},
                 "hybrid": {"type": "string", "enum": ["", "docling-fast"], "description": "Force the Docling OCR fallback regardless of text layer (upper bound: CPU cost only)"},
@@ -221,7 +221,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
     name = params.name
     arguments = params.arguments or {}
     if not isinstance(arguments, dict):
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": "arguments must be a dict"}))], isError=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": "arguments must be a dict"}))], is_error=True)
 
     def safe_int(v, default=0):
         try:
@@ -237,7 +237,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
 
     def _res(data) -> CallToolResult:
         ok = isinstance(data, dict) and data.get("success", False)
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, default=str))], isError=not ok)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, default=str))], is_error=not ok)
 
     try:
         if name == "ping":
@@ -418,19 +418,26 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 r = {"screenshot": ss, "snapshot": snap}
             else:
                 r = ss
-            # Line range slicing for snapshot content
-            if isinstance(r, dict) and r.get("content"):
-                all_lines = r["content"].split("\n")
+            # Line range slicing for snapshot content (cdpa11y_snapshot returns "snapshot", pdf extract "content")
+            text_key = None
+            if isinstance(r, dict):
+                if r.get("snapshot") is not None:
+                    text_key = "snapshot"
+                elif r.get("content") is not None:
+                    text_key = "content"
+            if text_key:
+                text = r[text_key]
+                all_lines = text.split("\n")
                 r["total_lines"] = len(all_lines)
-                r["total_chars"] = len(r["content"])
+                r["total_chars"] = len(text)
                 start_line = safe_int(arguments.get("start_line", 0))
                 end_line = safe_int(arguments.get("end_line", 0))
                 if start_line > 0:
                     if end_line > 0:
-                        r["content"] = "\n".join(all_lines[start_line - 1:end_line])
+                        r[text_key] = "\n".join(all_lines[start_line - 1:end_line])
                     else:
-                        r["content"] = "\n".join(all_lines[start_line - 1:])
-                    r["returned_lines"] = r["content"].count("\n") + 1
+                        r[text_key] = "\n".join(all_lines[start_line - 1:])
+                    r["returned_lines"] = r[text_key].count("\n") + 1
             return _res(r)
         elif name == "wikipedia":
             action = str(arguments.get("action", "search"))
@@ -505,7 +512,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 id_list=str(arguments.get("id_list","")),
                 category=str(arguments.get("category","")),
                 raw_query=str(arguments.get("raw_query","")))
-            return _res({"success": True, "results": r})
+            return _res({"success": True, **r})
 
         elif name == "ddgs_extract":
             r = await ddgs_extract(url=str(arguments.get("url", "")),
@@ -517,7 +524,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             r = await extract_content(
                 url=str(arguments["url"]),
                 instruction=str(arguments.get("instruction") or "").strip() or None,
-                strategy=str(arguments.get("strategy", "llm")),
+                strategy=str(arguments.get("strategy", "css")),
                 fields=arguments.get("fields"),
                 chunk_threshold=safe_int(arguments.get("chunk_threshold", 2000)),
                 css_selector=str(arguments.get("css_selector") or "").strip() or None,
@@ -537,22 +544,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 format=str(arguments.get("format", "markdown")),
                 password=str(arguments.get("password", "")),
                 pages=str(arguments.get("pages", "")),
-                hybrid=hy, hybrid_mode=hm,
-                hybrid_url=str(arguments.get("hybrid_url", "")),
-                hybrid_timeout=str(arguments.get("hybrid_timeout", "")),
-                table_method=str(arguments.get("table_method", "")),
-                reading_order=str(arguments.get("reading_order", "")),
-                image_output=str(arguments.get("image_output", "")),
-                image_format=str(arguments.get("image_format", "")),
-                sanitize=bool(arguments.get("sanitize", False)),
-                keep_line_breaks=bool(arguments.get("keep_line_breaks", False)),
-                markdown_with_html=bool(arguments.get("markdown_with_html", False)),
-                include_header_footer=bool(arguments.get("include_header_footer", False)),
-                detect_strikethrough=bool(arguments.get("detect_strikethrough", False)),
-                use_struct_tree=bool(arguments.get("use_struct_tree", False)),
-                content_safety_off=str(arguments.get("content_safety_off", "")),
-                threads=str(arguments.get("threads", "")),
-                replace_invalid_chars=str(arguments.get("replace_invalid_chars", "")))
+                hybrid=hy, hybrid_mode=hm)
             return _res(r)
         elif name == "map_site":
             r = await map_site(url=str(arguments.get("url","")),
@@ -564,17 +556,17 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 exclude_patterns=arguments.get("exclude_patterns"))
             return _res(r)
         else:
-            return CallToolResult(content=[TextContent(type="text", text=f"Unknown tool: {name}")], isError=True)
+            return CallToolResult(content=[TextContent(type="text", text=f"Unknown tool: {name}")], is_error=True)
     except ValueError as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], isError=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], is_error=True)
     except KeyError as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": f"Missing required argument: {e}"}))], isError=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": f"Missing required argument: {e}"}))], is_error=True)
     except TypeError as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], isError=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], is_error=True)
     except RuntimeError as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], isError=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], is_error=True)
     except Exception as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": f"{type(e).__name__}: {e}"}))], isError=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": f"{type(e).__name__}: {e}"}))], is_error=True)
 
 
 server = Server("websearch", instructions=INSTRUCTIONS,

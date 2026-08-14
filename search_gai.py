@@ -23,7 +23,7 @@ from typing import Any
 
 from config import GOOGLE_AI_URL, HELIUM_CDP, get_http_client
 from cdp_client import CDPPage, get_cdp_session, close_cdp, owned_targets
-from security import validate_url
+from security import safe_fetch, validate_url
 
 logger = logging.getLogger("gai")
 
@@ -563,11 +563,9 @@ class GoogleAIClient:
                     await asyncio.sleep(1)
                     continue
                 # Fallback: server-side download
-                url = await validate_url(url)
                 c = get_http_client()
-                resp = await c.get(url, headers={
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
-                    follow_redirects=True)
+                resp = await safe_fetch(c, url, headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"})
                 if resp.status_code == 200 and len(resp.content) <= 10_000_000:
                     b64 = base64.b64encode(resp.content).decode('ascii')
                     ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower() or '.bin'

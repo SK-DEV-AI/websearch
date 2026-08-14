@@ -140,7 +140,7 @@ async def crawl_url(
     if log_console:
         run_kw["log_console"] = True
     if bypass_cache:
-        run_kw["bypass_cache"] = True
+        run_kw["cache_mode"] = CacheMode.BYPASS
     if exclude_all_images:
         run_kw["exclude_all_images"] = True
     if exclude_external_images:

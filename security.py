@@ -6,8 +6,6 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-import httpx
-
 _MAX_URL_LENGTH = 8192
 
 _BLOCKED_SCHEMES = frozenset({
@@ -210,6 +208,23 @@ async def validate_url(url: str, allow_internal: bool = False) -> str:
                 )
 
     return url
+
+
+async def safe_fetch(client: Any, url: str, *, max_hops: int = 5,
+                    allow_internal: bool = False, **kwargs) -> Any:
+    """GET with per-hop SSRF validation — follows redirects manually, validating
+    each hop's URL before requesting it. Returns the final response."""
+    from urllib.parse import urljoin
+
+    current = url
+    for _ in range(max_hops + 1):
+        current = await validate_url(current, allow_internal=allow_internal)
+        resp = await client.get(current, follow_redirects=False, **kwargs)
+        if resp.is_redirect and resp.headers.get("location"):
+            current = urljoin(str(resp.url), resp.headers["location"])
+            continue
+        return resp
+    raise SecurityError(f"Too many redirects (> {max_hops}): {url}")
 
 
 def sanitize_result(result: dict[str, Any]) -> dict[str, Any]:
