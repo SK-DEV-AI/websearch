@@ -575,14 +575,6 @@ server = Server("websearch", instructions=INSTRUCTIONS,
 )
 
 
-async def _warmup_reranker():
-    """Pre-load reranker model in background to avoid cold-start delay."""
-    try:
-        from reranker import warmup
-        await warmup()
-    except Exception:
-        pass
-
 async def _warmup_gai():
     """Pre-warm GAI CDP connection at server start."""
     try:
@@ -592,7 +584,6 @@ async def _warmup_gai():
         pass
 
 async def main():
-    asyncio.create_task(_warmup_reranker())
     asyncio.create_task(_warmup_gai())
     async with stdio_server() as (rs, ws):
         await server.run(rs, ws, server.create_initialization_options())
