@@ -10,10 +10,14 @@ import trafilatura
 
 from scrapling.fetchers import AsyncFetcher, AsyncStealthySession
 
+from urllib.parse import urlparse
+
 from bot_detection import detect_antibot
 from ghost_state import CHALLENGE, CONTENT_OK, TERMINAL, classify, ghost
 import jsdata
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
+from cookies import CookieJar
+from revalidate import RevalidationCache
 from security import SecurityError, safe_fetch, validate_url as _validate_url
 import cache as cache_mod
 import focus as focus_mod
@@ -21,6 +25,10 @@ import focus as focus_mod
 logger = logging.getLogger("fetch")
 
 AsyncFetcher.configure(huge_tree=True)
+
+# donsetch ports: per-host cookie jar + conditional revalidation cache
+_jar = CookieJar()
+_reval = RevalidationCache()
 
 # ── Cloudflare challenge detection ──────────────────────────────
 # Covers old interstitial ("Checking your browser"), Managed Challenge
@@ -322,23 +330,55 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                               offset, max_chars, method="docx")
 
         # ── httpx + trafilatura (primary path) ──────────────────────
-        try:
-            resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True,
-                                          cookies=cookies)
-        except Exception as e:
-            wayback = await _try_wayback(url)
-            if wayback:
-                return wayback
-            return {"success": False, "url": url, "error": f"Fetch failed: {e}"}
+        # 304 revalidation + cookie jar (donsetch revalidate.rs/cookies.rs
+        # port): browser-true freshness windows, conditional GETs, and a
+        # per-host jar fed from Set-Cookie. Fresh entries skip the request.
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        reval = _reval.check(url)
+        resp = None
+        raw_html = None
+        if reval and reval[0] == "fresh":
+            raw_html = reval[1].decode("utf-8", errors="replace")
+            status_used = reval[2]
+        else:
+            cond = dict(reval[1]) if reval and reval[0] == "revalidate" else None
+            jar_cookies = _jar.dict_for(host, parsed.path or "/")
+            merged = {**jar_cookies, **(cookies or {})}
+            try:
+                resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True,
+                                              cookies=merged or None,
+                                              headers=cond or None)
+            except Exception as e:
+                wayback = await _try_wayback(url)
+                if wayback:
+                    return wayback
+                return {"success": False, "url": url, "error": f"Fetch failed: {e}"}
+            for hop in list(getattr(resp, "history", []) or []) + [resp]:
+                _jar.store_from_headers(host, hop.headers)
+            if resp.status == 304:
+                stored = _reval.stored(url)
+                if stored:
+                    raw_html = stored[0].decode("utf-8", errors="replace")
+                    status_used = stored[1]
+                else:
+                    raw_html = ""
+                    status_used = 304
+            else:
+                body = resp.body if isinstance(resp.body, bytes) else resp.body.encode("utf-8", errors="replace")
+                _reval.store(url, resp.status, resp.headers, body)
+                raw_html = resp.body if isinstance(resp.body, str) else body.decode("utf-8", errors="replace")
+                status_used = resp.status
 
         # If the page is dead (404, 410, 5xx), try Wayback Machine
-        if resp.status in (404, 410) or resp.status >= 500:
+        if status_used in (404, 410) or status_used >= 500:
             wayback = await _try_wayback(url)
             if wayback:
                 return wayback
             # No snapshot — let content extraction continue for error page info
-        raw_html = resp.body if isinstance(resp.body, str) else resp.body.decode("utf-8", errors="replace")
-        if not main_content_only:
+        # fresh reval entries have no live response — run the full
+        # extraction path (works off raw_html + status_used) instead
+        if not main_content_only and resp is not None:
             content = (resp.get_all_text() or "").strip()
             full_content = content
             if focus:
@@ -388,21 +428,24 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             full_content = trafilatura.extract(raw_html, output_format='txt',
                                                 with_metadata=False, url=url) or ''
         if not full_content.strip():
-            try:
-                full_content = (resp.get_all_text() or '').strip()
-            except Exception:
+            if resp is not None:
+                try:
+                    full_content = (resp.get_all_text() or '').strip()
+                except Exception:
+                    pass
+            if not full_content.strip():
                 full_content = raw_html.strip()
         full_content = full_content.strip()
 
         # Bot challenge detection via vendor-specific patterns (is-antibot port)
         # Covers Cloudflare, Akamai, DataDome, PerimeterX, Anubis, reCAPTCHA,
         # Turnstile, hCaptcha, and 25+ more — all from static HTTP response data.
-        headers_dict = getattr(resp, "headers", {})
+        headers_dict = getattr(resp, "headers", {}) if resp else {}
         set_cookie = headers_dict.get("set-cookie", headers_dict.get("Set-Cookie"))
         detected, provider, detection_type = detect_antibot(
             html=raw_html,
             url=url,
-            status_code=resp.status,
+            status_code=status_used,
             headers=headers_dict,
             set_cookie=set_cookie,
         )
@@ -454,7 +497,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         if cache_ttl > 0:
             _cache_task = asyncio.ensure_future(cache_mod.set_cached(
                 url, full_content, extraction_type=extraction_type,
-                status=resp.status, title=title or "",
+                status=status_used, title=title or "",
                 metadata={k: v for k, v in meta.items() if v}, ttl=cache_ttl))
             _cache_task.add_done_callback(
                 lambda t: t.exception() and logger.warning(
@@ -462,7 +505,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
         if focus:
             full_content = focus_mod.filter_by_relevance(full_content, focus)
-        result = _build_paginated_response(url, full_content, resp.status,
+        result = _build_paginated_response(url, full_content, status_used,
                                           title or meta.get("title", ""),
                                           {k: v for k, v in meta.items() if v}, "",
                                           offset, max_chars, method="httpx")
