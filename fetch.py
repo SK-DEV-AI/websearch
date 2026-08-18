@@ -16,6 +16,9 @@ from urllib.parse import urlparse
 from bot_detection import detect_antibot
 from ghost_state import CHALLENGE, CONTENT_OK, TERMINAL, classify, ghost
 import jsdata
+import feed_extract
+import hn_extract
+import mathml
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
 from cookies import CookieJar
 from revalidate import RevalidationCache
@@ -411,29 +414,61 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             kw["url_blacklist"] = set(x.strip() for x in url_blacklist.split(",") if x.strip())
         if author_blacklist:
             kw["author_blacklist"] = set(x.strip() for x in author_blacklist.split(",") if x.strip())
-        result = trafilatura.extract(raw_html, **kw)
-        title = None
-        if isinstance(result, str) and result.startswith('{'):
+
+        # ── Dedicated extractors (donsetch feed.rs / hn.rs ports) ──
+        # Feeds are raw XML bodies trafilatura would render as soup;
+        # HN comment threads are table layouts the generic pipeline
+        # mangles into pipe rows. Both run BEFORE the generic pipeline.
+        dedicated = None
+        try:
+            ct = ((getattr(resp, "headers", {}) or {}).get("content-type", "")
+                  if resp is not None else "")
+            dedicated = feed_extract.try_extract(raw_html, url, ct)
+        except Exception as e:
+            logger.debug("fetch: feed extract failed for %s: %s", url, e)
+        if not dedicated:
             try:
-                d = json.loads(result)
-            except (json.JSONDecodeError, ValueError):
-                d = None
-            if d:
-                full_content = d.get('text', '')
-                title = d.get('title')
-            else:
-                full_content = result
+                dedicated = hn_extract.try_extract(raw_html, url, focus or None)
+            except Exception as e:
+                logger.debug("fetch: HN extract failed for %s: %s", url, e)
+
+        if dedicated:
+            full_content = dedicated
+            title = None
         else:
-            full_content = result or ''
-        if not full_content:
-            full_content = trafilatura.extract(raw_html, output_format='txt',
-                                                with_metadata=False, url=url) or ''
-        if not full_content.strip():
-            if resp is not None:
+            # MathML → LaTeX pre-transform (donsetch math.rs port):
+            # trafilatura flattens <math> away, gutting formulas.
+            # Rewrite first so they survive as $..$ / $$..$$ text.
+            try:
+                traf_input = mathml.transform(raw_html)
+            except Exception:
+                traf_input = raw_html
+            result = trafilatura.extract(traf_input, **kw)
+            title = None
+            if isinstance(result, str) and result.startswith('{'):
                 try:
-                    full_content = (resp.get_all_text() or '').strip()
-                except Exception:
-                    pass
+                    d = json.loads(result)
+                except (json.JSONDecodeError, ValueError):
+                    d = None
+                if d:
+                    full_content = d.get('text', '')
+                    title = d.get('title')
+                else:
+                    full_content = result
+            else:
+                full_content = result or ''
+            if not full_content:
+                full_content = trafilatura.extract(traf_input, output_format='txt',
+                                                    with_metadata=False, url=url) or ''
+            if not full_content.strip():
+                if resp is not None:
+                    try:
+                        full_content = (resp.get_all_text() or '').strip()
+                    except Exception:
+                        pass
+                if not full_content.strip():
+                    full_content = raw_html.strip()
+            full_content = full_content.strip()
             if not full_content.strip():
                 full_content = raw_html.strip()
         full_content = full_content.strip()
@@ -475,8 +510,10 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         # Generic density-based fallback for unknown challenge vendors
         # (is-antibot patterns only cover known vendors — new/obscure challenge
         # pages also serve massive JS payloads with near-empty extracted text.)
+        # Dedicated extractor output is authoritative: HN thread pages are
+        # dense HTML with genuinely thin text (small threads) — never gate.
         raw_len = len(raw_html)
-        if raw_len > 5000 and len(full_content) < 500:
+        if dedicated is None and raw_len > 5000 and len(full_content) < 500:
             return {"success": False, "url": url,
                     "error": f"Unknown bot challenge detected ({raw_len} bytes HTML, {len(full_content)} chars text)"}
 
