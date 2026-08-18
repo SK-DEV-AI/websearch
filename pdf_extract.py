@@ -23,6 +23,10 @@ from security import safe_fetch, validate_url
 __all__ = ["extract_pdf"]
 
 _OCR_PAGE_BUDGET = 300  # seconds for a whole docling run
+_OCR_INIT_BUDGET = 30  # seconds for docling init (import + converter build);
+#                       # ONNX Runtime's C++ constructors can hang — donsetch ocr.rs guard
+_OCR_MAX_PAGES = 25  # per-document OCR page cap; giant scans must not eat the budget
+_PUA_FLOOR = 0.3  # PUA ratio above which a glyph stream is garbage (broken ToUnicode)
 _FORMATS = ("markdown", "json", "html")
 _EXT = {"markdown": "md", "json": "json", "html": "html"}
 
@@ -78,12 +82,20 @@ def _pymupdf_extract(path: str, pages: str = "", password: str = "",
         doc.close()
 
 
-def _docling_extract(path: str, fmts: list[str]) -> str | dict[str, str]:
-    """Full OCR pipeline (CPU, rapidocr backend). Called only when no text layer exists.
+def _pua_ratio(text: str) -> float:
+    """Fraction of chars in the Private Use Area (broken ToUnicode maps).
 
-    Converts ONCE; every requested format is exported from the same in-memory
-    document (a multi-format request previously re-ran the full OCR per format).
+    donsetch ocr.rs fusion-trust audit: a glyph stream full of PUA chars is
+    garbage (broken encoding), not text — treat it as scanned and OCR it.
     """
+    if not text:
+        return 0.0
+    bad = sum(1 for ch in text if 0xE000 <= ord(ch) <= 0xF8FF or 0xF0000 <= ord(ch) <= 0xFFFFD)
+    return bad / len(text)
+
+
+def _docling_build() -> Any:
+    """Import docling + build the converter (slow; 30s init guard)."""
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.base_models import InputFormat
@@ -103,19 +115,50 @@ def _docling_extract(path: str, fmts: list[str]) -> str | dict[str, str]:
     opts.do_picture_description = False
     opts.ocr_options = RapidOcrOptions()
 
-    conv = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
-    res = conv.convert(path)
-    doc = res.document
-    out: dict[str, str] = {}
-    if "markdown" in fmts:
-        out["markdown"] = (doc.export_to_markdown() or "").strip()
-    if "json" in fmts:
-        out["json"] = json.dumps(doc.export_to_dict(), ensure_ascii=False)
-    if "html" in fmts:
-        out["html"] = (doc.export_to_html() or "").strip()
-    if len(fmts) == 1:
-        return out[fmts[0]]
-    return out
+    return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
+
+
+def _docling_extract(conv: Any, path: str, fmts: list[str], max_pages: int = _OCR_MAX_PAGES) -> str | dict[str, str]:
+    """Full OCR pipeline (CPU, rapidocr backend). Called only when no usable
+    text layer exists (empty, PUA-garbage, or force_ocr).
+
+    `conv` is the pre-built DocumentConverter (init guarded separately).
+    Converts ONCE; every requested format is exported from the same in-memory
+    document (a multi-format request previously re-ran the full OCR per format).
+    The donsetch page cap is applied here: docs beyond max_pages get a
+    pymupdf subset saved to a temp file so OCR cost stays bounded.
+    """
+    src = path
+    tmp_subset = ""
+    if max_pages:
+        doc = _pymupdf_open(path)
+        try:
+            if doc.page_count > max_pages:
+                doc.select(list(range(max_pages)))
+                tmp_subset = path + ".subset.pdf"
+                doc.save(tmp_subset, garbage=3, deflate=True)
+                src = tmp_subset
+        finally:
+            doc.close()
+    try:
+        res = conv.convert(src)
+        doc = res.document
+        out: dict[str, str] = {}
+        if "markdown" in fmts:
+            out["markdown"] = (doc.export_to_markdown() or "").strip()
+        if "json" in fmts:
+            out["json"] = json.dumps(doc.export_to_dict(), ensure_ascii=False)
+        if "html" in fmts:
+            out["html"] = (doc.export_to_html() or "").strip()
+        if len(fmts) == 1:
+            return out[fmts[0]]
+        return out
+    finally:
+        if tmp_subset and os.path.isfile(tmp_subset):
+            try:
+                os.remove(tmp_subset)
+            except OSError:
+                pass
 
 
 def _formats_arg(raw: str) -> list[str]:
@@ -171,12 +214,24 @@ async def extract_pdf(
             method = "pymupdf"
             try:
                 text, page_count = _pymupdf_extract(str(path), pages, password, "markdown")
-                # Below a threshold the PDF is scanned/image-only: no text layer.
-                if force_ocr or len(text) < 30:
+                # No usable text layer (empty, PUA-garbage) or forced OCR:
+                # donsetch fusion-trust audit — a PUA-heavy glyph stream is a
+                # broken encoding (garbage), not text, so it must be OCR'd.
+                if force_ocr or len(text) < 30 or _pua_ratio(text) > _PUA_FLOOR:
                     method = "docling-ocr"
+                    # Init (import + converter build) has its own guard: ONNX
+                    # Runtime C++ constructors can hang, and init failure should
+                    # not burn the whole OCR budget (donsetch ocr.rs).
+                    try:
+                        conv = await asyncio.wait_for(
+                            asyncio.to_thread(_docling_build), timeout=_OCR_INIT_BUDGET)
+                    except asyncio.TimeoutError:
+                        return {"success": False,
+                                "error": f"OCR engine init timed out after {_OCR_INIT_BUDGET}s: {path.name}"}
                     content = await asyncio.wait_for(
-                        asyncio.to_thread(_docling_extract, str(path), fmts),
-                        timeout=_OCR_PAGE_BUDGET)
+                        asyncio.to_thread(
+                            _docling_extract, conv, str(path), fmts, _OCR_MAX_PAGES),
+                        timeout=_OCR_PAGE_BUDGET - _OCR_INIT_BUDGET)
                 elif len(fmts) == 1:
                     if fmts[0] != "markdown":
                         text = (await asyncio.to_thread(
