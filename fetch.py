@@ -11,6 +11,7 @@ import trafilatura
 from scrapling.fetchers import AsyncFetcher, AsyncStealthySession
 
 from bot_detection import detect_antibot
+from ghost_state import CHALLENGE, CONTENT_OK, TERMINAL, classify, ghost
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
 from security import SecurityError, safe_fetch, validate_url as _validate_url
 import cache as cache_mod
@@ -66,6 +67,28 @@ _CLOUDFLARE_RESOLVED_JS = """
     if (text.includes('Checking your browser') || text.includes('cf-challenge')) return false;
 
     return true;
+}
+"""
+
+# Consent-banner + turnstile auto-dismiss (donsetch ops.rs DISMISS_MODALS_JS,
+# turnstile click) — run once after the page settles so modals cannot
+# wedge the challenge iframe and so cf-turnstile checkboxes get clicked.
+_AUTO_DISMISS_JS = """
+() => {
+    const selectors = [
+        'button[id*=\"accept\"]', 'button[class*=\"accept\"]', 'button[aria-label*=\"Accept\"]',
+        'button[class*=\"consent\"]', '#onetrust-accept-btn-handler',
+        'button[aria-label*=\"Agree\"]', '.fc-button.fc-cta-consent',
+        'button[class*=\"cookie\"]', '#CybotCookiebotDialogBodyButtonAccept',
+        '[class*=\"cookie-banner\"] button', '[id*=\"cmpbntyestxt\"]',
+        'button[aria-label*=\"Got it\"]',
+    ];
+    for (let s of selectors) {
+        const el = document.querySelector(s);
+        if (el) { try { el.click(); } catch (e) {} }
+    }
+    const ts = document.querySelector('input[type=\"checkbox\"][name*=\"turnstile\"], .cf-turnstile input[type=\"checkbox\"]');
+    if (ts) { try { ts.click(); } catch (e) {} }
 }
 """
 
@@ -212,7 +235,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     prune_xpath: str = "", url_blacklist: str = "",
                     author_blacklist: str = "", min_output_size: int = 0,
                     raw: bool = False, offset: int = 0, focus: str = "",
-                    cache_ttl: int = 3600) -> dict:
+                    cache_ttl: int = 3600, cookies: dict | None = None) -> dict:
     """Fetch a URL with cache, focus filtering, and pagination via httpx + trafilatura.
 
     Cache keyed by URL+extraction_type (focus and offset are NOT part of the key).
@@ -299,7 +322,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
         # ── httpx + trafilatura (primary path) ──────────────────────
         try:
-            resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True)
+            resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True,
+                                          cookies=cookies)
         except Exception as e:
             wayback = await _try_wayback(url)
             if wayback:
@@ -508,6 +532,10 @@ async def _cdp_fetch_page(
                 except Exception:
                     pass
             try:
+                await page.evaluate(_AUTO_DISMISS_JS)
+            except Exception:
+                pass
+            try:
                 await _wait_cf_resolution(page)
             except Exception:
                 pass
@@ -521,8 +549,32 @@ async def _cdp_fetch_page(
                 content = content.decode("utf-8", errors="replace")
             title = await page.title()
 
+            # ── Terminal-verdict gate (donsetch server.rs:798-820) ──
+            # Only content that actually looks like the page may be
+            # served; a rendered 404/paywall/auth shell is an error,
+            # not content — and an unsolved challenge is a failed
+            # solve, not a page.
+            verdict = classify(0, content, title)
+            if verdict == CHALLENGE:
+                return {"success": False, "url": url,
+                        "error": "Challenge wall still up after browser render",
+                        "verdict": verdict,
+                        "next_action": "tier=2 (manual browser)"}
+            if verdict in TERMINAL:
+                return {"success": False, "url": url,
+                        "error": f"Rendered page is a {verdict} shell",
+                        "verdict": verdict, "next_action": "none"}
+
+            # ── Clearance harvest (solve-and-bounce handoff) ─────────
+            cookies: list[dict] = []
+            try:
+                cookies = await page.cookies()
+            except Exception:
+                pass
+
             return {"success": True, "url": url,
-                    "title": title or "", "content": (content or "")}
+                    "title": title or "", "content": (content or ""),
+                    "cookies": cookies, "verdict": verdict}
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
@@ -576,6 +628,8 @@ async def scrapling_stealthy_fetch(
                 "title": result.get("title", ""),
                 "content": (result.get("content", "") or "")[:50000],
                 "method": "cdp", "attempt": 1,
+                "cookies": result.get("cookies", []),
+                "verdict": result.get("verdict", CONTENT_OK),
             }
         # CDP failed — fall through to scrapling
 
@@ -638,6 +692,14 @@ async def scrapling_stealthy_fetch(
                                       "content": content[:50000], "method": "scrapling"}
             if captured:
                 result["captured_xhr"] = captured
+            # terminal-verdict gate for the scrapling path too (same
+            # shell-laundering protection as the CDP path)
+            verdict = classify(result.get("status", 0), result.get("content", ""), "")
+            if verdict == CHALLENGE or verdict in TERMINAL:
+                return {"success": False, "url": url,
+                        "error": f"Rendered page is a {verdict} shell",
+                        "verdict": verdict, "next_action": "none"}
+            result["verdict"] = verdict
             return result
     except Exception as e:
         return {"success": False, "url": url, "error": str(e)}

@@ -15,6 +15,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
 from config import MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client, _KeyRotator
+from ghost_state import CHALLENGE, CONTENT_OK, classify, ghost
 from search_ddg import ddgs_extract
 from fetch import fetch_url, scrapling_stealthy_fetch
 from crawl import crawl_url
@@ -310,22 +311,48 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             offset = safe_int(arguments.get("offset", 0))
             max_chars = safe_int(arguments.get("max_chars", 5000))
 
-            r = await fetch_url(url,
-                    max_chars=max_chars,
-                    offset=offset,
-                    focus=str(arguments.get("focus", "")),
-                    cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
-                    target_language=str(arguments.get("target_language", "")),
-                    fast=bool(arguments.get("fast", False)),
-                    output_format=str(arguments.get("output_format", "markdown")),
-                    include_images=bool(arguments.get("include_images", True)),
-                    include_tables=bool(arguments.get("include_tables", True)),
-                    include_formatting=bool(arguments.get("include_formatting", True)),
-                    include_links=bool(arguments.get("include_links", True)),
-                    raw=bool(arguments.get("raw", False)))
+            host = ghost.host_of(url)
+            route = ghost.route_for(host)
 
-            # Auto-fallback: httpx failed/blocked → retry via CDP
-            if not r.get("success"):
+            # ── Tier-1 fetch, routed by domain profile ──────────────
+            if route == "skip_to_solve":
+                # recent failed cold check + stale cookies: skip the
+                # doomed tier-1 round-trip, solve straight in browser
+                r = None
+            else:
+                cookies = ghost.vault(host) if route == "warm" else None
+                r = await fetch_url(url,
+                        max_chars=max_chars,
+                        offset=offset,
+                        focus=str(arguments.get("focus", "")),
+                        cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
+                        target_language=str(arguments.get("target_language", "")),
+                        fast=bool(arguments.get("fast", False)),
+                        output_format=str(arguments.get("output_format", "markdown")),
+                        include_images=bool(arguments.get("include_images", True)),
+                        include_tables=bool(arguments.get("include_tables", True)),
+                        include_formatting=bool(arguments.get("include_formatting", True)),
+                        include_links=bool(arguments.get("include_links", True)),
+                        raw=bool(arguments.get("raw", False)),
+                        cookies=cookies)
+                if r.get("success"):
+                    if route == "warm":
+                        ghost.warm_ok(host)
+                    else:
+                        ghost.record_fetch(host, CONTENT_OK)
+                else:
+                    verdict = classify(r.get("status", 0), r.get("content", ""),
+                                       r.get("title", ""))
+                    if verdict != CONTENT_OK:
+                        ghost.record_fetch(host, verdict)
+                    if route == "warm":
+                        ghost.record_warm_stale(host)
+
+            # ── Escalation decision ─────────────────────────────────
+            should_retry = False
+            if r is None:
+                should_retry = True
+            elif not r.get("success"):
                 content = (r.get("content", "") or "").strip()
                 status = r.get("status", 0)
                 r_error = (r.get("error", "") or "").lower()
@@ -344,18 +371,54 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                     )
                 ) or (len(content) < 100)
 
-                if should_retry:
-                    cdp_r = await scrapling_stealthy_fetch(url,
-                        css_selector=arguments.get("css_selector"),
-                        extraction_type=str(arguments.get("extraction_type", "markdown")),
-                        cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle", True)))
-                    if cdp_r.get("success"):
+            # ── Tier-2 browser solve + solve-and-bounce handoff ─────
+            if should_retry:
+                cdp_r = await scrapling_stealthy_fetch(url,
+                    css_selector=arguments.get("css_selector"),
+                    extraction_type=str(arguments.get("extraction_type", "markdown")),
+                    cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle", True)))
+                if cdp_r.get("success"):
+                    # browser solved the wall → store clearance cookies
+                    ghost.record_solved(host, cdp_r.get("cookies", []),
+                                        replay_ok=False)
+                    vault = ghost.vault(host)
+                    if vault:
+                        # replay the cheap tier-1 fetch with clearance
+                        # cookies; real content means future warm
+                        # fetches skip the browser entirely
+                        replay = await fetch_url(url,
+                                max_chars=max_chars,
+                                offset=offset,
+                                focus=str(arguments.get("focus", "")),
+                                cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
+                                target_language=str(arguments.get("target_language", "")),
+                                fast=bool(arguments.get("fast", False)),
+                                output_format=str(arguments.get("output_format", "markdown")),
+                                include_images=bool(arguments.get("include_images", True)),
+                                include_tables=bool(arguments.get("include_tables", True)),
+                                include_formatting=bool(arguments.get("include_formatting", True)),
+                                include_links=bool(arguments.get("include_links", True)),
+                                raw=bool(arguments.get("raw", False)),
+                                cookies=vault)
+                        if replay.get("success"):
+                            ghost.set_replay_ok(host, True)
+                            r = replay
+                        else:
+                            ghost.set_replay_ok(host, False)
+                            r = cdp_r
+                    else:
                         r = cdp_r
-                        # Re-apply focus on CDP result if we had one
-                        focus_q = str(arguments.get("focus", ""))
-                        if focus_q and r.get("content"):
-                            from focus import filter_by_relevance as _focus_filter
-                            r["content"] = _focus_filter(r["content"], focus_q)
+                else:
+                    ghost.record_fetch(host, cdp_r.get("verdict", CHALLENGE))
+                    r = cdp_r
+
+            # Re-apply focus on browser-served results (httpx/cache
+            # paths already applied it inside fetch_url)
+            if r.get("success") and r.get("method") == "cdp":
+                focus_q = str(arguments.get("focus", ""))
+                if focus_q and r.get("content"):
+                    from focus import filter_by_relevance as _focus_filter
+                    r["content"] = _focus_filter(r["content"], focus_q)
 
             # Backward compat: start_line/end_line line-range slicing
             start_line = safe_int(arguments.get("start_line", 0))

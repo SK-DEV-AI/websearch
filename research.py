@@ -13,12 +13,14 @@ from search_anysearch import search_anysearch
 from search_tinyfish import tinyfish_search
 from search_gai import get_gai_client
 from fetch import fetch_url
-from embed import _embed, _dedup_rank, _cosine_sim
+from embed import _embed, _cosine_sim
 from wikipedia import search_wikipedia
 from arxiv import search_arxiv
 from reddit import search_reddit
 from query_expand import expand_query
 from reranker import rerank as _rerank, killswitch_active as _reranker_disabled
+from merge import (merge_base, blend, apply_coverage, apply_authority, finalize,
+                   detect_intent, is_weak, merged_total, norm_key)
 
 
 
@@ -96,10 +98,14 @@ def _related_queries(query: str, results: list[dict], *, n: int = 6) -> list[str
 
 
 def _normalize_scores(results: list[dict]) -> list[dict]:
-    """Normalize _rerank scores to 0-1 relevance_score range."""
+    """Normalize blended scores to 0-1 relevance_score range."""
     if not results:
         return results
-    scores = [r.get("_rerank", 0) or 0 for r in results]
+    scores = [
+        r.get("score") or r.get("_rerank") or r.get("_rel") or r.get("_relevance")
+        or r.get("_hybrid") or 0
+        for r in results
+    ]
     lo, hi = min(scores), max(scores)
     if hi == 0:
         # Unranked (killswitch/reranker failure): keep engine order with a
@@ -124,11 +130,16 @@ def _normalize_scores(results: list[dict]) -> list[dict]:
                 r["fetch_relevance"] = "med"
             else:
                 r["fetch_relevance"] = "low"
-    # Clean up internal keys
+    # Clean up internal keys (reranker + merge staging keys)
     for r in results:
-        r.pop("_rerank", None)
-        r.pop("_embedding", None)
-        r.pop("_rel", None)
+        for k in [k for k in r if k.startswith("_")]:
+            r.pop(k)
+        if "sources" in r:
+            # Best-ranked (lowest rank value) engine as the entry's engine,
+            # mirroring the pre-merge contract.
+            r["engine"] = min(r["sources"], key=lambda se: se[1])[0]
+            r.pop("sources")
+        r.pop("score", None)
     return results
 
 
@@ -166,7 +177,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                         anysearch_params: dict | None = None) -> dict:
     _start = time.monotonic()
     engines_used: list[str] = []
-    results: list[dict] = []
+    per_engine: dict[str, list[dict]] = {}
+    _seen_urls: set[str] = set()
     engine_totals: dict[str, int] = {}
     ai_answer = ""
     follow_up = ""
@@ -193,10 +205,13 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             ai_answer = rd.get("answer", "")
             follow_up = rd.get("followUp", "")
             for s in rd.get("sources", []):
-                results.append({"title": s["title"], "url": s["url"],
+                per_engine.setdefault("google-ai-mode", []).append({
+                    "title": s["title"], "url": s["url"],
                     "snippet": s.get("snippet", ""),
                     "source": urllib.parse.urlparse(s["url"]).netloc if s.get("url") else "",
-                    "engine": "google-ai-mode"})
+                    "engine": "google-ai-mode",
+                    "rank": len(per_engine.get("google-ai-mode", [])),
+                })
     else:
         gai_future = asyncio.create_task(_gai_search())
         queries = [query]
@@ -298,15 +313,16 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 engine_totals[eng_name] = ta
             for r in results_list:
                 if isinstance(r, dict) and "error" not in r and r.get("url"):
-                    if not any(e.get("url") == r["url"] for e in results):
-                        if key != "reddit" or r.get("engine") in ("reddit", "reddit-comment", "reddit-ai-summary"):
-                            new_eng = "duckduckgo" if key.startswith("ddg") else (
-                                "google-news-rss" if key == "rss" else key)
-                            # Preserve sub-engine (e.g., reddit-ai-summary, reddit-comment)
-                            cur = r.get("engine")
-                            if not cur or cur == key or cur == new_eng:
-                                r["engine"] = new_eng
-                        results.append(r)
+                    if key != "reddit" or r.get("engine") in ("reddit", "reddit-comment", "reddit-ai-summary"):
+                        new_eng = "duckduckgo" if key.startswith("ddg") else (
+                            "google-news-rss" if key == "rss" else key)
+                        # Preserve sub-engine (e.g., reddit-ai-summary, reddit-comment)
+                        cur = r.get("engine")
+                        if not cur or cur == key or cur == new_eng:
+                            r["engine"] = new_eng
+                        entry = dict(r)
+                        entry["rank"] = len(per_engine.get(new_eng, []))
+                        per_engine.setdefault(new_eng, []).append(entry)
         eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish"}
         for key, name in eng.items():
             val = done_map.get(key)
@@ -335,41 +351,61 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 rd = r["result"]
                 ai_answer = rd.get("answer", "")
                 follow_up = rd.get("followUp", "")
+                _seen_urls |= {norm_key(h["url"]) for hits in per_engine.values() for h in hits}
                 for s in rd.get("sources", []):
-                    if not any(e.get("url") == s["url"] for e in results):
-                        results.append({"title": s["title"], "url": s["url"],
+                    if norm_key(s["url"]) not in _seen_urls:
+                        _seen_urls.add(norm_key(s["url"]))
+                        per_engine.setdefault("google-ai-mode", []).append({
+                            "title": s["title"], "url": s["url"],
                             "snippet": s.get("snippet", ""),
                             "source": urllib.parse.urlparse(s["url"]).netloc if s.get("url") else "",
-                            "engine": "google-ai-mode"})
+                            "engine": "google-ai-mode",
+                            "rank": len(per_engine.get("google-ai-mode", [])),
+                        })
         else:
             gai_future.cancel()
     # Track which engines were expected but didn't contribute
     engine_blocked = sorted(_ALL_ENGINES - set(engines_used))
 
-    if results:
-        texts = [(r.get("snippet", "") or "")[:300] + " " +
-                 (r.get("title", "") or "")[:100] for r in results]
-        q_emb, item_emb = await asyncio.gather(
-            _embed([query], "query"),
-            _embed(texts, "passage"),
-        )
-        if q_emb and item_emb:
-            for r, emb in zip(results, item_emb):
-                r["_embedding"] = emb
-            deduped = _dedup_rank(results, q_emb[0])
+    if per_engine:
+        intent = detect_intent(query)
+        merged = merge_base(per_engine, query, intent)
+        if merged:
+            # Cross-encoder scores from the shared rust worker, blended 60/40
+            with_idx = [dict(m, idx=i) for i, m in enumerate(merged)]
+            semantic = await _rerank(query, with_idx, top_k=len(with_idx))
+            if semantic:
+                by_idx = {}
+                for s in semantic:
+                    if s.get("idx") is not None:
+                        v = s.get("_rerank")
+                        if v is None:
+                            v = s.get("_rel") or s.get("_relevance") or s.get("_hybrid")
+                        if v is not None:
+                            by_idx[s["idx"]] = v
+                blend(merged, [by_idx.get(i) for i in range(len(merged))])
+            apply_coverage(query, merged)
+            apply_authority(query, intent, merged)
+            deduped = finalize(merged, count + 1)
+            total_merged = merged_total(per_engine)
+            weak = is_weak(deduped, total_merged)
         else:
-            deduped = results
-        deduped = await _rerank(query, deduped, top_k=min(count, len(deduped) + 1))
+            deduped = []
+            total_merged = 0
+            weak = True
         deduped = _normalize_scores(deduped)
         related = _related_queries(query, deduped)
     else:
-        deduped = results
+        deduped = []
+        total_merged = 0
+        weak = True
         related = []
     out: dict = {"success": True, "engines_used": engines_used,
                  "engine_blocked": engine_blocked,
                  "engine_totals": engine_totals,
                  "ai_answer": ai_answer, "follow_up": follow_up,
                  "related_queries": related,
+                 "merged_total": total_merged, "weak": weak,
                  "results": deduped[:count], "total": len(deduped[:count]),
                  "duration_ms": round((time.monotonic() - _start) * 1000)}
     if _reranker_disabled():
