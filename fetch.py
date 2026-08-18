@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -493,6 +494,10 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             except Exception:
                 pass
 
+        if focus:
+            full_content = focus_mod.filter_by_relevance(full_content, focus)
+        full_content = _token_polish(full_content)
+
         # Cache the full content
         if cache_ttl > 0:
             _cache_task = asyncio.ensure_future(cache_mod.set_cached(
@@ -503,8 +508,6 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 lambda t: t.exception() and logger.warning(
                     f"fetch: cache write failed for {url}: {t.exception()}"))
 
-        if focus:
-            full_content = focus_mod.filter_by_relevance(full_content, focus)
         result = _build_paginated_response(url, full_content, status_used,
                                           title or meta.get("title", ""),
                                           {k: v for k, v in meta.items() if v}, "",
@@ -781,6 +784,87 @@ async def _cdp_wait_for_selector(page, css: str, timeout: float = 10):
 
 # ── Pagination helper ──────────────────────────────────────────────
 
+def _paginate(text: str, offset: int, max_chars: int) -> tuple[str, int | None]:
+    """Char-budget slice at a block boundary (donsetch paginate port).
+
+    Resuming at offset>0 seeks forward to the next ``\n\n`` block so the
+    agent starts at a clean paragraph/heading, not mid-sentence. Cutting
+    prefers a block boundary in the last quarter of the window, and an
+    inline truncation marker carries the resume offset inside the content
+    itself (agents read content, not metadata). Returns (slice, next_off).
+    """
+    total = len(text)
+    if offset >= total:
+        return "", None
+    start = offset
+    if offset > 0:
+        pos = text.find("\n\n", start, min(start + 500, total))
+        if pos != -1:
+            start = pos + 2
+    end = min(start + max_chars, total)
+    if end < total:
+        window_start = start + (end - start) * 3 // 4
+        pos = text.rfind("\n\n", window_start, end)
+        if pos != -1:
+            end = pos
+    next_off = end if end < total else None
+    slice_ = text[start:end]
+    if next_off is not None:
+        slice_ += f"\n\n*[truncated — continue with offset={next_off}]*"
+    return slice_, next_off
+
+
+def _token_polish(md: str) -> str:
+    """Token-war markdown filters (donsetch render.rs port).
+
+    Drops bare-link lines, bare-number lines (vote counts, ranks), wiki
+    ``[edit]`` junk, link-farm runs (>=7 consecutive bare links — the
+    block is dropped entirely, matching render.rs's list-density drop),
+    and exact-duplicate prose paragraphs (badge dupes, repeated teasers).
+    """
+    lines = md.split("\n")
+    out: list[str] = []
+    seen: set[str] = set()
+    farm = 0
+    farm_start = -1
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            out.append(ln)
+            continue  # blank lines don't break a farm run
+        bare = False
+        if s.startswith("!["):
+            pass
+        elif len(s) < 80 and (
+            re.fullmatch(r"\[[^\]]*\]\(https?://[^)]*\)", s)
+            or re.fullmatch(r"<https?://[^\s<>]+>", s)
+        ):
+            bare = True
+        elif len(s) < 8 and re.fullmatch(r"[\d,]+", s):
+            bare = True
+        elif len(s) < 14 and s.startswith("[") and s.endswith("]")\
+                and s[1:-1].strip().replace(" ", "").isalpha():
+            bare = True
+        if bare:
+            if farm == 0:
+                farm_start = len(out)
+            farm += 1
+            out.append(ln)
+            continue
+        if farm >= 7:
+            del out[farm_start:]
+        farm = 0
+        key = re.sub(r"\s+", " ", s).lower()
+        if key and s[0] not in "#-*|>`":
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(ln)
+    if farm >= 7:
+        del out[farm_start:]
+    return "\n".join(out)
+
+
 def _build_paginated_response(url: str, content: str, status: int | str,
                               title: str, metadata: dict, content_type: str,
                               offset: int, max_chars: int,
@@ -793,42 +877,15 @@ def _build_paginated_response(url: str, content: str, status: int | str,
     """
     total = len(content)
 
-    if offset > 0:
-        content = content[offset:]
-        if not content:
-            return {
-                "success": True, "url": url, "status": status,
-                "title": title, "content": "",
-                "content_type": content_type, "metadata": metadata,
-                "total_extracted_chars": total,
-                "offset": offset,
-                "is_truncated": False,
-                "next_offset": 0,
-                "method": method,
-            }
-
-    if total > max_chars:
-        sliced = content[:max_chars]
-        next_off = offset + max_chars
-        is_truncated = next_off < total
-        return {
-            "success": True, "url": url, "status": status,
-            "title": title, "content": sliced,
-            "content_type": content_type, "metadata": metadata,
-            "total_extracted_chars": total,
-            "offset": offset,
-            "is_truncated": is_truncated,
-            "next_offset": next_off if is_truncated else 0,
-            "method": method,
-        }
-    else:
-        return {
-            "success": True, "url": url, "status": status,
-            "title": title, "content": content,
-            "content_type": content_type, "metadata": metadata,
-            "total_extracted_chars": total,
-            "offset": offset,
-            "is_truncated": False,
-            "next_offset": 0,
-            "method": method,
-        }
+    sliced, next_off = _paginate(content, offset, max_chars)
+    is_truncated = next_off is not None
+    return {
+        "success": True, "url": url, "status": status,
+        "title": title, "content": sliced,
+        "content_type": content_type, "metadata": metadata,
+        "total_extracted_chars": total,
+        "offset": offset,
+        "is_truncated": is_truncated,
+        "next_offset": next_off if is_truncated else 0,
+        "method": method,
+    }
