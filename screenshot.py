@@ -66,7 +66,9 @@ async def cdpa11y_snapshot(url: str, verbose: bool = False, max_chars: int = 100
 def _format_ax_nodes(nodes: list[dict], depth: int = 0) -> list[str]:
     """Format Accessibility.getFullAXTree nodes into indented role lines."""
     lines: list[str] = []
-    for node in nodes:
+    by_id = {n.get("nodeId"): n for n in nodes}
+
+    def emit(node: dict, depth: int) -> None:
         role = node.get("role", {}).get("value", "unknown")
         name = node.get("name", {}).get("value", "")
         value = node.get("value", {}).get("value", "")
@@ -77,10 +79,14 @@ def _format_ax_nodes(nodes: list[dict], depth: int = 0) -> list[str]:
         if value and value != name:
             line += f': {value}'
         lines.append(line)
-        children = node.get("childIds", [])
-        if children and depth < 10:
-            child_nodes = [n for n in nodes if n.get("nodeId") in children]
-            lines.extend(_format_ax_nodes(child_nodes, depth + 1))
+        if depth < 10:
+            for cid in node.get("childIds", []):
+                child = by_id.get(cid)
+                if child is not None:
+                    emit(child, depth + 1)
+
+    for node in nodes:
+        emit(node, depth)
     return lines
 
 

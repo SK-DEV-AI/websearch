@@ -14,7 +14,7 @@ from search_tinyfish import tinyfish_search
 from search_gai import get_gai_client
 from fetch import fetch_url
 from embed import _embed, _dedup_rank, _cosine_sim
-from wikipedia import search_wikipedia, fetch_wikipedia_summary_rest
+from wikipedia import search_wikipedia
 from arxiv import search_arxiv
 from reddit import search_reddit
 from query_expand import expand_query
@@ -100,20 +100,32 @@ def _normalize_scores(results: list[dict]) -> list[dict]:
     if not results:
         return results
     scores = [r.get("_rerank", 0) or 0 for r in results]
-    if not scores:
-        return results
     lo, hi = min(scores), max(scores)
-    span = hi - lo if hi > lo else 1.0
-    for r, s in zip(results, scores):
-        normalized = round((s - lo) / span, 4)
-        r["relevance_score"] = normalized
-        if normalized >= 0.7:
+    if hi == 0:
+        # Unranked (killswitch/reranker failure): keep engine order with a
+        # monotonic descending score so the client still gets a ranking signal.
+        n = len(results)
+        for i, r in enumerate(results):
+            r["relevance_score"] = round(1 - i / n, 4)
+            r["fetch_relevance"] = "high" if i < n / 3 else ("med" if i < 2 * n / 3 else "low")
+    elif hi == lo:
+        # Tied real scores: every result is equally top-ranked.
+        for r in results:
+            r["relevance_score"] = 1.0
             r["fetch_relevance"] = "high"
-        elif normalized >= 0.4:
-            r["fetch_relevance"] = "med"
-        else:
-            r["fetch_relevance"] = "low"
-        # Clean up internal keys
+    else:
+        span = hi - lo
+        for r, s in zip(results, scores):
+            normalized = round((s - lo) / span, 4)
+            r["relevance_score"] = normalized
+            if normalized >= 0.7:
+                r["fetch_relevance"] = "high"
+            elif normalized >= 0.4:
+                r["fetch_relevance"] = "med"
+            else:
+                r["fetch_relevance"] = "low"
+    # Clean up internal keys
+    for r in results:
         r.pop("_rerank", None)
         r.pop("_embedding", None)
         r.pop("_rel", None)
@@ -379,28 +391,12 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
     if not urls:
         return {"fetched_content": []}
     fetched = await asyncio.gather(
-        *[fetch_url(url, max_chars=3000, fast=True) for url in urls], return_exceptions=True)
+        *[fetch_url(url, max_chars=32768, fast=True) for url in urls], return_exceptions=True)
     fetched = [f for f in fetched if isinstance(f, dict) and f.get("success")]
-    for i, r in enumerate(results[:5]):
-        url = r.get("url", "")
-        if not url or "wikipedia.org" not in url:
-            continue
-        page_path = urllib.parse.urlparse(url).path.strip("/")
-        if page_path.startswith("wiki/"):
-            page_path = page_path[5:]
-        page_title = urllib.parse.unquote(page_path.replace("_", " "))
-        if not page_title:
-            continue
-        wiki_summary = await fetch_wikipedia_summary_rest(page_title, language=language)
-        if wiki_summary:
-            for f in fetched:
-                if f.get("url") == url:
-                    f.setdefault("content", "")
-                    content = f["content"]
-                    summary_text = wiki_summary.get("extract", "")
-                    if summary_text and len(summary_text) > len(content):
-                        f["content"] = summary_text + "\n\n" + content
-                    break
+    # No Wikipedia summary re-fetch: the full 32K fetch already carries the
+    # article, and a summary extract is longer than it almost never (it would
+    # only prepend when summary > full content). The old block spent a REST
+    # call per wiki page on work that was discarded ~always.
     if len(fetched) > 1:
         texts = [(f.get("content", "") or "")[:300] + " " +
                  (f.get("title", "") or "")[:100] for f in fetched]
@@ -409,13 +405,17 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
             deduped = []
             seen_emb: list[list[float]] = []
             for f, emb in zip(fetched, item_emb):
-                is_dup = any(_cosine_sim(emb, se) > 0.90 for se in seen_emb)
+                is_dup = any(_cosine_sim(emb, se) > 0.92 for se in seen_emb)  # match _dedup_rank default
                 if not is_dup:
                     deduped.append(f)
                     seen_emb.append(emb)
             fetched = deduped
         fetched = await _rerank(query, fetched, top_k=depth * 2)
         fetched = _normalize_scores(fetched)
+        # reranker saw the full fetch; give the LLM a bounded digest per page
+        for f in fetched:
+            if f.get("content"):
+                f["content"] = f["content"][:5000]
     result = {"fetched_content": fetched}
     if _reranker_disabled():
         result["reranker"] = "disabled — results are engine-ranked only (not reranked). " \

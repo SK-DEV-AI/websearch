@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
 import hashlib
 import json
 import os
+import threading
 import time
 from typing import Any
 
@@ -99,7 +101,7 @@ def cached(ttl: int = CACHE_TTL):
             async with _cache_lock:
                 entry = _cache.get(key)
                 if entry and now - entry[0] < ttl:
-                    return entry[1]
+                    return copy.deepcopy(entry[1])
             result = await fn(*args, **kw)
             async with _cache_lock:
                 _cache[key] = (now, result)
@@ -117,17 +119,20 @@ def cached(ttl: int = CACHE_TTL):
 # ── Shared HTTP client pool ───────────────────────────────────────
 
 _http_client: httpx.AsyncClient | None = None
+_http_client_lock = threading.Lock()
 
 
 def get_http_client() -> httpx.AsyncClient:
     """Return a shared httpx.AsyncClient with connection pooling."""
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(
-            timeout=30.0,
-            follow_redirects=True,
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
-        )
+        with _http_client_lock:
+            if _http_client is None or _http_client.is_closed:
+                _http_client = httpx.AsyncClient(
+                    timeout=30.0,
+                    follow_redirects=True,
+                    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+                )
     return _http_client
 
 

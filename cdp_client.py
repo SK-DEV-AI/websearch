@@ -616,18 +616,6 @@ class CDPPage:
         except Exception:
             pass
 
-    # ── Diagnostics ──────────────────────────────────────────────
-
-    async def dom_counters(self) -> dict:
-        """Return DOM node counters (documents, nodes, jsEventListeners)."""
-        try:
-            return (await self._session.send(
-                "Memory.getDOMCounters", {},
-                session_id=self._session_id, timeout=5,
-            )).get("result", {})
-        except Exception:
-            return {"documents": 0, "nodes": 0, "jsEventListeners": 0}
-
     async def get_ax_tree(self, depth: int = 5) -> list[dict]:
         """Return the AX tree via **Accessibility.getFullAXTree**.
 
@@ -703,11 +691,3 @@ async def get_cdp_session(cdp_url: str | None = None) -> CDPSession | None:
         _cdp_session = session
         logger.info("CDP session established")
         return _cdp_session
-
-
-async def close_cdp():
-    """Shut down the shared CDP session."""
-    global _cdp_session
-    if _cdp_session:
-        await _cdp_session.close()
-        _cdp_session = None

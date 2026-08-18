@@ -226,14 +226,3 @@ async def safe_fetch(client: Any, url: str, *, max_hops: int = 5,
         return resp
     raise SecurityError(f"Too many redirects (> {max_hops}): {url}")
 
-
-def sanitize_result(result: dict[str, Any]) -> dict[str, Any]:
-    """Remove sensitive/security-relevant keys from a fetch result dict."""
-    safe = dict(result)
-    safe.pop("_embedding", None)
-    safe.pop("_rerank", None)
-    safe.pop("_rel", None)
-    safe.pop("_relevance", None)
-    safe.pop("_bm25", None)
-    safe.pop("_hybrid", None)
-    return safe

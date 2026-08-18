@@ -14,7 +14,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
-from config import MAX_RESULTS, HELIUM_CDP, get_http_client, _KeyRotator
+from config import MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client, _KeyRotator
 from search_ddg import ddgs_extract
 from fetch import fetch_url, scrapling_stealthy_fetch
 from crawl import crawl_url
@@ -31,6 +31,8 @@ from arxiv import search_arxiv
 from site_mapper import map_site
 from research import search_multi, enrich
 from extract import extract_content
+
+_groq_keys = _KeyRotator("GROQ_API_KEYS")
 
 INSTRUCTIONS = """# WebSearch MCP
 
@@ -285,10 +287,9 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             skip_synthesis = google_ai_only and r.get("ai_answer")
             if r.get("success") and bool(arguments.get("synthesize", True)) and r.get("results") and not skip_synthesis:
                 try:
-                    top = r["results"][:3]
-                    ctx = "\n\n".join(f"[{i+1}] {x.get('title','')}: {x.get('content','')[:400]}"
+                    top = (r.get("fetched_content") or r["results"])[:3]
+                    ctx = "\n\n".join(f"[{i+1}] {x.get('title','')}: {x.get('content','')[:1500]}"
                                      for i, x in enumerate(top))
-                    _groq_keys = _KeyRotator("GROQ_API_KEYS")
                     if _groq_keys.has_keys:
                         groq_key = await _groq_keys.next()
                         c = get_http_client()
@@ -585,8 +586,11 @@ async def _warmup_gai():
 
 async def main():
     asyncio.create_task(_warmup_gai())
-    async with stdio_server() as (rs, ws):
-        await server.run(rs, ws, server.create_initialization_options())
+    try:
+        async with stdio_server() as (rs, ws):
+            await server.run(rs, ws, server.create_initialization_options())
+    finally:
+        await close_http_client()
 
 if __name__ == "__main__":
     asyncio.run(main())

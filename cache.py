@@ -127,22 +127,3 @@ async def set_cached(url: str, content: str,
                 (excess,),
             )
         await db.commit()
-
-
-async def clear_cache() -> int:
-    """Clear expired entries. Returns count purged."""
-    db_path = await _ensure_db()
-    async with aiosqlite.connect(db_path) as db:
-        cursor = await db.execute(
-            "DELETE FROM fetch_cache WHERE fetched_at + ttl <= ?", (time.time(),))
-        await db.commit()
-        return cursor.rowcount
-
-
-async def clear_all_cache() -> int:
-    """Nuke the entire fetch cache."""
-    db_path = await _ensure_db()
-    async with aiosqlite.connect(db_path) as db:
-        cursor = await db.execute("DELETE FROM fetch_cache")
-        await db.commit()
-        return cursor.rowcount

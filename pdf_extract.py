@@ -78,8 +78,12 @@ def _pymupdf_extract(path: str, pages: str = "", password: str = "",
         doc.close()
 
 
-def _docling_extract(path: str, fmt: str = "markdown") -> str:
-    """Full OCR pipeline (CPU, rapidocr backend). Called only when no text layer exists."""
+def _docling_extract(path: str, fmts: list[str]) -> str | dict[str, str]:
+    """Full OCR pipeline (CPU, rapidocr backend). Called only when no text layer exists.
+
+    Converts ONCE; every requested format is exported from the same in-memory
+    document (a multi-format request previously re-ran the full OCR per format).
+    """
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.base_models import InputFormat
@@ -102,13 +106,16 @@ def _docling_extract(path: str, fmt: str = "markdown") -> str:
     conv = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
     res = conv.convert(path)
     doc = res.document
-    if fmt == "markdown":
-        return (doc.export_to_markdown() or "").strip()
-    if fmt == "json":
-        return json.dumps(doc.export_to_dict(), ensure_ascii=False)
-    if fmt == "html":
-        return (doc.export_to_html() or "").strip()
-    raise ValueError(f"unsupported format: {fmt}")
+    out: dict[str, str] = {}
+    if "markdown" in fmts:
+        out["markdown"] = (doc.export_to_markdown() or "").strip()
+    if "json" in fmts:
+        out["json"] = json.dumps(doc.export_to_dict(), ensure_ascii=False)
+    if "html" in fmts:
+        out["html"] = (doc.export_to_html() or "").strip()
+    if len(fmts) == 1:
+        return out[fmts[0]]
+    return out
 
 
 def _formats_arg(raw: str) -> list[str]:
@@ -166,22 +173,20 @@ async def extract_pdf(
                 text, page_count = _pymupdf_extract(str(path), pages, password, "markdown")
                 # Below a threshold the PDF is scanned/image-only: no text layer.
                 if force_ocr or len(text) < 30:
-                    text = await asyncio.wait_for(
-                        asyncio.to_thread(_docling_extract, str(path), fmts[0]),
-                        timeout=_OCR_PAGE_BUDGET)
                     method = "docling-ocr"
-                if len(fmts) == 1:
-                    if method == "pymupdf" and fmts[0] != "markdown":
+                    content = await asyncio.wait_for(
+                        asyncio.to_thread(_docling_extract, str(path), fmts),
+                        timeout=_OCR_PAGE_BUDGET)
+                elif len(fmts) == 1:
+                    if fmts[0] != "markdown":
                         text = (await asyncio.to_thread(
                             _pymupdf_extract, str(path), pages, password, fmts[0]))[0]
-                    content: dict[str, str] | str = text
+                    content = text
                 else:
                     got: dict[str, str] = {}
                     for f in fmts:
                         got[f] = (await asyncio.to_thread(
-                            _docling_extract, str(path), f)) if method == "docling-ocr" \
-                            else (await asyncio.to_thread(
-                                _pymupdf_extract, str(path), pages, password, f))[0]
+                            _pymupdf_extract, str(path), pages, password, f))[0]
                     content = got
             except asyncio.TimeoutError:
                 return {"success": False, "error": f"OCR timed out after {_OCR_PAGE_BUDGET}s: {path.name}"}

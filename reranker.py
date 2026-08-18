@@ -1,10 +1,12 @@
 """Shared reranker bridge — one subprocess via Unix socket, both MCP servers connect to it."""
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import signal
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -48,42 +50,59 @@ async def _close_connection():
             if _PROC.returncode is None:
                 _PROC.send_signal(signal.SIGTERM)
                 try:
-                    await asyncio.wait_for(_PROC.wait(), timeout=3)
+                    await asyncio.wait_for(asyncio.to_thread(_PROC.wait), timeout=3)
                 except asyncio.TimeoutError:
                     _PROC.kill()
-                    await _PROC.wait()
+                    await asyncio.to_thread(_PROC.wait)
         except Exception:
             pass
         _PROC = None
+        # Best-effort remove the socket we owned — a SIGKILLed worker leaves a
+        # stale file that would keep the stat-based health check green forever.
+        try:
+            os.unlink(_SOCKET_PATH)
+        except OSError:
+            pass
 
 
 async def _ensure_worker():
-    """Spawn the reranker worker process and connect to its socket.
-
-    Always removes the stale socket and spawns a fresh worker — never tries
-    to reuse a dead peer connection. Tests the connection with a ping after
-    connecting.
+    """Connect to the shared worker socket, spawning it only when no live
+    listener exists. A flock guard prevents concurrent servers from
+    double-spawning; whoever wins spawns, the rest just connect.
     """
     global _PROC, _READER, _WRITER
     if killswitch_active():
         return False
-    # Kill any stale process and close old connection
-    await _close_connection()
-    # Remove stale socket so new worker can bind
     try:
-        os.unlink(_SOCKET_PATH)
-    except OSError:
+        _READER, _WRITER = await asyncio.open_unix_connection(_SOCKET_PATH, limit=2**20)
+        return True
+    except (FileNotFoundError, ConnectionRefusedError, OSError):
         pass
+    lock_fd = os.open(_SOCKET_PATH + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        _PROC = await asyncio.create_subprocess_exec(
-            _RERANKER_PYTHON, _RERANKER_WORKER,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            _READER, _WRITER = await asyncio.open_unix_connection(_SOCKET_PATH, limit=2**20)
+            return True
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
+            return False
+    try:
+        try:
+            os.unlink(_SOCKET_PATH)
+        except OSError:
+            pass
+        _PROC = subprocess.Popen(
+            [_RERANKER_PYTHON, _RERANKER_WORKER],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
         )
         for _ in range(50):
             try:
-                _READER, _WRITER = await asyncio.open_unix_connection(_SOCKET_PATH)
+                _READER, _WRITER = await asyncio.open_unix_connection(_SOCKET_PATH, limit=2**20)
                 return True
             except (FileNotFoundError, ConnectionRefusedError, OSError):
                 await asyncio.sleep(0.1)
@@ -91,44 +110,22 @@ async def _ensure_worker():
     except Exception as e:
         logger.warning(f"reranker: start failed: {e}")
         return False
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 async def _is_healthy() -> bool:
-    """Quick ping to check if the worker socket is alive."""
+    """Stat-based health check — no wire ping, so a busy worker (40-120s
+    rerank) never stalls other agents' checks or queues stale ping lines."""
     global _PROC, _WRITER, _READER
-    if _PROC is None or _PROC.returncode is not None or _WRITER is None or _READER is None:
-        return False
-    # Return early if we can't reach the socket
-    try:
-        req = json.dumps({"query": "ping", "passages": [{"snippet": ""}], "top_k": 1})
-        _WRITER.write((req + "\n").encode())
-        await asyncio.wait_for(_WRITER.drain(), timeout=2)
-        r = await asyncio.wait_for(_READER.readuntil(b"\n"), timeout=5)
-        return not json.loads(r).get("error")
-    except Exception:
-        return False
-
-
-async def warmup() -> bool:
-    if killswitch_active():
-        await _close_connection()  # free VRAM if worker still running
-        return False
-    async with _LOCK:
-        global _READER, _WRITER, _PROC
-        if await _is_healthy():
-            return True
-        if not await _ensure_worker():
-            return False
-        try:
-            req = json.dumps({"query": "warmup", "passages": [{"snippet": "warmup"}], "top_k": 1})
-            _WRITER.write((req + "\n").encode())
-            await asyncio.wait_for(_WRITER.drain(), timeout=5)
-            r = await asyncio.wait_for(_READER.readuntil(b"\n"), timeout=120)
-            result = json.loads(r)
-            return not result.get("error")
-        except Exception:
-            await _close_connection()
-            return False
+    return (
+        _PROC is not None
+        and _PROC.returncode is None
+        and _WRITER is not None
+        and _READER is not None
+        and os.path.exists(_SOCKET_PATH)
+    )
 
 
 def fallback_sort(passages: list[dict], top_k: int) -> list[dict]:
@@ -154,8 +151,8 @@ async def rerank(query: str, passages: list[dict], top_k: int = 20) -> list[dict
         normalized = []
         for p in passages:
             item = dict(p)
-            text = item.get("snippet") or item.get("text") or item.get("content") or ""
-            item["snippet"] = text[:3072]
+            text = item.get("snippet") or item.get("text") or item.get("content") or item.get("full_content") or ""
+            item["snippet"] = text[:32768]
             normalized.append(item)
         req = json.dumps({"query": query, "passages": normalized, "top_k": top_k})
         try:
@@ -166,7 +163,7 @@ async def rerank(query: str, passages: list[dict], top_k: int = 20) -> list[dict
             await _close_connection()
             return fallback_sort(passages, top_k)
         try:
-            r = await asyncio.wait_for(_READER.readuntil(b"\n"), timeout=30)
+            r = await asyncio.wait_for(_READER.readuntil(b"\n"), timeout=120)
         except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError) as e:
             logger.warning(f"reranker: read failed: {e}")
             await _close_connection()

@@ -22,7 +22,7 @@ import urllib.parse
 from typing import Any
 
 from config import GOOGLE_AI_URL, HELIUM_CDP, get_http_client
-from cdp_client import CDPPage, get_cdp_session, close_cdp, owned_targets
+from cdp_client import CDPPage, get_cdp_session, owned_targets
 from security import safe_fetch, validate_url
 
 logger = logging.getLogger("gai")
@@ -636,11 +636,3 @@ async def get_gai_client(cdp_url: str | None = None) -> GoogleAIClient | None:
         except Exception as e:
             logger.warning("GAI CDP check failed: %s", e)
             return None
-
-
-async def gai_shutdown():
-    """Shutdown the GAI client and CDP connection."""
-    global _gaiclient
-    if _gaiclient:
-        _gaiclient = None
-    await close_cdp()
