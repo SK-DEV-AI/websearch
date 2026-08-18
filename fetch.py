@@ -86,6 +86,19 @@ _CLOUDFLARE_RESOLVED_JS = """
 # Consent-banner + turnstile auto-dismiss (donsetch ops.rs DISMISS_MODALS_JS,
 # turnstile click) — run once after the page settles so modals cannot
 # wedge the challenge iframe and so cf-turnstile checkboxes get clicked.
+MAX_DECOMPRESSED = 64 * 1024 * 1024  # donsetch decompress.rs bomb cap
+
+# donsetch inline.rs:212 — tracker params dropped from markdown link targets
+TRACKER_PARAMS = re.compile(
+    r"[?&](?:utm_[a-z0-9_]*|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid|ref_src|spm|scm|_ga)[^&]*",
+    re.IGNORECASE,
+)
+_LINK_TARGET = re.compile(r"\]\(([^()\s]+)\)")
+
+# donsetch inline.rs:156 — wiki citation markers: [1], [12], [a] (≤3 digits or 1 lowercase letter)
+# Negative lookahead keeps real links: [1](https://…) stays, bare [1] goes.
+_CITATION_MARKER = re.compile(r"\[(?:\d{1,3}|[a-z])\](?!\()")
+
 _AUTO_DISMISS_JS = """
 () => {
     const selectors = [
@@ -204,6 +217,8 @@ async def _try_wayback(original_url: str) -> dict | None:
         if wr.status_code != 200:
             return None
         content = wr.text
+        if _bomb_capped(content):
+            return None
         if not content or len(content.strip()) < 50:
             return None
         # Run through trafilatura like the normal path — model gets clean text, not raw HTML
@@ -285,6 +300,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
             try:
                 resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True)
+                if _bomb_capped(resp.body):
+                    return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
                 content = resp.body if isinstance(resp.body, str) else resp.body.decode("utf-8", errors="replace")
                 full_content = content.strip()
                 if focus:
@@ -312,9 +329,11 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                                   offset, max_chars, method="pdf")
             except Exception as e:
                 logger.warning("PDF extraction failed for %s: %s", url, e)
-        if url_lower.endswith('.epub'):
-            resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
-            content = _extract_epub(
+            if url_lower.endswith('.epub'):
+                resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
+                if _bomb_capped(resp.body):
+                    return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
+                content = _extract_epub(
                 resp.body if isinstance(resp.body, bytes) else resp.body.encode(), 100000)
             full_content = content
             if focus:
@@ -322,9 +341,11 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             return _build_paginated_response(url, full_content, 200,
                                               url.split("/")[-1], {}, "",
                                               offset, max_chars, method="epub")
-        if url_lower.endswith(('.docx', '.doc')):
-            resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
-            content = _extract_docx(
+            if url_lower.endswith(('.docx', '.doc')):
+                resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
+                if _bomb_capped(resp.body):
+                    return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
+                content = _extract_docx(
                 resp.body if isinstance(resp.body, bytes) else resp.body.encode(), 100000)
             full_content = content
             if focus:
@@ -370,6 +391,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     status_used = 304
             else:
                 body = resp.body if isinstance(resp.body, bytes) else resp.body.encode("utf-8", errors="replace")
+                if _bomb_capped(body):
+                    return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
                 _reval.store(url, resp.status, resp.headers, body)
                 raw_html = resp.body if isinstance(resp.body, str) else body.decode("utf-8", errors="replace")
                 status_used = resp.status
@@ -533,6 +556,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
         if focus:
             full_content = focus_mod.filter_by_relevance(full_content, focus)
+        full_content = _strip_trackers_md(full_content)
+        full_content = _drop_citation_markers(full_content)
         full_content = _token_polish(full_content)
 
         # Cache the full content
@@ -849,6 +874,35 @@ def _paginate(text: str, offset: int, max_chars: int) -> tuple[str, int | None]:
     if next_off is not None:
         slice_ += f"\n\n*[truncated — continue with offset={next_off}]*"
     return slice_, next_off
+
+
+def _bomb_capped(body: bytes | str) -> bool:
+    """True if a (already decompressed) body exceeds the 64 MiB cap."""
+    return len(body) > MAX_DECOMPRESSED
+
+
+def _strip_trackers_md(md: str) -> str:
+    """Drop tracker params from markdown link targets (donsetch inline.rs:212).
+
+    Rewrites ``[text](url?utm_...=x&fbclid=y)`` to ``[text](url)`` — the
+    markdown equivalent of stripping at link-render time.
+    """
+    def _clean(m: re.Match) -> str:
+        target = TRACKER_PARAMS.sub("", m.group(1))
+        if "?" in m.group(1) and "?" not in target and "&" in target:
+            target = target.replace("&", "?", 1)
+        return f"]({target})"
+    return _LINK_TARGET.sub(_clean, md)
+
+
+def _drop_citation_markers(md: str) -> str:
+    """Drop wiki citation markers [1], [12], [a] (donsetch inline.rs:156).
+
+    Removes bracket-only tokens that are <=3 digits or a single lowercase
+    letter — the shape of wiki sup citations. Real links (``[text](url)``)
+    and code spans are untouched because the regex only matches bare brackets.
+    """
+    return _CITATION_MARKER.sub("", md)
 
 
 def _token_polish(md: str) -> str:

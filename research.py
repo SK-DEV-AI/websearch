@@ -442,7 +442,33 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
         return {"fetched_content": []}
     fetched = await asyncio.gather(
         *[fetch_url(url, max_chars=32768, fast=True) for url in urls], return_exceptions=True)
-    fetched = [f for f in fetched if isinstance(f, dict) and f.get("success")]
+    # donsetch mod.rs:583 — dead links keep their SERP title/snippet with a 0.5
+    # score demote; bot walls (challenge verdict) stay untouched at full score.
+    # Both stay in the pool (the LLM still sees title+snippet), only real
+    # successes carry fetched content and enter dedup/rerank.
+    kept: list[dict] = []
+    demoted: list[dict] = []
+    by_url = {r.get("url"): r for r in results if r.get("url")}
+    for f in fetched:
+        if isinstance(f, dict) and f.get("success"):
+            kept.append(f)
+            continue
+        url = f.get("url") if isinstance(f, dict) else None
+        orig = by_url.get(url)
+        if not orig:
+            continue
+        entry = {
+            **orig,
+            "content": orig.get("snippet") or "",
+            "success": False,
+            "dead": True,
+        }
+        if isinstance(f, dict) and f.get("verdict") in ("CHALLENGE", "TERMINAL"):
+            entry["relevance_score"] = orig.get("relevance_score") or 0.5
+        else:
+            entry["relevance_score"] = round((orig.get("relevance_score") or 0.5) * 0.5, 4)
+        demoted.append(entry)
+    fetched = kept
     # No Wikipedia summary re-fetch: the full 32K fetch already carries the
     # article, and a summary extract is longer than it almost never (it would
     # only prepend when summary > full content). The old block spent a REST
@@ -467,6 +493,8 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
             if f.get("content"):
                 f["content"] = f["content"][:5000]
     result = {"fetched_content": fetched}
+    if demoted:
+        result["fetched_content"] = result["fetched_content"] + demoted
     if _reranker_disabled():
         result["reranker"] = "disabled — results are engine-ranked only (not reranked). " \
             "Enable with: rm ~/.local/share/reranker-rust/disabled"
