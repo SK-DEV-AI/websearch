@@ -386,6 +386,13 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         merged = merge_base(per_engine, query, intent)
         if merged:
             # Cross-encoder scores from the shared rust worker, blended 60/40
+            # ponytail: truncate snippets to 1200 chars before rerank — 94-entry
+            # merged pools were feeding ~500K chars (~130K tokens, 15-50s) for
+            # a relevance signal that the first ~300 tokens already carry.
+            for m in merged:
+                s = m.get("snippet") or ""
+                if len(s) > 1200:
+                    m["snippet"] = s[:1200]
             with_idx = [dict(m, idx=i) for i, m in enumerate(merged)]
             semantic = await _rerank(query, with_idx, top_k=len(with_idx))
             if semantic:
