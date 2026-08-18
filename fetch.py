@@ -12,6 +12,7 @@ from scrapling.fetchers import AsyncFetcher, AsyncStealthySession
 
 from bot_detection import detect_antibot
 from ghost_state import CHALLENGE, CONTENT_OK, TERMINAL, classify, ghost
+import jsdata
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
 from security import SecurityError, safe_fetch, validate_url as _validate_url
 import cache as cache_mod
@@ -408,6 +409,24 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         if detected:
             return {"success": False, "url": url,
                     "error": f"{provider} challenge detected ({detection_type}) — auto-fallback to CDP in progress."}
+
+        # ── SPA JSON rescue (donsetch jsdata.rs port) ───────────────
+        # A script-heavy page that yielded thin text is usually a
+        # client-rendered shell with the real content embedded in a
+        # JSON blob (Next.js __next_f RSC frames, __NEXT_DATA__,
+        # GitHub react-app embeddedData, ytInitialData, ld+json ...).
+        # Mine it BEFORE the density fallback so shells are rescued
+        # instead of misread as unknown bot challenges. Challenge
+        # pages are config-noise shaped and get rejected by the
+        # scorer, so they still fall through to the gate below.
+        if len(full_content) < 800:
+            try:
+                mined = jsdata.extract(raw_html, url)
+            except Exception as e:
+                logger.debug("jsdata rescue failed for %s: %s", url, e)
+                mined = None
+            if mined and len(mined) > len(full_content) + 50:
+                full_content = mined
 
         # Generic density-based fallback for unknown challenge vendors
         # (is-antibot patterns only cover known vendors — new/obscure challenge
