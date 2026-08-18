@@ -385,6 +385,12 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         intent = detect_intent(query)
         merged = merge_base(per_engine, query, intent)
         if merged:
+            # ponytail: cap the rerank pool at the top 120 by base score —
+            # the cross-encoder correlates with the pre-score, and the bottom
+            # of a 189-entry pool costs ~4-5s of GPU time for near-zero
+            # top-10 impact; raise if long-tail recall ever matters.
+            if len(merged) > 120:
+                merged = sorted(merged, key=lambda r: r["score"], reverse=True)[:120]
             # Cross-encoder scores from the shared rust worker, blended 60/40
             # ponytail: truncate snippets to 1200 chars before rerank — 94-entry
             # merged pools were feeding ~500K chars (~130K tokens, 15-50s) for

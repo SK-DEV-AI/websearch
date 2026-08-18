@@ -122,6 +122,7 @@ async def _get_ai_summary(page, query: str) -> dict | None:
     deadline = time.monotonic() + 15
     section_len = 0
     stable = 0
+    no_marker = 0
     section_js = (
         "(() => {"
         "  const t = document.body?.innerText || '';"
@@ -135,6 +136,7 @@ async def _get_ai_summary(page, query: str) -> dict | None:
     while time.monotonic() < deadline:
         state = await page.evaluate(section_js)
         if state and state.get("ready"):
+            no_marker = 0
             cur = state.get("len", 0)
             if cur == section_len:
                 stable += 1
@@ -143,6 +145,13 @@ async def _get_ai_summary(page, query: str) -> dict | None:
             else:
                 section_len = cur
                 stable = 0
+        else:
+            # Reddit AI answers are precomputed per query: if the marker
+            # hasn't rendered within the grace window it never will —
+            # don't burn the full 15s deadline waiting for nothing.
+            no_marker += 1
+            if no_marker >= 6:
+                break
         await asyncio.sleep(0.5)
 
     extracted = await page.evaluate('''
@@ -198,6 +207,7 @@ async def _get_ai_summary(page, query: str) -> dict | None:
             full = None
             prev = 0
             stable = 0
+            no_chunk = 0
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 chunk = await page.evaluate('''
@@ -209,6 +219,7 @@ async def _get_ai_summary(page, query: str) -> dict | None:
 })()
 ''')
                 if chunk and isinstance(chunk, str):
+                    no_chunk = 0
                     cur = len(chunk)
                     if cur == prev:
                         stable += 1
@@ -218,6 +229,12 @@ async def _get_ai_summary(page, query: str) -> dict | None:
                     else:
                         prev = cur
                         stable = 0
+                else:
+                    # The stream either starts within the grace window or
+                    # not at all — don't burn the full 20s deadline.
+                    no_chunk += 1
+                    if no_chunk >= 6:
+                        break
                 await asyncio.sleep(0.5)
             if full and isinstance(full, str) and len(full.strip()) > 100:
                 result["full_answer"] = full.strip()
