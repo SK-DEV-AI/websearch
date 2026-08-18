@@ -20,7 +20,8 @@ from reddit import search_reddit
 from query_expand import expand_query
 from reranker import rerank as _rerank, killswitch_active as _reranker_disabled
 from merge import (merge_base, blend, apply_coverage, apply_authority, finalize,
-                   detect_intent, is_weak, merged_total, norm_key)
+                   detect_intent, is_weak, merged_total, norm_key, verticals_for)
+from verticals import run as vertical_run
 
 
 
@@ -295,7 +296,14 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         }
         done = await asyncio.gather(*tasks.values(), return_exceptions=True)
         done_map = dict(zip(tasks.keys(), done))
-        for key in ("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish") + tuple(ddg_tasks.keys()):
+        _verticals = [v for v in verticals_for(detect_intent(query), query)
+                      if v not in ("wikipedia", "arxiv", "news")]
+        for _v in _verticals:
+            try:
+                done_map[f"vert_{_v}"] = await vertical_run(_v, query)
+            except BaseException:
+                done_map[f"vert_{_v}"] = []
+        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
             val = done_map[key]
             if isinstance(val, BaseException):
                 continue
@@ -316,6 +324,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                     if key != "reddit" or r.get("engine") in ("reddit", "reddit-comment", "reddit-ai-summary"):
                         new_eng = "duckduckgo" if key.startswith("ddg") else (
                             "google-news-rss" if key == "rss" else key)
+                        if key.startswith("vert_"):
+                            new_eng = key[5:]
                         # Preserve sub-engine (e.g., reddit-ai-summary, reddit-comment)
                         cur = r.get("engine")
                         if not cur or cur == key or cur == new_eng:
@@ -334,6 +344,10 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 continue
             if any(isinstance(r, dict) and "error" not in r for r in rl):
                 engines_used.append(name)
+        for _v in _verticals:
+            if any(isinstance(r, dict) and "error" not in r
+                   for r in done_map.get(f"vert_{_v}", [])):
+                engines_used.append(_v)
         if any(isinstance(done_map.get(k), (list, dict)) for k in ddg_tasks):
             engines_used.append("duckduckgo")
 
