@@ -15,6 +15,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
 from config import MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client, _KeyRotator
+from errors import annotate as _err_annotate, classify_exception as _err_exc
 from ghost_state import CHALLENGE, CONTENT_OK, classify, ghost
 from search_ddg import ddgs_extract
 from fetch import fetch_url, scrapling_stealthy_fetch
@@ -224,7 +225,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
     name = params.name
     arguments = params.arguments or {}
     if not isinstance(arguments, dict):
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": "arguments must be a dict"}))], is_error=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": "arguments must be a dict"})))], is_error=True)
 
     def safe_int(v, default=0):
         try:
@@ -240,6 +241,8 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
 
     def _res(data) -> CallToolResult:
         ok = isinstance(data, dict) and data.get("success", False)
+        if not ok and isinstance(data, dict):
+            _err_annotate(data)
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, default=str))], is_error=not ok)
 
     try:
@@ -620,17 +623,17 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 exclude_patterns=arguments.get("exclude_patterns"))
             return _res(r)
         else:
-            return CallToolResult(content=[TextContent(type="text", text=f"Unknown tool: {name}")], is_error=True)
+            return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": f"Unknown tool: {name}"})))], is_error=True)
     except ValueError as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], is_error=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": str(e)})))], is_error=True)
     except KeyError as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": f"Missing required argument: {e}"}))], is_error=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": f"Missing required argument: {e}"})))], is_error=True)
     except TypeError as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], is_error=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": str(e)})))], is_error=True)
     except RuntimeError as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": str(e)}))], is_error=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": str(e)})))], is_error=True)
     except Exception as e:
-        return CallToolResult(content=[TextContent(type="text", text=json.dumps({"error": f"{type(e).__name__}: {e}"}))], is_error=True)
+        return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": f"{type(e).__name__}: {e}", "errorKind": _err_exc(e)})))], is_error=True)
 
 
 server = Server("websearch", instructions=INSTRUCTIONS,
