@@ -422,8 +422,18 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True,
                                               cookies=merged or None,
                                               headers=cond or None)
-                if resp.status == 429:  # rate-limited: one jittered retry
-                    await asyncio.sleep(random.uniform(1.5, 3.5))
+                # Rate-limit / transient 5xx: exponential backoff with jitter,
+                # honoring Retry-After when present (capped — never sleep for
+                # an hour because a server said so). tenacity pattern, hand-rolled.
+                for attempt in range(2):
+                    if resp.status != 429 and resp.status < 500:
+                        break
+                    ra = resp.headers.get("retry-after")
+                    if ra and ra.isdigit():
+                        delay = min(float(ra), 10.0)
+                    else:
+                        delay = 1.5 * (2 ** attempt) + random.uniform(0, 1.0)
+                    await asyncio.sleep(delay)
                     resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True,
                                                   cookies=merged or None,
                                                   headers=cond or None)
@@ -453,8 +463,20 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 raw_html = resp.body if isinstance(resp.body, str) else body.decode("utf-8", errors="replace")
                 status_used = resp.status
 
-        # If the page is dead (404, 410, 5xx), try Wayback Machine
+        # If the page is dead (404, 410, 5xx), try a proxy fallback, then Wayback
         if status_used in (404, 410) or status_used >= 500:
+            if config.PROXY_POOL_ENABLED:
+                try:
+                    from proxy_pool import proxy_fetch
+                    proxy_body = await proxy_fetch(url)
+                    if proxy_body and len(proxy_body) > 500:
+                        if focus:
+                            proxy_body = focus_mod.filter_by_relevance(proxy_body, focus)
+                        return _build_paginated_response(
+                            url, proxy_body, 200, "", {}, "text/html",
+                            offset, max_chars, method="proxy")
+                except Exception:
+                    pass
             wayback = await _try_wayback(url)
             if wayback:
                 return wayback
