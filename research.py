@@ -11,8 +11,6 @@ from collections import Counter
 from config import cached
 from search_ddg import search_ddg, search_google_rss
 from search_brave import search_brave
-from search_marginalia import search_marginalia
-from search_cc_hf import search_commoncrawl, search_huggingface
 from search_tavily import search_tavily
 from search_anysearch import search_anysearch
 from search_tinyfish import tinyfish_search
@@ -49,8 +47,7 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'+-]{2,}")
 
 # Engines expected in a non-GAI-only search (for engine_blocked reporting)
 _ALL_ENGINES = {"google-news-rss", "tavily", "reddit", "wikipedia", "arxiv",
-                "anysearch", "tinyfish", "duckduckgo", "brave", "marginalia",
-                "commoncrawl", "huggingface"}
+                "anysearch", "tinyfish", "duckduckgo", "brave"}
 
 
 def _query_tokens(query: str) -> set[str]:
@@ -247,14 +244,6 @@ async def classify_need(query: str) -> str:
     return "general"
 
 
-async def _noop_rewrite(query: str) -> str:
-    return query
-
-
-async def _noop_need() -> str:
-    return "general"
-
-
 @cached(ttl=90)
 async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                        google_ai_only: bool = False, search_type: str = "auto",
@@ -262,7 +251,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                        hl: str = "en", tbs: str = "", pws: str = "", backend: str = "auto",
                        timelimit: str = "", page: int = 1, region: str = "wt-wt",
                        safesearch: str = "moderate",
-                        language: str = "en", country: str = "",
+                        language: str = "en",
                         reddit_subreddit: str = "", reddit_comments: bool = True,
                        upload_urls: list[str] | None = None,
                        query_expand: bool = True,
@@ -275,27 +264,21 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                        resolution: str = "", duration: str = "",
                        license_videos: str = "",
                        start_date: str = "", end_date: str = "",
-                       exact_phrase: bool = False,
-                       engines: list[str] | None = None,
                        anysearch_tag: str = "", anysearch_zone: str = "",
                        anysearch_language: str = "",
                         anysearch_params: dict | None = None,
                         depth: int = 1,
-                       query_rewrite: bool = True, need_classifier: bool = True,
                        history: str = "") -> dict:
     _start = time.monotonic()
     rewritten_query = ""
     search_need = "general"
     out_subqueries: list[dict] = []
-    if not google_ai_only and (query_rewrite or need_classifier):
+    if not google_ai_only:
         # D2: one combined pass → standalone rewrite + search-need label.
         # Never suppresses search — the label only biases engine boosts below.
-        rw, nd = await asyncio.gather(
-            rewrite_query(query, history) if query_rewrite else _noop_rewrite(query),
-            classify_need(query) if need_classifier else _noop_need(),
+        rewritten_query, search_need = await asyncio.gather(
+            rewrite_query(query, history), classify_need(query),
         )
-        rewritten_query = rw
-        search_need = nd
     effective_query = rewritten_query or query
     engines_used: list[str] = []
     per_engine: dict[str, list[dict]] = {}
@@ -411,8 +394,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             "tavily": asyncio.create_task(_multi_search(search_tavily, multi_variants,
                 n=count, topic=tavily_topic, time_range=tavily_tr or tbs,
                 search_depth=tavily_depth, include_raw_content=True,
-                start_date=start_date, end_date=end_date, exact_phrase=exact_phrase,
-                country=country, include_domains=include_domains, exclude_domains=exclude_domains)),
+                start_date=start_date, end_date=end_date,
+                include_domains=include_domains, exclude_domains=exclude_domains)),
             "wiki": asyncio.create_task(_multi_search(search_wikipedia, multi_variants,
                 count=min(count, 8), language=language)),
             "reddit": asyncio.create_task(_multi_search(
@@ -431,30 +414,6 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 count=min(count, 10), timelimit=timelimit)),
             **ddg_tasks,
         }
-        if engines:
-            _ENGINE_KEY = {"google-news-rss": "rss", "duckduckgo": "ddg",
-                           "tavily": "tavily", "reddit": "reddit",
-                           "wikipedia": "wiki", "arxiv": "arxiv",
-                           "anysearch": "anysearch", "tinyfish": "tinyfish",
-                           "brave": "brave", "marginalia": "marginalia",
-                           "commoncrawl": "commoncrawl", "huggingface": "huggingface"}
-            allowed = {_ENGINE_KEY.get(e, e) for e in engines}
-            tasks = {k: v for k, v in tasks.items()
-                     if (k.startswith("ddg_") and "ddg" in allowed) or k in allowed}
-        # marginalia is a small non-commercial index under aggressive rate
-        # limiting — opt-in only via engines=[...], never part of the default
-        # fan-out (steal engines #4)
-        if engines and "marginalia" in allowed:
-            tasks["marginalia"] = asyncio.create_task(_multi_search(
-                search_marginalia, multi_variants[:1], count=min(count, 10)))
-        # commoncrawl/huggingface: niche archival + ML-vertical intents, opt-in
-        # only (steal engines #6)
-        if engines and "commoncrawl" in allowed:
-            tasks["commoncrawl"] = asyncio.create_task(_multi_search(
-                search_commoncrawl, multi_variants[:1], count=min(count, 20)))
-        if engines and "huggingface" in allowed:
-            tasks["huggingface"] = asyncio.create_task(_multi_search(
-                search_huggingface, multi_variants[:1], count=min(count, 20)))
         done = await asyncio.gather(*tasks.values(), return_exceptions=True)
         done_map = dict(zip(tasks.keys(), done))
         # D2 need-bias: academic need overrides the detected intent so the
@@ -470,7 +429,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 done_map[f"vert_{_v}"] = await vertical_run(_v, effective_query)
             except BaseException:
                 done_map[f"vert_{_v}"] = []
-        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "brave", "marginalia", "commoncrawl", "huggingface")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
+        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "brave")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
             if key not in done_map:
                 continue
             val = done_map[key]
@@ -511,7 +470,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                         entry = dict(r)
                         entry["rank"] = len(per_engine.get(new_eng, []))
                         per_engine.setdefault(new_eng, []).append(entry)
-        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish", "brave": "brave", "marginalia": "marginalia", "commoncrawl": "commoncrawl", "huggingface": "huggingface"}
+        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish", "brave": "brave"}
         for key, name in eng.items():
             val = done_map.get(key)
             if isinstance(val, dict):

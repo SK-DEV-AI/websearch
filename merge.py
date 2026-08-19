@@ -132,6 +132,8 @@ def merge_base(per_engine: dict[str, list[dict]], query: str, intent: str) -> li
             family_best[(key, family)] = contribution if fb is None else max(fb, contribution)
             entry = groups.get(key)
             if entry is None:
+                src_type, is_off = classify_source(
+                    urllib.parse.urlsplit(hit["url"]).hostname or "")
                 entry = {
                     "title": hit.get("title", ""),
                     "url": hit["url"],
@@ -139,7 +141,14 @@ def merge_base(per_engine: dict[str, list[dict]], query: str, intent: str) -> li
                     "sources": [],
                     "score": 0.0,
                     "published": hit.get("published") or hit.get("date"),
+                    "source_type": src_type,
+                    "is_official": is_off,
                 }
+                if entry["published"]:
+                    _age = _iso_days_ago(str(entry["published"]))
+                    if _age is not None:
+                        entry["content_age_days"] = _age
+                        entry["is_stale"] = _age > _STALE_DAYS
                 groups[key] = entry
             snip = hit.get("snippet", "") or ""
             if len(snip) > len(entry["snippet"]) and not snip.startswith("Redirecting"):
@@ -694,6 +703,54 @@ def _iso_days_ago(iso: str) -> int | None:
     then = _days_from_civil(y, mo, d)
     now = int(time.time() // 86400)
     return now - then
+
+
+# Structured freshness/source fields (hound-mcp steal, landscape 🥈):
+# content_age_days / is_stale from the published date, source_type /
+# is_official from the hostname. Computed once in merge_base so every
+# consumer (search/enrich) gets them without per-engine plumbing.
+
+_STALE_DAYS = 365
+
+_SOCIAL_HOSTS = {"reddit.com", "x.com", "twitter.com", "facebook.com",
+                 "instagram.com", "tiktok.com", "youtube.com", "linkedin.com",
+                 "mastodon.social", "bsky.app", "threads.net"}
+_NEWS_HOSTS = {"news.ycombinator.com", "techcrunch.com", "theverge.com",
+               "arstechnica.com", "wired.com", "bbc.com", "bbc.co.uk",
+               "cnn.com", "reuters.com", "apnews.com", "npr.org",
+               "theguardian.com", "nytimes.com", "wsj.com", "bloomberg.com"}
+_WIKI_HOSTS = {"wikipedia.org", "wiktionary.org", "wikimedia.org"}
+_AGG_HOSTS = {"medium.com", "substack.com", "ghost.io", "quora.com",
+              "stackoverflow.com", "stackexchange.com"}
+
+
+def classify_source(hostname: str) -> tuple[str, bool]:
+    """(source_type, is_official) from a hostname."""
+    h = (hostname or "").lower().strip(".")
+    if not h:
+        return "other", False
+    parts = h.split(".")
+    root = ".".join(parts[-2:]) if len(parts) >= 2 else h
+    tld = parts[-1]
+    if tld in ("gov", "mil") or h.endswith(".gov.in") or h.endswith(".gov.uk"):
+        return "official", True
+    if tld == "edu":
+        return "academic", True
+    if tld == "in" and h.endswith((".ac.in", ".edu.in")):
+        return "academic", True
+    if root in _WIKI_HOSTS:
+        return "wiki", False
+    if root in _SOCIAL_HOSTS:
+        return "social", False
+    if root in _NEWS_HOSTS:
+        return "news", False
+    if root in _AGG_HOSTS:
+        return "aggregator", False
+    # org/io are project/FOSS convention — official-ish; com/net is
+    # too aggressive to call official without query context.
+    if tld in ("org", "io"):
+        return "official", True
+    return "other", False
 
 
 def _days_from_civil(y: int, m: int, d: int) -> int:

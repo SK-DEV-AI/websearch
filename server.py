@@ -86,7 +86,6 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "upload_urls": {"type": "array", "items": {"type": "string"}, "description": "GAI file upload: supported formats .avif .bmp .heic .heif .jpeg .pdf .png .webp. 10MB max. Only one file per call (GAI drops all but the last). Local: file:///path or remote URL."},
                 "start_date": {"type": "string", "description": "Tavily date filter start (YYYY-MM-DD)"},
                 "end_date": {"type": "string", "description": "Tavily date filter end (YYYY-MM-DD)"},
-                "engines": {"type": "array", "items": {"type": "string"}, "description": "Restrict fan-out to these engines (duckduckgo, google-news-rss, tavily, reddit, wikipedia, arxiv, anysearch, tinyfish, brave). Omit for all."},
                 "include_domains": {"type": "array", "items": {"type": "string"}, "description": "Tavily domain include filter"},
                 "exclude_domains": {"type": "array", "items": {"type": "string"}, "description": "Tavily domain exclude filter"},
                 "synthesize": {"type": "boolean", "default": True, "description": "Groq-synthesize top results into a concise answer with citations"},
@@ -95,9 +94,6 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "anysearch_zone": {"type": "string", "enum": ["", "cn", "intl"], "description": "AnySearch geo zone (cn or intl)"},
                 "anysearch_language": {"type": "string", "description": "AnySearch content language (e.g. en, zh-CN)"},
                 "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"},
-                "query_rewrite": {"type": "boolean", "default": True, "description": "Rewrite context-dependent/pronoun queries into self-contained form before fan-out"},
-                "need_classifier": {"type": "boolean", "default": True, "description": "Label search intent (academic/discussion/general) to bias vertical lanes"},
-                "grounding_check": {"type": "boolean", "default": True, "description": "After synthesis, flag answer sentences unsupported by cited sources"},
                 "history": {"type": "string", "description": "Conversation context for query rewriting (resolves pronouns like 'the second one')"}},
                 "required": ["query"]}),
          Tool(name="fetch",
@@ -338,15 +334,14 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 upload_urls=arguments.get("upload_urls"),
                 start_date=str(arguments.get("start_date","")),
                 end_date=str(arguments.get("end_date","")),
-                engines=arguments.get("engines"),
+                include_domains=arguments.get("include_domains"),
+                exclude_domains=arguments.get("exclude_domains"),
                 domain=str(arguments.get("domain","")),
                 anysearch_tag=str(arguments.get("anysearch_tag","")),
                 anysearch_zone=str(arguments.get("anysearch_zone","")),
                 anysearch_language=str(arguments.get("anysearch_language","")),
                 cdp_url=HELIUM_CDP,
                 depth=depth,
-                query_rewrite=bool(arguments.get("query_rewrite", True)),
-                need_classifier=bool(arguments.get("need_classifier", True)),
                 history=str(arguments.get("history", "")))
             if r.get("success") and depth >= 2 and r.get("results"):
                 try:
@@ -387,7 +382,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                             answer += "\n\n---\n\n## Sources\n\n" + "\n".join(
                                 f"[{s['n']}] {s['title']} — {s['url']}" for s in sources)
                             r["synthesis"] = {"answer": answer, "sources": sources}
-                            if bool(arguments.get("grounding_check", True)) and len(answer) > 120:
+                            if len(answer) > 120:
                                 try:
                                     r["synthesis"]["grounded"] = await verify_grounding(
                                         answer, sources, groq_key)

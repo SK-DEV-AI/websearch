@@ -18,10 +18,8 @@ async def search_tavily(query: str, n: int = 10, topic: str = "general",
                         include_images: bool = True, auto_parameters: bool = True,
                         include_domains: list | None = None,
                         exclude_domains: list | None = None,
-                        country: str = "",
                         chunks_per_source: int = 0,
-                        start_date: str = "", end_date: str = "",
-                        exact_phrase: bool = False) -> list[dict]:
+                        start_date: str = "", end_date: str = "") -> list[dict]:
     """Tavily search — AI-optimized with 1K free reqs/month per key. Returns answer + results."""
     key = _next_tavily_key()
     if not key:
@@ -38,15 +36,10 @@ async def search_tavily(query: str, n: int = 10, topic: str = "general",
         body["end_date"] = end_date
     if time_range and not start_date and not end_date:
         body["time_range"] = time_range
-    if exact_phrase:
-        body["include_answer"] = True
-        body["query"] = f'"{query}"'
     if include_domains:
         body["include_domains"] = include_domains
     if exclude_domains:
         body["exclude_domains"] = exclude_domains
-    if country:
-        body["country"] = country
     if chunks_per_source > 0:
         body["chunks_per_source"] = chunks_per_source
     try:
