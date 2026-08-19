@@ -889,6 +889,14 @@ async def _cdp_fetch_page(
             "error": str(last_err) if last_err else "CDP fetch failed"}
 
 
+def _ghost_host(url: str) -> str:
+    """Hostname for ghost-state fingerprint keying (like ghost.host_of)."""
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
 async def scrapling_stealthy_fetch(
     url: str, css_selector: str | None = None, extraction_type: str = "markdown",
     headless: bool = True, cdp_url: str | None = None, block_webrtc: bool = False,
@@ -933,6 +941,16 @@ async def scrapling_stealthy_fetch(
 
     # ── Scrapling AsyncStealthySession (last resort fallback) ──────
     try:
+        # Camoufox coherence model: no explicit knobs + non-CDP path → fill
+        # locale/timezone/UA from one per-host fingerprint bundle so the
+        # stealth knobs never contradict each other.
+        if not cdp_url and not (locale or timezone_id or useragent):
+            from fingerprint import bundle_fills
+            fills = bundle_fills(ghost.fp_seed(_ghost_host(url)),
+                                 locale, timezone_id, useragent)
+            locale, timezone_id, useragent = (fills["locale"],
+                                              fills["timezone_id"],
+                                              fills["useragent"])
         sk: dict[str, Any] = {
             "headless": headless, "timeout": timeout, "block_ads": block_ads,
             "dns_over_https": dns_over_https, "solve_cloudflare": solve_cloudflare,

@@ -199,6 +199,7 @@ class GhostState:
         if p is None:
             p = self._profiles[host] = {
                 "needs_tier2": False,
+                "fp_seed": host,  # one coherent fingerprint bundle per host
                 "last_solved": 0.0,
                 "last_cold_check": 0.0,
                 "observed_lifetime": COOKIE_DEFAULT_TTL,
@@ -216,6 +217,10 @@ class GhostState:
                 },
             }
         return p
+
+    def fp_seed(self, host: str) -> str:
+        """Stable fingerprint seed for *host* (Camoufox coherence model)."""
+        return str(self._profile(host).get("fp_seed", host))
 
     def _vault_fresh_at(self, profile: dict) -> float:
         """Earliest expiry across vault cookies, trusting the learned
