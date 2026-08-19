@@ -12,6 +12,7 @@ from config import cached
 from search_ddg import search_ddg, search_google_rss
 from search_brave import search_brave
 from search_marginalia import search_marginalia
+from search_cc_hf import search_commoncrawl, search_huggingface
 from search_tavily import search_tavily
 from search_anysearch import search_anysearch
 from search_tinyfish import tinyfish_search
@@ -48,7 +49,8 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'+-]{2,}")
 
 # Engines expected in a non-GAI-only search (for engine_blocked reporting)
 _ALL_ENGINES = {"google-news-rss", "tavily", "reddit", "wikipedia", "arxiv",
-                "anysearch", "tinyfish", "duckduckgo", "brave", "marginalia"}
+                "anysearch", "tinyfish", "duckduckgo", "brave", "marginalia",
+                "commoncrawl", "huggingface"}
 
 
 def _query_tokens(query: str) -> set[str]:
@@ -428,7 +430,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                            "tavily": "tavily", "reddit": "reddit",
                            "wikipedia": "wiki", "arxiv": "arxiv",
                            "anysearch": "anysearch", "tinyfish": "tinyfish",
-                           "brave": "brave", "marginalia": "marginalia"}
+                           "brave": "brave", "marginalia": "marginalia",
+                           "commoncrawl": "commoncrawl", "huggingface": "huggingface"}
             allowed = {_ENGINE_KEY.get(e, e) for e in engines}
             tasks = {k: v for k, v in tasks.items()
                      if (k.startswith("ddg_") and "ddg" in allowed) or k in allowed}
@@ -438,6 +441,14 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         if engines and "marginalia" in allowed:
             tasks["marginalia"] = asyncio.create_task(_multi_search(
                 search_marginalia, multi_variants[:1], count=min(count, 10)))
+        # commoncrawl/huggingface: niche archival + ML-vertical intents, opt-in
+        # only (steal engines #6)
+        if engines and "commoncrawl" in allowed:
+            tasks["commoncrawl"] = asyncio.create_task(_multi_search(
+                search_commoncrawl, multi_variants[:1], count=min(count, 20)))
+        if engines and "huggingface" in allowed:
+            tasks["huggingface"] = asyncio.create_task(_multi_search(
+                search_huggingface, multi_variants[:1], count=min(count, 20)))
         done = await asyncio.gather(*tasks.values(), return_exceptions=True)
         done_map = dict(zip(tasks.keys(), done))
         # D2 need-bias: academic need overrides the detected intent so the
@@ -453,7 +464,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 done_map[f"vert_{_v}"] = await vertical_run(_v, effective_query)
             except BaseException:
                 done_map[f"vert_{_v}"] = []
-        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "brave", "marginalia")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
+        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "brave", "marginalia", "commoncrawl", "huggingface")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
             if key not in done_map:
                 continue
             val = done_map[key]
@@ -485,7 +496,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                         entry = dict(r)
                         entry["rank"] = len(per_engine.get(new_eng, []))
                         per_engine.setdefault(new_eng, []).append(entry)
-        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish", "brave": "brave", "marginalia": "marginalia"}
+        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish", "brave": "brave", "marginalia": "marginalia", "commoncrawl": "commoncrawl", "huggingface": "huggingface"}
         for key, name in eng.items():
             val = done_map.get(key)
             if isinstance(val, dict):
