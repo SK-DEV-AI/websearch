@@ -326,6 +326,12 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             ai_answer = rd.get("answer", "")
             follow_up = rd.get("followUp", "")
             for s in rd.get("sources", []):
+                _h = (urllib.parse.urlsplit(s["url"]).hostname or "").lower()
+                if _h and ((include_domains and not any(
+                        d.lower() in _h for d in include_domains)) or
+                        (exclude_domains and any(
+                            d.lower() in _h for d in exclude_domains))):
+                    continue
                 per_engine.setdefault("google-ai-mode", []).append({
                     "title": s["title"], "url": s["url"],
                     "snippet": s.get("snippet", ""),
@@ -484,6 +490,15 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 engine_totals[eng_name] = ta
             for r in results_list:
                 if isinstance(r, dict) and "error" not in r and r.get("url"):
+                    # Post-merge domain scoping (landscape 🥉): tavily filters
+                    # natively, but DDG/brave/rss/reddit/verticals don't —
+                    # apply include/exclude uniformly here.
+                    _h = (urllib.parse.urlsplit(r["url"]).hostname or "").lower()
+                    if _h and ((include_domains and not any(
+                            d.lower() in _h for d in include_domains)) or
+                            (exclude_domains and any(
+                                d.lower() in _h for d in exclude_domains))):
+                        continue
                     if key != "reddit" or r.get("engine") in ("reddit", "reddit-comment", "reddit-ai-summary"):
                         new_eng = "duckduckgo" if key.startswith("ddg") else (
                             "google-news-rss" if key == "rss" else key)
@@ -531,6 +546,12 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 follow_up = rd.get("followUp", "")
                 _seen_urls |= {norm_key(h["url"]) for hits in per_engine.values() for h in hits}
                 for s in rd.get("sources", []):
+                    _h = (urllib.parse.urlsplit(s["url"]).hostname or "").lower()
+                    if _h and ((include_domains and not any(
+                            d.lower() in _h for d in include_domains)) or
+                            (exclude_domains and any(
+                                d.lower() in _h for d in exclude_domains))):
+                        continue
                     if norm_key(s["url"]) not in _seen_urls:
                         _seen_urls.add(norm_key(s["url"]))
                         per_engine.setdefault("google-ai-mode", []).append({
