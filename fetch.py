@@ -666,6 +666,33 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             except Exception:
                 pass
 
+        # extruct secondary pass: microdata/RDFa (trafilatura has neither) +
+        # broader JSON-LD/OpenGraph surface, merged under "structured".
+        if config.EXTRACT_METADATA_ENABLED and full_content:
+            try:
+                from extruct.w3cmicrodata import MicrodataExtractor
+                from extruct.rdfa import RDFaExtractor
+                from extruct.jsonld import JsonLdExtractor
+                from extruct.opengraph import OpenGraphExtractor
+                _mde, _rde, _jle, _oge = (MicrodataExtractor(), RDFaExtractor(),
+                                          JsonLdExtractor(), OpenGraphExtractor())
+                structured = {
+                    "microdata": _mde.extract(raw_html, base_url=url) or [],
+                    "rdfa": _rde.extract(raw_html, base_url=url) or [],
+                    "jsonld": _jle.extract(raw_html, base_url=url) or [],
+                    "opengraph": _oge.extract(raw_html, base_url=url) or [],
+                }
+                structured = {k: v for k, v in structured.items() if v}
+                if structured:
+                    meta["structured"] = structured
+                    og = structured.get("opengraph") or []
+                    if og and not meta.get("title"):
+                        og_props = dict((og[0].get("properties") or []))
+                        if og_props.get("og:title"):
+                            meta["title"] = og_props["og:title"]
+            except Exception as e:
+                logger.warning(f"fetch: extruct pass failed: {e}")
+
         if focus:
             full_content = focus_mod.filter_by_relevance(full_content, focus)
         full_content = _strip_trackers_md(full_content)
