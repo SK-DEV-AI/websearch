@@ -11,9 +11,12 @@ import re
 from urllib.parse import quote
 
 from config import get_http_client
+from search_academic import search_academic
 
 FETCH_TIMEOUT = 12.0
 MAX_PER_VERTICAL = 5
+
+_ACADEMIC = {"openalex", "crossref", "pubmed", "europepmc"}
 
 _RSS_ITEM = re.compile(r"<item>(.*?)</item>", re.S)
 _ATOM_ENTRY = re.compile(r"<entry>(.*?)</entry>", re.S)
@@ -66,6 +69,8 @@ def endpoint(vertical: str, query: str) -> str | None:
 
 async def run(vertical: str, query: str) -> list[dict]:
     """Fetch one vertical, return hits in the standard {title,url,snippet} shape."""
+    if vertical in _ACADEMIC:
+        return await search_academic(query, MAX_PER_VERTICAL, source=vertical)
     url = endpoint(vertical, query)
     if not url:
         return []

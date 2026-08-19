@@ -127,7 +127,16 @@ async def _get_optimized_page(block_resources: bool = True) -> CDPPage:
             raise ConnectionError("Cannot connect to Helium CDP")
         page = await session.create_page()
         try:
-            await page.add_init_script(ANTI_DETECT_JS)
+            from config import STEALTH_HEADERS_ENABLED, STEALTH_INJECT_ENABLED
+            if STEALTH_INJECT_ENABLED:
+                from stealth_cdp import build_stealth_init_script
+                await page.add_init_script(build_stealth_init_script())
+                if STEALTH_HEADERS_ENABLED:
+                    from stealth_cdp import stealth_headers
+                    await page._session.send("Network.setExtraHTTPHeaders",
+                        {"headers": stealth_headers()}, session_id=page._session_id)
+            else:
+                await page.add_init_script(ANTI_DETECT_JS)
             # Protective defaults — save RAM, prevent leaks, avoid hangs
             await page.disable_images()
             await page.ignore_certificate_errors(True)

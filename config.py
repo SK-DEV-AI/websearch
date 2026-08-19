@@ -66,6 +66,16 @@ TINYFISH_KEYS = [k.strip() for k in os.environ.get("TINYFISH_KEYS", "").split(",
 GROQ_API_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEYS", "").split(",") if k.strip()]
 RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "Alibaba-NLP/gte-reranker-modernbert-base")
 
+# ── steal-theme config (C2/E2/B1/A2/ghost-tier/C3) ─────────────
+QUALITY_FLOOR = float(os.environ.get("QUALITY_FLOOR", "0.35"))
+SIX_SIGNAL_ENABLED = os.environ.get("SIX_SIGNAL_ENABLED", "true") == "true"
+STEALTH_INJECT_ENABLED = os.environ.get("STEALTH_INJECT_ENABLED", "false") == "true"
+STEALTH_HEADERS_ENABLED = os.environ.get("STEALTH_HEADERS_ENABLED", "false") == "true"
+TIER_SKIP_THRESHOLD = float(os.environ.get("TIER_SKIP_THRESHOLD", "0.30"))
+TIER_MIN_TRIES = int(os.environ.get("TIER_MIN_TRIES", "10"))
+MINERU_DEVICE = os.environ.get("MINERU_DEVICE", "cpu")
+MINERU_ENABLED = os.environ.get("MINERU_ENABLED", "false") == "true"
+
 
 _cache: dict[str, tuple[float, Any]] = {}
 _MAX_CACHE = 500

@@ -19,16 +19,33 @@ import jsdata
 import feed_extract
 import hn_extract
 import mathml
+import md_convert
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
 from cookies import CookieJar
 from revalidate import RevalidationCache
 from security import SecurityError, safe_fetch, validate_url as _validate_url
 import cache as cache_mod
 import focus as focus_mod
+from config import QUALITY_FLOOR
 
 logger = logging.getLogger("fetch")
 
 AsyncFetcher.configure(huge_tree=True)
+
+
+async def _revalidate_redirect(requested: str, resp) -> str | None:
+    """E3a: the SSRF validator guards the requested URL, but the
+    fetcher follows redirects internally — re-validate the final hop
+    so a redirect into an internal/private range is refused.
+    Returns an error message, or None when the final URL is fine."""
+    final = getattr(resp, "url", None)
+    if not final or final == requested:
+        return None
+    try:
+        await _validate_url(final)
+    except SecurityError as e:
+        return f"Redirect to blocked URL ({final}): {e}"
+    return None
 
 # donsetch ports: per-host cookie jar + conditional revalidation cache
 _jar = CookieJar()
@@ -222,19 +239,19 @@ async def _try_wayback(original_url: str) -> dict | None:
         if not content or len(content.strip()) < 50:
             return None
         # Run through trafilatura like the normal path — model gets clean text, not raw HTML
-        extracted = trafilatura.extract(content, output_format="markdown", with_metadata=True,
-                                         include_links=False, include_tables=False,
-                                         url=original_url)
+        # steal C1: trafilatura extracts, html-to-markdown serializes
+        html_ext = trafilatura.extract(content, output_format="html", with_metadata=False,
+                                        include_links=False, include_tables=False,
+                                        url=original_url)
         title = ""
-        final_content = extracted or trafilatura.extract(content, output_format="txt",
-                                                          with_metadata=False, url=original_url) or ""
-        if isinstance(extracted, str) and extracted.startswith("{"):
-            try:
-                d = json.loads(extracted)
-                final_content = d.get("text", "")
-                title = d.get("title", "")
-            except Exception:
-                pass
+        final_content = md_convert.to_markdown(
+            html_ext, include_links=False, include_tables=False) if html_ext else ""
+        if not final_content:
+            final_content = trafilatura.extract(content, output_format="txt",
+                                                  with_metadata=False, url=original_url) or ""
+        m = re.search(r"<title[^>]*>(.*?)</title>", content, re.S | re.I)
+        if m and not title:
+            title = m.group(1).strip()[:200]
         final_content = final_content.strip()
         # Format a human-readable date from the timestamp
         date_str = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else ts
@@ -263,7 +280,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     prune_xpath: str = "", url_blacklist: str = "",
                     author_blacklist: str = "", min_output_size: int = 0,
                     raw: bool = False, offset: int = 0, focus: str = "",
-                    cache_ttl: int = 3600, cookies: dict | None = None) -> dict:
+                    cache_ttl: int = 3600, cookies: dict | None = None,
+                    quality_floor: float = 0.0, mineru: bool = False) -> dict:
     """Fetch a URL with cache, focus filtering, and pagination via httpx + trafilatura.
 
     Cache keyed by URL+extraction_type (focus and offset are NOT part of the key).
@@ -300,6 +318,9 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
             try:
                 resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True)
+                redir_err = await _revalidate_redirect(url, resp)
+                if redir_err:
+                    return {"success": False, "url": url, "error": redir_err}
                 if _bomb_capped(resp.body):
                     return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
                 content = resp.body if isinstance(resp.body, str) else resp.body.decode("utf-8", errors="replace")
@@ -374,6 +395,9 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True,
                                               cookies=merged or None,
                                               headers=cond or None)
+                redir_err = await _revalidate_redirect(url, resp)
+                if redir_err:
+                    return {"success": False, "url": url, "error": redir_err}
             except Exception as e:
                 wayback = await _try_wayback(url)
                 if wayback:
@@ -466,20 +490,51 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 traf_input = mathml.transform(raw_html)
             except Exception:
                 traf_input = raw_html
-            result = trafilatura.extract(traf_input, **kw)
-            title = None
-            if isinstance(result, str) and result.startswith('{'):
-                try:
-                    d = json.loads(result)
-                except (json.JSONDecodeError, ValueError):
-                    d = None
-                if d:
-                    full_content = d.get('text', '')
-                    title = d.get('title')
-                else:
-                    full_content = result
+            if output_format == 'markdown':
+                # steal C1: trafilatura extracts, html-to-markdown serializes.
+                # with_metadata must be off for html output (trafilatura 2.1.0
+                # crashes on list-valued metadata); title comes from the
+                # meta pass below.
+                full_content = md_convert.extract_and_convert(
+                    traf_input, url=url, fast=fast,
+                    include_links=include_links, include_images=include_images,
+                    include_tables=include_tables, deduplicate=deduplicate,
+                    target_language=target_language,
+                    favor_precision=favor_precision,
+                    favor_recall=favor_recall,
+                    prune_xpath=kw.get('prune_xpath'),
+                    url_blacklist=kw.get('url_blacklist'),
+                    author_blacklist=kw.get('author_blacklist'))
+                title = None
+                if not full_content:
+                    result = trafilatura.extract(traf_input, **kw)
+                    if isinstance(result, str) and result.startswith('{'):
+                        try:
+                            d = json.loads(result)
+                        except (json.JSONDecodeError, ValueError):
+                            d = None
+                        if d:
+                            full_content = d.get('text', '')
+                            title = d.get('title')
+                        else:
+                            full_content = result
+                    else:
+                        full_content = result or ''
             else:
-                full_content = result or ''
+                result = trafilatura.extract(traf_input, **kw)
+                title = None
+                if isinstance(result, str) and result.startswith('{'):
+                    try:
+                        d = json.loads(result)
+                    except (json.JSONDecodeError, ValueError):
+                        d = None
+                    if d:
+                        full_content = d.get('text', '')
+                        title = d.get('title')
+                    else:
+                        full_content = result
+                else:
+                    full_content = result or ''
             if not full_content:
                 full_content = trafilatura.extract(traf_input, output_format='txt',
                                                     with_metadata=False, url=url) or ''
@@ -548,9 +603,12 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                        include_links=False, include_tables=False,
                                        url=url) if full_content else None
         meta = {}
+        meta_title = ""
         if isinstance(meta_str, str) and meta_str.startswith('{'):
             try:
-                meta = json.loads(meta_str).get("metadata", {})
+                d = json.loads(meta_str)
+                meta = d.get("metadata", {}) or {}
+                meta_title = d.get("title", "") or ""
             except Exception:
                 pass
 
@@ -571,10 +629,35 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     f"fetch: cache write failed for {url}: {t.exception()}"))
 
         result = _build_paginated_response(url, full_content, status_used,
-                                          title or meta.get("title", ""),
+                                          title or meta_title or meta.get("title", ""),
                                           {k: v for k, v in meta.items() if v}, "",
                                           offset, max_chars, method="httpx")
         result["raw_size"] = raw_len
+        q = _extraction_quality(full_content, title=title or meta_title or "",
+                                url=url, raw_html=(raw_html or "").encode("utf-8", errors="replace") if isinstance(raw_html, str) else (raw_html or b""))
+        result["quality"] = q
+        result["low_quality"] = q < QUALITY_FLOOR
+        # ── C3: MinerU-HTML rescue (opt-in) ────────────────────────
+        # The SLM main-content extractor is heavy (model ~1.2 GB
+        # resident, seconds per page on CPU) — only for callers who
+        # ask for it AND score below the requested floor. Minerva
+        # never overrides a decent extraction.
+        if mineru and MINERU_ENABLED and q < (quality_floor or QUALITY_FLOOR):
+            try:
+                from mineru_extract import extract_with_mineru
+                mr = await extract_with_mineru(raw_html, output_format=output_format)
+                if mr.get("success") and len(mr["content"]) > len(full_content):
+                    full_content = mr["content"].strip()
+                    result = _build_paginated_response(
+                        url, full_content, status_used,
+                        title or meta_title or meta.get("title", ""),
+                        {k: v for k, v in meta.items() if v}, "",
+                        offset, max_chars, method="mineru_html")
+                    result["raw_size"] = raw_len
+                    result["quality"] = _extraction_quality(full_content, title=title or "", url=url)
+                    result["low_quality"] = result["quality"] < QUALITY_FLOOR
+            except Exception as e:
+                logger.warning("mineru rescue failed for %s: %s", url, e)
         return result
     except Exception as e:
         return {"success": False, "url": url, "error": str(e)}
@@ -600,12 +683,44 @@ async def _cdp_extract_content(page, css_selector: str | None, extraction_type: 
         return await page.document_html()
     if extraction_type == "markdown":
         html_c = await page.document_html()
-        content = trafilatura.extract(html_c, output_format='markdown', fast=True,
-                                      include_links=include_links, include_images=include_images,
-                                      include_tables=include_tables, deduplicate=deduplicate,
-                                      url=page_url or None)
+        content = md_convert.extract_and_convert(
+            html_c, url=page_url or "", fast=True,
+            include_links=include_links, include_images=include_images,
+            include_tables=include_tables, deduplicate=deduplicate)
+        if content:
+            content = _strip_trackers_md(content)
+            content = _drop_citation_markers(content)
+            content = _token_polish(content)
         return content or await page.inner_text()
     return await page.inner_text()
+
+
+def _extraction_quality(content: str, *, title: str = "", url: str = "",
+                        raw_html: bytes = b"") -> float:
+    """Lightweight 0-1 extraction-quality score (rs-trafilatura
+    extraction_quality concept). Signals: log-scaled text length,
+    text/markup density, title presence, structural markup richness.
+    Zero new deps — everything is already computed by the callers."""
+    if not content or not content.strip():
+        return 0.0
+    n = len(content.strip())
+    if n < 200:
+        return 0.05
+    len_sig = min(n / 2000.0, 1.0)
+    if raw_html:
+        raw_len = max(len(raw_html), 1)
+        text_bytes = len(content.encode("utf-8", errors="replace"))
+        density = min(text_bytes / raw_len * 8.0, 1.0)
+    else:
+        density = 0.5
+    title_sig = 1.0 if title and len(title.strip()) >= 4 else 0.0
+    struct = 0.0
+    if "```" in content:
+        struct += 0.15
+    if "| " in content and "\n|-" in content.replace("\n\n", "\n"):
+        struct += 0.15
+    score = 0.45 * len_sig + 0.25 * density + 0.15 * title_sig + struct
+    return round(min(max(score, 0.0), 1.0), 3)
 
 
 async def _cdp_fetch_page(
@@ -699,9 +814,11 @@ async def _cdp_fetch_page(
             except Exception:
                 pass
 
+            q = _extraction_quality(content or "", title=title or "", url=url)
             return {"success": True, "url": url,
                     "title": title or "", "content": (content or ""),
-                    "cookies": cookies, "verdict": verdict}
+                    "cookies": cookies, "verdict": verdict,
+                    "quality": q, "low_quality": q < QUALITY_FLOOR}
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
@@ -810,7 +927,10 @@ async def scrapling_stealthy_fetch(
                 elif extraction_type == "markdown":
                     content = p.get_all_text()
                     html_c = p.body if isinstance(p.body, str) else p.body.decode("utf-8", errors="replace")
-                    content = trafilatura.extract(html_c, output_format='markdown', fast=True, url=url) or content
+                    content = md_convert.extract_and_convert(html_c, url=url, fast=True) or content
+                    content = _strip_trackers_md(content)
+                    content = _drop_citation_markers(content)
+                    content = _token_polish(content)
                 else:
                     content = p.get_all_text()
             if isinstance(content, bytes):

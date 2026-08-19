@@ -42,6 +42,7 @@ async def crawl_url(
     bypass_cache: bool = False,
     exclude_all_images: bool = False,
     exclude_external_images: bool = False,
+    min_content_chars: int = 0,
 ) -> dict:
     browser_kw: dict[str, Any] = {
         "headless": True, "verbose": False, "ignore_https_errors": True,
@@ -141,6 +142,11 @@ async def crawl_url(
         run_kw["log_console"] = True
     if bypass_cache:
         run_kw["cache_mode"] = CacheMode.BYPASS
+    if min_content_chars > 0:
+        # E4c: adaptive crawl — prune thin pages (nav shells, redirect
+        # stubs, empty JS renders) from the result set; the crawl itself
+        # is unchanged, only what counts as a deliverable narrows.
+        pass
     if exclude_all_images:
         run_kw["exclude_all_images"] = True
     if exclude_external_images:
@@ -159,8 +165,12 @@ async def crawl_url(
         if isinstance(results, list):
             pages = []
             combined = []
+            pruned = 0
             for r in results:
                 md = r.markdown or ""
+                if min_content_chars > 0 and len(md) < min_content_chars:
+                    pruned += 1
+                    continue
                 combined.append(md)
                 links = (r.links or {}) if extract_links else {}
                 pe: dict[str, Any] = {"url": r.url, "markdown_len": len(md),
@@ -189,14 +199,22 @@ async def crawl_url(
                     pages = deduped_pages
                     combined = [combined[i] for i in deduped_indices]
             return {"success": True, "url": url, "pages_crawled": len(pages),
+                    "pages_pruned_thin": pruned,
+                    "min_content_chars": min_content_chars,
                     "pages": pages,
                     "combined_markdown_len": sum(p["markdown_len"] for p in pages),
                     "combined_markdown": "\n\n---\n\n".join(combined)}
         md = results.markdown or ""
+        pruned = 0
+        if min_content_chars > 0 and len(md) < min_content_chars:
+            pruned = 1
+            md = ""
         links = getattr(results, 'links', None) or {}
         out: dict[str, Any] = {
             "success": True, "url": url, "status_code": results.status_code,
             "markdown": md,
+            "pages_pruned_thin": pruned,
+            "min_content_chars": min_content_chars,
             "links": {"internal": len(links.get("internal", [])),
                       "external": len(links.get("external", []))},
             "error": results.error_message or "",

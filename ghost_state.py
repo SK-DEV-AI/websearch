@@ -11,6 +11,7 @@ State persists as JSON at ~/.cache/websearch/ghost_state.json
 session-root/work/donsetch/IMPLEMENTATION-PLAN.md items #3/#4/#5.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -20,6 +21,22 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 logger = logging.getLogger("ghost_state")
+
+from config import TIER_MIN_TRIES, TIER_SKIP_THRESHOLD
+from tier_stats import record_tier_result
+
+
+def _fire_and_forget(fn, *args, **kw):
+    """Best-effort async mirror write; never blocks the sync path."""
+    try:
+        asyncio.get_running_loop().create_task(fn(*args, **kw))
+    except RuntimeError:
+        try:
+            asyncio.run(fn(*args, **kw))
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 STATE_DIR = Path.home() / ".cache" / "websearch"
 STATE_FILE = STATE_DIR / "ghost_state.json"
@@ -192,6 +209,11 @@ class GhostState:
                 "fail_count": 0,
                 "verdicts": {},
                 "cookies": [],
+                "tier_stats": {
+                    "t1": {"attempts": 0, "ok": 0, "fail": 0},
+                    "t2": {"attempts": 0, "ok": 0, "fail": 0},
+                    "scrape": {"attempts": 0, "ok": 0, "fail": 0},
+                },
             }
         return p
 
@@ -226,19 +248,25 @@ class GhostState:
         return "recheck_cold"
 
     # ── observation (cache.rs:418-554) ─────────────────────────
-    def record_fetch(self, host: str, verdict: str) -> None:
+    def record_fetch(self, host: str, verdict: str, tier: str = "t1") -> None:
         """Move counters only. Non-challenge verdicts never set
         needs_tier2 (cache.rs:418-424); a content_ok means the wall
         went away."""
         p = self._profile(host)
         p["verdicts"][verdict] = p["verdicts"].get(verdict, 0) + 1
+        ts = p.setdefault("tier_stats", {}).setdefault(tier, {"attempts": 0, "ok": 0, "fail": 0})
+        ts["attempts"] += 1
         if verdict == CONTENT_OK:
             p["ok_count"] += 1
             p["needs_tier2"] = False
             p["replay_ok"] = False
             p["warm_fails"] = 0
+            ts["ok"] += 1
+            _fire_and_forget(record_tier_result, host, tier, True)
         else:
             p["fail_count"] += 1
+            ts["fail"] += 1
+            _fire_and_forget(record_tier_result, host, tier, False)
             if verdict == CHALLENGE:
                 p["needs_tier2"] = True
             # stamp last_cold_check so a wall we could not beat routes
@@ -248,7 +276,7 @@ class GhostState:
         self.save()
 
     def record_solved(self, host: str, cookies: list[dict],
-                      replay_ok: bool = False) -> None:
+                      replay_ok: bool = False, tier: str = "t2") -> None:
         """Browser solved the wall: store clearance cookies, mark the
         domain tier-2 and arm the replay gate."""
         p = self._profile(host)
@@ -260,10 +288,27 @@ class GhostState:
         p["replay_ok"] = replay_ok
         p["warm_fails"] = 0
         p["cookies"] = _filter_cookies(cookies)
+        ts = p.setdefault("tier_stats", {}).setdefault(tier, {"attempts": 0, "ok": 0, "fail": 0})
+        ts["attempts"] += 1
+        ts["ok"] += 1
+        _fire_and_forget(record_tier_result, host, tier, True)
         if not p["cookies"]:
             # no usable clearance → lifetime learning is moot
             p["replay_ok"] = False
         self.save()
+
+    def tier_allowed(self, host: str, tier: str) -> bool:
+        """Auto-skip a tier whose success rate is below the threshold
+        after enough attempts (ghost-tier-learning). Defaults to allowed
+        for unknown/host-less tiers."""
+        if not host:
+            return True
+        p = self._profile(host)
+        ts = p.get("tier_stats", {}).get(tier, {"attempts": 0, "ok": 0, "fail": 0})
+        if ts["attempts"] < TIER_MIN_TRIES:
+            return True
+        rate = ts["ok"] / max(ts["attempts"], 1)
+        return rate >= TIER_SKIP_THRESHOLD
 
     def warm_ok(self, host: str) -> None:
         """A tier-1 fetch with vault cookies returned real content."""

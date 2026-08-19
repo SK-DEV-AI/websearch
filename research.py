@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 import time
 import urllib.parse
@@ -8,6 +10,7 @@ from collections import Counter
 
 from config import cached
 from search_ddg import search_ddg, search_google_rss
+from search_brave import search_brave
 from search_tavily import search_tavily
 from search_anysearch import search_anysearch
 from search_tinyfish import tinyfish_search
@@ -20,7 +23,8 @@ from reddit import search_reddit
 from query_expand import expand_query
 from reranker import rerank as _rerank, killswitch_active as _reranker_disabled
 from merge import (merge_base, blend, apply_coverage, apply_authority, finalize,
-                   detect_intent, is_weak, merged_total, norm_key, verticals_for)
+                   detect_intent, is_weak, merged_total, norm_key, verticals_for,
+                   apply_six_signal)
 from verticals import run as vertical_run
 
 
@@ -43,7 +47,7 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'+-]{2,}")
 
 # Engines expected in a non-GAI-only search (for engine_blocked reporting)
 _ALL_ENGINES = {"google-news-rss", "tavily", "reddit", "wikipedia", "arxiv",
-                "anysearch", "tinyfish", "duckduckgo"}
+                "anysearch", "tinyfish", "duckduckgo", "brave"}
 
 
 def _query_tokens(query: str) -> set[str]:
@@ -152,6 +156,102 @@ def _detect_tinyfish_type(query: str) -> str:
     return "web"
 
 
+async def _groq_text(sys_prompt: str, user_prompt: str,
+                     temperature: float = 0.2, max_tokens: int = 300) -> str | None:
+    """One Groq call returning trimmed text; None on any failure (caller falls back)."""
+    from query_expand import _next_key
+    key = await _next_key()
+    if not key:
+        return None
+    try:
+        from config import get_http_client
+        c = get_http_client()
+        r = await c.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"model": "openai/gpt-oss-120b",
+                  "messages": [{"role": "system", "content": sys_prompt},
+                               {"role": "user", "content": user_prompt}],
+                  "temperature": temperature, "max_tokens": max_tokens},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logging.getLogger("research").warning(f"_groq_text failed: {type(e).__name__}: {e}")
+    return None
+
+
+async def decompose_query(query: str, num_queries: int = 4,
+                          date: str | None = None) -> list[dict]:
+    """Return [{query, researchGoal}, ...] for parallel fan-out.
+
+    Falls back to [{"query": query, "researchGoal": ""}] on any LLM/parse error.
+    """
+    today = date or time.strftime("%Y-%m-%d")
+    sys_p = (
+        "You are an expert research assistant decomposing a question into distinct web search queries.\n"
+        "Rules (strict):\n"
+        "- Do NOT use search operators: no site:, filetype:, inurl:, intitle:, OR, AND, NOT, and no quote-wrapped phrases.\n"
+        "- Write each query as a human would type it into a search engine.\n"
+        f"- Assume the current date is {today} if the task is time-sensitive.\n"
+        f"- Generate {num_queries} unique, non-overlapping queries covering different angles (background, current status, critiques, data/examples, outlook).\n"
+        "Return ONLY a JSON array of objects: [{\"query\": \"...\", \"researchGoal\": \"...\"}].\n"
+        "researchGoal = what this query should establish and how it advances the overall answer. No prose, no markdown fences."
+    )
+    text = await _groq_text(sys_p, f"Task: {query}", temperature=0.3, max_tokens=512)
+    if not text:
+        return [{"query": query, "researchGoal": ""}]
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            out = [d for d in parsed if isinstance(d, dict) and d.get("query")][:num_queries]
+            if out:
+                return out
+    except Exception:
+        pass
+    return [{"query": query, "researchGoal": ""}]
+
+
+async def rewrite_query(query: str, history: str = "") -> str:
+    """Return a self-contained, context-independent rephrase of query.
+    Falls back to the original query on any error."""
+    sys_p = (
+        "Rephrase the user's query into a single self-contained, context-independent search query.\n"
+        "Expand pronouns and references (\"it\", \"the second one\", \"they\") using any supplied context.\n"
+        "Output ONLY the rewritten query string, no labels, no quotes, no explanation."
+    )
+    text = await _groq_text(sys_p, f"Context: {history}\nQuery: {query}", temperature=0.2, max_tokens=200)
+    if text and len(text) <= 400 and not text.lower().startswith(("query:", "here")):
+        return text
+    return query
+
+
+async def classify_need(query: str) -> str:
+    """Return one of: 'academic' | 'discussion' | 'general'.
+    NEVER returns a skip-search signal. Falls back to 'general' on error."""
+    sys_p = (
+        "Classify the search intent of the query into exactly one label:\n"
+        '- "academic": scholarly/paper/research/technical-documentation intent\n'
+        '- "discussion": opinions, forums, social, community, comparisons-by-users intent\n'
+        '- "general": everything else\n'
+        "Output ONLY the label word. Web search is ALWAYS required; do not suggest skipping it."
+    )
+    text = await _groq_text(sys_p, f"Query: {query}", temperature=0.1, max_tokens=64)
+    if text and text.lower() in ("academic", "discussion", "general"):
+        return text.lower()
+    return "general"
+
+
+async def _noop_rewrite(query: str) -> str:
+    return query
+
+
+async def _noop_need() -> str:
+    return "general"
+
+
 @cached(ttl=90)
 async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                        google_ai_only: bool = False, search_type: str = "auto",
@@ -173,10 +273,27 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                        license_videos: str = "",
                        start_date: str = "", end_date: str = "",
                        exact_phrase: bool = False,
+                       engines: list[str] | None = None,
                        anysearch_tag: str = "", anysearch_zone: str = "",
                        anysearch_language: str = "",
-                        anysearch_params: dict | None = None) -> dict:
+                        anysearch_params: dict | None = None,
+                        depth: int = 1,
+                       query_rewrite: bool = True, need_classifier: bool = True,
+                       history: str = "") -> dict:
     _start = time.monotonic()
+    rewritten_query = ""
+    search_need = "general"
+    out_subqueries: list[dict] = []
+    if not google_ai_only and (query_rewrite or need_classifier):
+        # D2: one combined pass → standalone rewrite + search-need label.
+        # Never suppresses search — the label only biases engine boosts below.
+        rw, nd = await asyncio.gather(
+            rewrite_query(query, history) if query_rewrite else _noop_rewrite(query),
+            classify_need(query) if need_classifier else _noop_need(),
+        )
+        rewritten_query = rw
+        search_need = nd
+    effective_query = rewritten_query or query
     engines_used: list[str] = []
     per_engine: dict[str, list[dict]] = {}
     _seen_urls: set[str] = set()
@@ -189,7 +306,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         if not gai:
             return None
         try:
-            r = await asyncio.wait_for(gai.search(query, search_prompt=search_prompt,
+            r = await asyncio.wait_for(gai.search(effective_query, search_prompt=search_prompt,
                 gl=gl, hl=hl, tbs=tbs, pws=pws, upload_urls=upload_urls),
                 timeout=300)
             if r.get("success"):
@@ -215,10 +332,19 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 })
     else:
         gai_future = asyncio.create_task(_gai_search())
-        queries = [query]
+        queries = [effective_query]
         if query_expand:
-            expanded = await expand_query(query)
-            queries = expanded[:4]
+            if depth >= 2:
+                # D1: LLM subquery decomposition for wider coverage; falls back
+                # to the heuristic expansion when the LLM pass fails.
+                subq = await decompose_query(effective_query)
+                out_subqueries = subq
+                if len(subq) > 1:
+                    queries = [s["query"] for s in subq][:4]
+            else:
+                out_subqueries = []
+                expanded = await expand_query(effective_query)
+                queries = expanded[:4]
         ddg_count = max(count * 2 // len(queries), 5)
 
         async def _ddg_search(q, n, **kw):
@@ -292,18 +418,37 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 params=anysearch_params)),
             "tinyfish": asyncio.create_task(_multi_search(tinyfish_search, multi_variants,
                 count=min(count, 50), domain_type=_detect_tinyfish_type(query), goal=query)),
+            "brave": asyncio.create_task(_multi_search(search_brave, multi_variants[:1],
+                count=min(count, 10), timelimit=timelimit)),
             **ddg_tasks,
         }
+        if engines:
+            _ENGINE_KEY = {"google-news-rss": "rss", "duckduckgo": "ddg",
+                           "tavily": "tavily", "reddit": "reddit",
+                           "wikipedia": "wiki", "arxiv": "arxiv",
+                           "anysearch": "anysearch", "tinyfish": "tinyfish",
+                           "brave": "brave"}
+            allowed = {_ENGINE_KEY.get(e, e) for e in engines}
+            tasks = {k: v for k, v in tasks.items()
+                     if (k.startswith("ddg_") and "ddg" in allowed) or k in allowed}
         done = await asyncio.gather(*tasks.values(), return_exceptions=True)
         done_map = dict(zip(tasks.keys(), done))
-        _verticals = [v for v in verticals_for(detect_intent(query), query)
+        # D2 need-bias: academic need overrides the detected intent so the
+        # scholarly vertical lanes fire; discussion keeps the detected intent
+        # (reddit is always in the fan-out already).
+        _intent = detect_intent(effective_query)
+        if search_need == "academic" and _intent != "paper":
+            _intent = "paper"
+        _verticals = [v for v in verticals_for(_intent, effective_query)
                       if v not in ("wikipedia", "arxiv", "news")]
         for _v in _verticals:
             try:
-                done_map[f"vert_{_v}"] = await vertical_run(_v, query)
+                done_map[f"vert_{_v}"] = await vertical_run(_v, effective_query)
             except BaseException:
                 done_map[f"vert_{_v}"] = []
-        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
+        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "brave")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
+            if key not in done_map:
+                continue
             val = done_map[key]
             if isinstance(val, BaseException):
                 continue
@@ -333,7 +478,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                         entry = dict(r)
                         entry["rank"] = len(per_engine.get(new_eng, []))
                         per_engine.setdefault(new_eng, []).append(entry)
-        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish"}
+        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish", "brave": "brave"}
         for key, name in eng.items():
             val = done_map.get(key)
             if isinstance(val, dict):
@@ -355,6 +500,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             completed, _ = await asyncio.wait([gai_future], timeout=300)
         except BaseException:
             completed = set()
+        ai_answer = ""
         if gai_future in completed:
             try:
                 r = gai_future.result()
@@ -382,7 +528,9 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     engine_blocked = sorted(_ALL_ENGINES - set(engines_used))
 
     if per_engine:
-        intent = detect_intent(query)
+        intent = detect_intent(effective_query)
+        if search_need == "academic" and intent != "paper":
+            intent = "paper"
         merged = merge_base(per_engine, query, intent)
         if merged:
             # ponytail: cap the rerank pool at the top 120 by base score —
@@ -413,6 +561,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 blend(merged, [by_idx.get(i) for i in range(len(merged))])
             apply_coverage(query, merged)
             apply_authority(query, intent, merged)
+            apply_six_signal(effective_query, intent, merged, ai_answer)
             deduped = finalize(merged, count + 1)
             total_merged = merged_total(per_engine)
             weak = is_weak(deduped, total_merged)
@@ -435,6 +584,11 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                  "merged_total": total_merged, "weak": weak,
                  "results": deduped[:count], "total": len(deduped[:count]),
                  "duration_ms": round((time.monotonic() - _start) * 1000)}
+    if rewritten_query and rewritten_query != query:
+        out["rewritten_query"] = rewritten_query
+    out["search_need"] = search_need
+    if out_subqueries:
+        out["subqueries"] = out_subqueries
     if _reranker_disabled():
         out["reranker"] = "disabled — results are engine-ranked only (not reranked). " \
             "Enable with: rm ~/.local/share/reranker-rust/disabled"

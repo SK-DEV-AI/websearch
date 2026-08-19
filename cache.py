@@ -127,3 +127,36 @@ async def set_cached(url: str, content: str,
                 (excess,),
             )
         await db.commit()
+
+
+async def clear_cache(url: str = "", prefix: str = "") -> dict:
+    """E4a: explicit cache invalidation for fast-moving topics.
+
+    - url="" and prefix="" → wipe the whole fetch cache
+    - prefix="foo" → delete every entry whose URL starts with foo
+    - url="https://x/y" → delete that exact URL (all extraction variants)
+    Returns {"deleted": N, "prefix": ...}.
+    """
+    db_path = await _ensure_db()
+    async with aiosqlite.connect(db_path) as db:
+        if url:
+            cur = await db.execute(
+                "SELECT key FROM fetch_cache WHERE url = ?", (url,))
+        elif prefix:
+            cur = await db.execute(
+                "SELECT key FROM fetch_cache WHERE url LIKE ?",
+                (prefix.replace("%", "%%") + "%",))
+        else:
+            cur = await db.execute("SELECT COUNT(*) FROM fetch_cache")
+            row = await cur.fetchone()
+            total = row[0] if row else 0
+            await db.execute("DELETE FROM fetch_cache")
+            await db.commit()
+            return {"deleted": total, "scope": "all"}
+        rows = await cur.fetchall()
+        keys = [r[0] for r in rows]
+        if keys:
+            await db.executemany("DELETE FROM fetch_cache WHERE key = ?",
+                                 [(k,) for k in keys])
+        await db.commit()
+        return {"deleted": len(keys), "scope": "prefix" if prefix else "url"}

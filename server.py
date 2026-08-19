@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any
 
 logger = logging.getLogger("websearch")
@@ -19,6 +20,8 @@ from errors import annotate as _err_annotate, classify_exception as _err_exc
 from ghost_state import CHALLENGE, CONTENT_OK, classify, ghost
 from search_ddg import ddgs_extract
 from fetch import fetch_url, scrapling_stealthy_fetch
+from cache import clear_cache
+from check_links import check_links
 from crawl import crawl_url
 from pdf_extract import extract_pdf
 from screenshot import cdpa11y_snapshot, screenshot_cdp
@@ -83,12 +86,19 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "upload_urls": {"type": "array", "items": {"type": "string"}, "description": "GAI file upload: supported formats .avif .bmp .heic .heif .jpeg .pdf .png .webp. 10MB max. Only one file per call (GAI drops all but the last). Local: file:///path or remote URL."},
                 "start_date": {"type": "string", "description": "Tavily date filter start (YYYY-MM-DD)"},
                 "end_date": {"type": "string", "description": "Tavily date filter end (YYYY-MM-DD)"},
+                "engines": {"type": "array", "items": {"type": "string"}, "description": "Restrict fan-out to these engines (duckduckgo, google-news-rss, tavily, reddit, wikipedia, arxiv, anysearch, tinyfish, brave). Omit for all."},
+                "include_domains": {"type": "array", "items": {"type": "string"}, "description": "Tavily domain include filter"},
+                "exclude_domains": {"type": "array", "items": {"type": "string"}, "description": "Tavily domain exclude filter"},
                 "synthesize": {"type": "boolean", "default": True, "description": "Groq-synthesize top results into a concise answer with citations"},
                 "domain": {"type": "string", "description": "AnySearch vertical: finance, code, academic, health, travel, legal, security. Guessed from query via simple heuristic — may be wrong, omit for general search."},
                 "anysearch_tag": {"type": "string", "description": "AnySearch precise sub-domain tag in {domain}.{sub_domain} format (e.g. code.doc, finance.us_stock). Overrides domain."},
                 "anysearch_zone": {"type": "string", "enum": ["", "cn", "intl"], "description": "AnySearch geo zone (cn or intl)"},
                 "anysearch_language": {"type": "string", "description": "AnySearch content language (e.g. en, zh-CN)"},
-                "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"}},
+                "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"},
+                "query_rewrite": {"type": "boolean", "default": True, "description": "Rewrite context-dependent/pronoun queries into self-contained form before fan-out"},
+                "need_classifier": {"type": "boolean", "default": True, "description": "Label search intent (academic/discussion/general) to bias vertical lanes"},
+                "grounding_check": {"type": "boolean", "default": True, "description": "After synthesis, flag answer sentences unsupported by cited sources"},
+                "history": {"type": "string", "description": "Conversation context for query rewriting (resolves pronouns like 'the second one')"}},
                 "required": ["query"]}),
          Tool(name="fetch",
             description="URL to markdown/text. Auto-fallback: direct fetch → CDP for blocked/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected. Use focus=\"query\" to filter content by relevance. Paginated via offset (response: next_offset). Results cached 1h; cache_ttl=0 fresh. For structured JSON extraction use `extract` instead. e.g. fetch(url='https://example.com')",
@@ -108,9 +118,11 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                    "include_links": {"type": "boolean", "default": True, "description": "Include hyperlinks in output"},
                    "include_formatting": {"type": "boolean", "default": True, "description": "Preserve text formatting (bold, italic, etc)"},
                    "include_tables": {"type": "boolean", "default": True, "description": "Extract tables from HTML"},
-                   "start_line": {"type": "integer", "description": "1-based start line for reading a range (slices content by newline)"},
-                   "end_line": {"type": "integer", "description": "1-based end line (inclusive). Use with start_line for targeted reading."},
-                   },
+                    "start_line": {"type": "integer", "description": "1-based start line for reading a range (slices content by newline)"},
+                    "end_line": {"type": "integer", "description": "1-based end line (inclusive). Use with start_line for targeted reading."},
+                    "quality_floor": {"type": "number", "default": 0, "description": "Min acceptable extraction quality 0-1 (length+density+structure score); below it the result is flagged low_quality"},
+                    "mineru": {"type": "boolean", "default": False, "description": "Opt-in MinerU-HTML SLM re-extraction for low-quality pages (heavy, CPU, seconds per page)"},
+                    },
                 "required": ["url"]}),
         Tool(name="crawl",
             description="BFS/DFS deep crawl. Returns per-page markdown + combined text. e.g. crawl(url='https://example.com', max_depth=2)",
@@ -128,10 +140,11 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "capture_network_requests": {"type": "boolean", "default": False},
                 "css_selector": {"type": "string", "description": "CSS selector to target specific content"},
                 "bypass_cache": {"type": "boolean", "default": False, "description": "Force fresh crawl, skip cache"},
-                "exclude_all_images": {"type": "boolean", "default": False},
-                "exclude_external_images": {"type": "boolean", "default": False}},
-                "required": ["url"]}),
-         Tool(name="screenshot",
+                 "exclude_all_images": {"type": "boolean", "default": False},
+                 "exclude_external_images": {"type": "boolean", "default": False},
+                 "min_content_chars": {"type": "integer", "default": 0, "description": "Adaptive crawl: prune result pages whose markdown is shorter than this many chars (nav shells, redirect stubs, empty JS renders)"}},
+                 "required": ["url"]}),
+          Tool(name="screenshot",
             description="Screenshot or ARIA accessibility snapshot (AI-optimized for LLMs). Use type=snapshot for LLM-readable text, type=screenshot for visual capture. start_line/end_line for range reads. e.g. screenshot(url='https://example.com', type='snapshot')",
             input_schema={"type": "object", "properties": {
                 "url": {"type": "string"}, "full_page": {"type": "boolean", "default": True},
@@ -189,8 +202,22 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "include_sitemap": {"type": "boolean", "default": True, "description": "Try sitemap discovery first"},
                 "include_links": {"type": "boolean", "default": True, "description": "Fall back to HTML link extraction when no sitemap"},
                 "same_domain": {"type": "boolean", "default": True, "description": "Only include URLs from the same domain"},
-                "exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex patterns to exclude matching URLs"}},
-                "required": ["url"]}),
+                 "exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex patterns to exclude matching URLs"}},
+                 "required": ["url"]}),
+         Tool(name="check_links",
+            description="Dead-link detection: probe a batch of URLs (HEAD with GET fallback, bounded concurrency) and classify each as ok/gone/broken/blocked/rate_limited/timeout/ssl/dns/server_error. SSRF-validated; internal targets and media/archive extensions are skipped and reported. e.g. check_links(urls=['https://example.com/a','https://example.com/b']) or check_links(links=[...]) with concurrency=10, timeout=8",
+            input_schema={"type": "object", "properties": {
+                "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs to probe (alias: links)"},
+                "links": {"type": "array", "items": {"type": "string"}},
+                "concurrency": {"type": "integer", "default": 10, "description": "Max parallel probes (1-25)"},
+                "timeout": {"type": "number", "default": 8, "description": "Per-request timeout in seconds"}},
+                "required": []}),
+         Tool(name="clear_cache",
+            description="Explicit fetch-cache invalidation for fast-moving topics. clear_cache() wipes all entries; clear_cache(url='https://x/y') drops that exact URL (all extraction variants); clear_cache(prefix='https://example.com/') drops everything under a prefix. Returns deleted count + scope.",
+            input_schema={"type": "object", "properties": {
+                "url": {"type": "string"},
+                "prefix": {"type": "string"}},
+                "required": []}),
          Tool(name="ddgs_extract",
             description="Lightweight URL content extraction via DuckDuckGo's extract endpoint. Faster than fetch for simple pages — markdown or plain text. Best for search snippets and quick page reads where trafilatura is overkill. e.g. ddgs_extract(url='https://example.com')",
             input_schema={"type": "object", "properties": {
@@ -219,6 +246,43 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
             },
                 "required": ["input_path"]}),
     ])
+
+
+async def verify_grounding(answer: str, sources: list[dict], groq_key: str) -> dict:
+    """Re-prompt Groq: for each sentence, is the claim backed by a cited source?
+
+    Returns {"flagged": [{"sentence": str, "issue": str}], "ok": bool}.
+    """
+    sources_block = "\n".join(f"[{s['n']}] {s['title']} — {s['url']}" for s in sources)
+    sys_p = (
+        "You are a grounding verifier. Given an answer and its source list, "
+        "identify every sentence whose central claim is NOT supported by any "
+        "cited source [N]. Output ONLY JSON: "
+        '{"flagged":[{"sentence":str,"issue":str}],"ok":bool}.'
+    )
+    c = get_http_client()
+    resp = await c.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+        json={"model": "openai/gpt-oss-120b",
+              "messages": [{"role": "system", "content": sys_p},
+                           {"role": "user", "content": f"Sources:\n{sources_block}\n\nAnswer:\n{answer}"}],
+              "temperature": 0.0, "max_tokens": 1024}, timeout=15)
+    if resp.status_code != 200:
+        return {"flagged": [], "ok": None, "error": f"http {resp.status_code}"}
+    text = resp.json()["choices"][0]["message"]["content"].strip()
+    if not text:
+        return {"flagged": [], "ok": None, "error": "empty completion"}
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        a, b = text.find("{"), text.rfind("}")
+        parsed = json.loads(text[a:b+1]) if a >= 0 and b > a else None
+    if isinstance(parsed, dict):
+        flagged = parsed.get("flagged", []) if isinstance(parsed.get("flagged"), list) else []
+        return {"flagged": flagged, "ok": bool(parsed.get("ok", not flagged))}
+    return {"flagged": [], "ok": None, "error": "unparseable"}
 
 
 async def handle_call_tool(ctx, params) -> CallToolResult:
@@ -274,11 +338,16 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 upload_urls=arguments.get("upload_urls"),
                 start_date=str(arguments.get("start_date","")),
                 end_date=str(arguments.get("end_date","")),
+                engines=arguments.get("engines"),
                 domain=str(arguments.get("domain","")),
                 anysearch_tag=str(arguments.get("anysearch_tag","")),
                 anysearch_zone=str(arguments.get("anysearch_zone","")),
                 anysearch_language=str(arguments.get("anysearch_language","")),
-                cdp_url=HELIUM_CDP)
+                cdp_url=HELIUM_CDP,
+                depth=depth,
+                query_rewrite=bool(arguments.get("query_rewrite", True)),
+                need_classifier=bool(arguments.get("need_classifier", True)),
+                history=str(arguments.get("history", "")))
             if r.get("success") and depth >= 2 and r.get("results"):
                 try:
                     fetched = await enrich(r["results"], query, depth=depth,
@@ -291,21 +360,39 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             skip_synthesis = google_ai_only and r.get("ai_answer")
             if r.get("success") and bool(arguments.get("synthesize", True)) and r.get("results") and not skip_synthesis:
                 try:
-                    top = (r.get("fetched_content") or r["results"])[:3]
-                    ctx = "\n\n".join(f"[{i+1}] {x.get('title','')}: {x.get('content','')[:1500]}"
-                                     for i, x in enumerate(top))
+                    top = (r.get("fetched_content") or r["results"])[:max(3, min(depth * 2, 8))]
+                    ctx = "\n\n".join(
+                        f"[{i+1}]\nSource: {x.get('url', '')}\nTitle: {x.get('title','')}\n"
+                        f"Content: {(x.get('content') or x.get('snippet') or '')[:1500]}"
+                        for i, x in enumerate(top))
                     if _groq_keys.has_keys:
                         groq_key = await _groq_keys.next()
                         c = get_http_client()
-                        resp = await c.post(
-                            "https://api.groq.com/openai/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
-                            json={"model": "openai/gpt-oss-120b",
-                                  "messages": [{"role": "system", "content": "Answer concisely from sources. Use [N] citations like [1][2]."},
-                                               {"role": "user", "content": f"Query: {query}\n\nResults:\n{ctx}"}],
-                                  "temperature": 0.3, "max_tokens": 256}, timeout=15)
-                        if resp.status_code == 200:
-                            r["synthesis"] = {"answer": resp.json()["choices"][0]["message"]["content"].strip()}
+                        answer = ""
+                        for _ in range(2):
+                            resp = await c.post(
+                                "https://api.groq.com/openai/v1/chat/completions",
+                                headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                                json={"model": "openai/gpt-oss-120b",
+                                      "messages": [{"role": "system", "content": "Synthesize a comprehensive answer based ONLY on the provided search results. Cite your sources using numbers [1], [2], ... corresponding to the search results. If the results are insufficient, state that clearly."},
+                                                   {"role": "user", "content": f"Query: {query}\n\nResults:\n{ctx}"}],
+                                      "temperature": 0.3, "max_tokens": 512}, timeout=15)
+                            if resp.status_code == 200:
+                                answer = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+                                if answer:
+                                    break
+                        if answer:
+                            sources = [{"n": i + 1, "title": x.get("title", ""), "url": x.get("url", "")}
+                                       for i, x in enumerate(top)]
+                            answer += "\n\n---\n\n## Sources\n\n" + "\n".join(
+                                f"[{s['n']}] {s['title']} — {s['url']}" for s in sources)
+                            r["synthesis"] = {"answer": answer, "sources": sources}
+                            if bool(arguments.get("grounding_check", True)) and len(answer) > 120:
+                                try:
+                                    r["synthesis"]["grounded"] = await verify_grounding(
+                                        answer, sources, groq_key)
+                                except Exception as e:
+                                    logger.warning("grounding check failed: %s", e)
                 except Exception as e:
                     r["synthesis_error"] = str(e)
             return _res(r)
@@ -337,7 +424,9 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                         include_formatting=bool(arguments.get("include_formatting", True)),
                         include_links=bool(arguments.get("include_links", True)),
                         raw=bool(arguments.get("raw", False)),
-                        cookies=cookies)
+                        cookies=cookies,
+                        quality_floor=float(arguments.get("quality_floor", 0.0)),
+                        mineru=bool(arguments.get("mineru", False)))
                 if r.get("success"):
                     if route == "warm":
                         ghost.warm_ok(host)
@@ -375,45 +464,62 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 ) or (len(content) < 100)
 
             # ── Tier-2 browser solve + solve-and-bounce handoff ─────
-            if should_retry:
-                cdp_r = await scrapling_stealthy_fetch(url,
-                    css_selector=arguments.get("css_selector"),
-                    extraction_type=str(arguments.get("extraction_type", "markdown")),
-                    cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle", True)))
-                if cdp_r.get("success"):
-                    # browser solved the wall → store clearance cookies
-                    ghost.record_solved(host, cdp_r.get("cookies", []),
-                                        replay_ok=False)
+            if should_retry and ghost.tier_allowed(host, "t2"):
+                async def _replay(cks):
+                    return await fetch_url(url,
+                            max_chars=max_chars,
+                            offset=offset,
+                            focus=str(arguments.get("focus", "")),
+                            cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
+                            target_language=str(arguments.get("target_language", "")),
+                            fast=bool(arguments.get("fast", False)),
+                            output_format=str(arguments.get("output_format", "markdown")),
+                            include_images=bool(arguments.get("include_images", True)),
+                            include_tables=bool(arguments.get("include_tables", True)),
+                            include_formatting=bool(arguments.get("include_formatting", True)),
+                            include_links=bool(arguments.get("include_links", True)),
+                            raw=bool(arguments.get("raw", False)),
+                            cookies=cks)
+
+                # Turnstile widget solve first (cheap, no full render)
+                cf_cookies = None
+                if cf_hits >= 2:
+                    from turnstile_solve import turnstile_solve as _cf_solve
+                    cf_cookies = await _cf_solve(url)
+                if cf_cookies:
+                    ghost.record_solved(host, cf_cookies, replay_ok=False, tier="t2")
                     vault = ghost.vault(host)
                     if vault:
-                        # replay the cheap tier-1 fetch with clearance
-                        # cookies; real content means future warm
-                        # fetches skip the browser entirely
-                        replay = await fetch_url(url,
-                                max_chars=max_chars,
-                                offset=offset,
-                                focus=str(arguments.get("focus", "")),
-                                cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
-                                target_language=str(arguments.get("target_language", "")),
-                                fast=bool(arguments.get("fast", False)),
-                                output_format=str(arguments.get("output_format", "markdown")),
-                                include_images=bool(arguments.get("include_images", True)),
-                                include_tables=bool(arguments.get("include_tables", True)),
-                                include_formatting=bool(arguments.get("include_formatting", True)),
-                                include_links=bool(arguments.get("include_links", True)),
-                                raw=bool(arguments.get("raw", False)),
-                                cookies=vault)
+                        replay = await _replay(vault)
                         if replay.get("success"):
                             ghost.set_replay_ok(host, True)
                             r = replay
+                if not cf_cookies or not r.get("success"):
+                    cdp_r = await scrapling_stealthy_fetch(url,
+                        css_selector=arguments.get("css_selector"),
+                        extraction_type=str(arguments.get("extraction_type", "markdown")),
+                        cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle", True)))
+                    if cdp_r.get("success"):
+                        # browser solved the wall → store clearance cookies
+                        ghost.record_solved(host, cdp_r.get("cookies", []),
+                                            replay_ok=False, tier="t2")
+                        vault = ghost.vault(host)
+                        if vault:
+                            # replay the cheap tier-1 fetch with clearance
+                            # cookies; real content means future warm
+                            # fetches skip the browser entirely
+                            replay = await _replay(vault)
+                            if replay.get("success"):
+                                ghost.set_replay_ok(host, True)
+                                r = replay
+                            else:
+                                ghost.set_replay_ok(host, False)
+                                r = cdp_r
                         else:
-                            ghost.set_replay_ok(host, False)
                             r = cdp_r
                     else:
+                        ghost.record_fetch(host, cdp_r.get("verdict", CHALLENGE), tier="t2")
                         r = cdp_r
-                else:
-                    ghost.record_fetch(host, cdp_r.get("verdict", CHALLENGE))
-                    r = cdp_r
 
             # Re-apply focus on browser-served results (httpx/cache
             # paths already applied it inside fetch_url)
@@ -452,6 +558,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 bypass_cache=bool(arguments.get("bypass_cache",False)),
                 exclude_all_images=bool(arguments.get("exclude_all_images",False)),
                 exclude_external_images=bool(arguments.get("exclude_external_images",False)),
+                min_content_chars=safe_int(arguments.get("min_content_chars",0)),
                 cdp_url=HELIUM_CDP)
             return _res(r)
         elif name == "screenshot":
@@ -621,6 +728,18 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 include_links=bool(arguments.get("include_links",True)),
                 same_domain=bool(arguments.get("same_domain",True)),
                 exclude_patterns=arguments.get("exclude_patterns"))
+            return _res(r)
+        elif name == "check_links":
+            urls = arguments.get("urls") or arguments.get("links")
+            if not urls or not isinstance(urls, list):
+                return _res({"success": False, "error": "urls must be a list"})
+            r = await check_links(urls,
+                concurrency=safe_int(arguments.get("concurrency",10)),
+                timeout=safe_float(arguments.get("timeout",8.0)))
+            return _res(r)
+        elif name == "clear_cache":
+            r = await clear_cache(url=str(arguments.get("url","")),
+                prefix=str(arguments.get("prefix","")))
             return _res(r)
         else:
             return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": f"Unknown tool: {name}"})))], is_error=True)

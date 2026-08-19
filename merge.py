@@ -310,7 +310,7 @@ def verticals_for(intent: str, query: str) -> list[str]:
     if intent == "code":
         return ["stackexchange", "mdn", "github", "hn"]
     if intent == "paper":
-        return ["scholar", "arxiv"]
+        return ["scholar", "arxiv", "openalex", "crossref", "pubmed", "europepmc"]
     if intent == "news":
         return ["news", "hn"]
     if intent == "entity":
@@ -327,7 +327,8 @@ _DOMAIN_PRIOR = {
              "serverfault.com", "news.ycombinator.com", "git-scm.com"],
     "paper": ["arxiv.org", "semanticscholar.org", "scholar.google.com", "nature.com",
               "science.org", "acm.org", "ieee.org", "openreview.net",
-              "pubmed.ncbi.nlm.nih.gov", "doi.org"],
+              "pubmed.ncbi.nlm.nih.gov", "doi.org", "openalex.org",
+              "api.crossref.org", "europepmc.org", "ncbi.nlm.nih.gov"],
     "news": ["reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "nytimes.com",
              "theguardian.com", "arstechnica.com", "techcrunch.com",
              "news.ycombinator.com", "bloomberg.com", "wsj.com"],
@@ -731,6 +732,62 @@ def apply_authority(query: str, intent: str, results: list[dict]) -> None:
         if intent == "news":
             m *= _freshness_mult(r.get("published"))
         r["score"] *= m
+
+
+# ────────────────────────────────────────────────────────────────
+# E2: six-signal ranking nudge (hound-mcp concept) — additive and
+# low-weight so the cross-encoder blend stays the dominant ordering.
+# ────────────────────────────────────────────────────────────────
+
+# host -> 0..1 reputation; unknown hosts default 0.5
+DOMAIN_REP = {
+    "wikipedia.org": 0.95, "github.com": 0.9, "docs.python.org": 0.9,
+    "arxiv.org": 0.9, "stackoverflow.com": 0.85, "reddit.com": 0.6,
+    "medium.com": 0.55,
+}
+
+# weights chosen so max |Δscore| <= ~0.38
+SIX_WEIGHTS = {"cons": 0.10, "dom": 0.12, "ans": 0.08, "title": 0.05, "url": 0.03, "div": -0.10}
+
+
+def _url_terms_ratio(query: str, url: str) -> float:
+    terms = [t for t in re.split(r"[^a-zA-Z0-9]", query.lower())
+             if len(t) > 2 and t not in _TITLE_STOPWORDS]
+    if not terms:
+        return 0.0
+    path = url.lower().split("//", 1)[-1].split("?", 1)[0]
+    toks = set(re.split(r"[/_\-.]", path))
+    return sum(1 for t in terms if t in toks) / len(terms)
+
+
+def apply_six_signal(query: str, intent: str, results: list[dict], ai_answer: str = "") -> None:
+    """Post-blend, pre-finalize scoring nudge: cross-variant consensus,
+    domain reputation, answer-signal, title/URL relevance, soft diversity.
+    Results are already sorted by score desc. In-place; adds r['_six']."""
+    w = SIX_WEIGHTS
+    ai_lower = (ai_answer or "").lower()
+    domain_count: dict[str, int] = {}
+    q_terms = [t for t in re.split(r"[^a-zA-Z0-9]", query.lower())
+               if len(t) > 2 and t not in _TITLE_STOPWORDS]
+    for r in results:
+        host = host_of(r.get("url", ""))
+        dom = domain_count.get(host, 0)
+        div_pen = w["div"] if dom >= 2 else 0.0
+        cons = min(max(int(r.get("_consensus", 1)) - 1, 0), 3) / 3
+        rep = DOMAIN_REP.get(host, 0.5)
+        url = r.get("url", "")
+        ans = 1.0 if url and ai_lower and url.lower() in ai_lower else 0.0
+        if ans == 0.0 and q_terms:
+            blob = ((r.get("snippet") or "") + " " + (r.get("title") or "")).lower()
+            ans = sum(1 for t in q_terms if t in blob) / len(q_terms)
+        title_r = _title_terms_ratio(query, r.get("title", ""))
+        url_r = _url_terms_ratio(query, url)
+        norm = (w["cons"] * cons + w["dom"] * rep + w["ans"] * ans
+                + w["title"] * title_r + w["url"] * url_r + div_pen)
+        r["score"] *= 1.0 + norm
+        r["_six"] = {"C": round(cons, 3), "D": round(rep, 3), "A": round(ans, 3),
+                      "T": round(title_r, 3), "U": round(url_r, 3), "div": div_pen}
+        domain_count[host] = dom + 1
 
 
 # ────────────────────────────────────────────────────────────────
