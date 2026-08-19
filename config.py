@@ -75,6 +75,7 @@ TIER_SKIP_THRESHOLD = float(os.environ.get("TIER_SKIP_THRESHOLD", "0.30"))
 TIER_MIN_TRIES = int(os.environ.get("TIER_MIN_TRIES", "10"))
 MINERU_DEVICE = os.environ.get("MINERU_DEVICE", "cpu")
 MINERU_ENABLED = os.environ.get("MINERU_ENABLED", "false") == "true"
+FAST_PATHS_ENABLED = os.environ.get("FAST_PATHS_ENABLED", "true") == "true"
 
 
 _cache: dict[str, tuple[float, Any]] = {}

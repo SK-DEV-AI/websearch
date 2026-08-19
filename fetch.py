@@ -27,6 +27,9 @@ from security import SecurityError, safe_fetch, validate_url as _validate_url
 import cache as cache_mod
 import focus as focus_mod
 from config import QUALITY_FLOOR
+import config
+import fast_paths
+from fast_paths import fast_path_fetch
 
 logger = logging.getLogger("fetch")
 
@@ -309,6 +312,24 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                                   cached.get("metadata", {}),
                                                   cached.get("content_type", ""),
                                                   offset, max_chars, method="cache")
+
+        # ── Fast paths (llms.txt / YouTube / Reddit / GitHub) ──────
+        # Shape-gated probes that skip the generic pipeline entirely;
+        # responses are cached so repeat fetches don't re-probe (GitHub
+        # API is 60 req/hr unauthenticated).
+        if config.FAST_PATHS_ENABLED:
+            fp = await fast_path_fetch(url)
+            if fp:
+                if cache_ttl > 0:
+                    asyncio.ensure_future(cache_mod.set_cached(
+                        url, fp["content"], extraction_type=extraction_type,
+                        status=200, content_type=fp.get("content_type", ""),
+                        title=fp.get("title", ""), metadata=fp.get("metadata") or {},
+                        ttl=cache_ttl))
+                return _build_paginated_response(
+                    url, fp["content"], 200, fp.get("title", ""),
+                    fp.get("metadata") or {}, fp.get("content_type", ""),
+                    offset, max_chars, method=fp.get("method", "fast-path"))
 
         # ── Raw mode ────────────────────────────────────────────────
         if raw or any(url_lower.startswith(p) for p in
