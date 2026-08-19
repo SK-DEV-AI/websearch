@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from typing import Any
@@ -402,6 +403,11 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         # per-host jar fed from Set-Cookie. Fresh entries skip the request.
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
+        if config.ROBOTS_POLITENESS:
+            import robots as robots_mod
+            if not await robots_mod.allowed(url):
+                return {"success": False, "url": url,
+                        "error": "blocked by robots.txt"}
         reval = _reval.check(url)
         resp = None
         raw_html = None
@@ -416,6 +422,11 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True,
                                               cookies=merged or None,
                                               headers=cond or None)
+                if resp.status == 429:  # rate-limited: one jittered retry
+                    await asyncio.sleep(random.uniform(1.5, 3.5))
+                    resp = await AsyncFetcher.get(url, timeout=15, stealthy_headers=True,
+                                                  cookies=merged or None,
+                                                  headers=cond or None)
                 redir_err = await _revalidate_redirect(url, resp)
                 if redir_err:
                     return {"success": False, "url": url, "error": redir_err}
