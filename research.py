@@ -11,6 +11,7 @@ from collections import Counter
 from config import cached
 from search_ddg import search_ddg, search_google_rss
 from search_brave import search_brave
+from search_marginalia import search_marginalia
 from search_tavily import search_tavily
 from search_anysearch import search_anysearch
 from search_tinyfish import tinyfish_search
@@ -47,7 +48,7 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'+-]{2,}")
 
 # Engines expected in a non-GAI-only search (for engine_blocked reporting)
 _ALL_ENGINES = {"google-news-rss", "tavily", "reddit", "wikipedia", "arxiv",
-                "anysearch", "tinyfish", "duckduckgo", "brave"}
+                "anysearch", "tinyfish", "duckduckgo", "brave", "marginalia"}
 
 
 def _query_tokens(query: str) -> set[str]:
@@ -427,10 +428,16 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                            "tavily": "tavily", "reddit": "reddit",
                            "wikipedia": "wiki", "arxiv": "arxiv",
                            "anysearch": "anysearch", "tinyfish": "tinyfish",
-                           "brave": "brave"}
+                           "brave": "brave", "marginalia": "marginalia"}
             allowed = {_ENGINE_KEY.get(e, e) for e in engines}
             tasks = {k: v for k, v in tasks.items()
                      if (k.startswith("ddg_") and "ddg" in allowed) or k in allowed}
+        # marginalia is a small non-commercial index under aggressive rate
+        # limiting — opt-in only via engines=[...], never part of the default
+        # fan-out (steal engines #4)
+        if engines and "marginalia" in allowed:
+            tasks["marginalia"] = asyncio.create_task(_multi_search(
+                search_marginalia, multi_variants[:1], count=min(count, 10)))
         done = await asyncio.gather(*tasks.values(), return_exceptions=True)
         done_map = dict(zip(tasks.keys(), done))
         # D2 need-bias: academic need overrides the detected intent so the
@@ -446,7 +453,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 done_map[f"vert_{_v}"] = await vertical_run(_v, effective_query)
             except BaseException:
                 done_map[f"vert_{_v}"] = []
-        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "brave")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
+        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "brave", "marginalia")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
             if key not in done_map:
                 continue
             val = done_map[key]
@@ -478,7 +485,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                         entry = dict(r)
                         entry["rank"] = len(per_engine.get(new_eng, []))
                         per_engine.setdefault(new_eng, []).append(entry)
-        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish", "brave": "brave"}
+        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish", "brave": "brave", "marginalia": "marginalia"}
         for key, name in eng.items():
             val = done_map.get(key)
             if isinstance(val, dict):
@@ -655,10 +662,15 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
             fetched = deduped
         fetched = await _rerank(query, fetched, top_k=depth * 2)
         fetched = _normalize_scores(fetched)
-        # reranker saw the full fetch; give the LLM a bounded digest per page
-        for f in fetched:
-            if f.get("content"):
-                f["content"] = f["content"][:5000]
+    # reranker saw the full fetch; give the LLM a bounded digest per page
+    # (smolagents truncate-with-marker pattern: explicit cut notice so the
+    # LLM never mistakes a truncated page for a short one)
+    for f in fetched:
+        c = f.get("content") or ""
+        if len(c) > 5000:
+            f["content"] = c[:5000] + "\n\n[Content truncated at 5000 chars]"
+        elif c:
+            f["content"] = c
     result = {"fetched_content": fetched}
     if demoted:
         result["fetched_content"] = result["fetched_content"] + demoted
