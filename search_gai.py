@@ -23,7 +23,7 @@ from typing import Any
 
 from config import GOOGLE_AI_URL, HELIUM_CDP, get_http_client
 from cdp_client import CDPPage, get_cdp_session, owned_targets
-from security import safe_fetch, validate_url
+from security import SecurityError, safe_fetch, validate_url
 
 logger = logging.getLogger("gai")
 
@@ -549,28 +549,34 @@ class GoogleAIClient:
                         await asyncio.sleep(1)
                     continue
                 # Remote URL
-                ok = await p.call_function("""async (url) => {
-                    const resp = await fetch(url);
-                    if (!resp.ok) return {error: `HTTP ${resp.status}`};
-                    const blob = await resp.blob();
-                    const name = url.split('/').pop()?.split('?')[0] || 'upload';
-                    const f = new File([blob], name, {type: blob.type});
-                    const dt = new DataTransfer(); dt.items.add(f);
-                    const ta = document.querySelector('textarea');
-                    if (!ta) return {error: 'no textarea'};
-                    ta.dispatchEvent(new DragEvent('dragenter',
-                        {bubbles: true, cancelable: true, dataTransfer: dt}));
-                    ta.dispatchEvent(new DragEvent('dragover',
-                        {bubbles: true, cancelable: true, dataTransfer: dt}));
-                    ta.dispatchEvent(new DragEvent('drop',
-                        {bubbles: true, cancelable: true, dataTransfer: dt}));
-                    await new Promise(r => setTimeout(r, 2000));
-                    return {ok: true, size: blob.size, type: blob.type};
-                }""", url)
-                if isinstance(ok, dict) and ok.get("ok"):
-                    uploaded = True
-                    await asyncio.sleep(1)
-                    continue
+                try:
+                    await validate_url(url)
+                    _gai_remote_ok = True
+                except SecurityError:
+                    _gai_remote_ok = False
+                if _gai_remote_ok:
+                    ok = await p.call_function("""async (url) => {
+                        const resp = await fetch(url);
+                        if (!resp.ok) return {error: `HTTP ${resp.status}`};
+                        const blob = await resp.blob();
+                        const name = url.split('/').pop()?.split('?')[0] || 'upload';
+                        const f = new File([blob], name, {type: blob.type});
+                        const dt = new DataTransfer(); dt.items.add(f);
+                        const ta = document.querySelector('textarea');
+                        if (!ta) return {error: 'no textarea'};
+                        ta.dispatchEvent(new DragEvent('dragenter',
+                            {bubbles: true, cancelable: true, dataTransfer: dt}));
+                        ta.dispatchEvent(new DragEvent('dragover',
+                            {bubbles: true, cancelable: true, dataTransfer: dt}));
+                        ta.dispatchEvent(new DragEvent('drop',
+                            {bubbles: true, cancelable: true, dataTransfer: dt}));
+                        await new Promise(r => setTimeout(r, 2000));
+                        return {ok: true, size: blob.size, type: blob.type};
+                    }""", url)
+                    if isinstance(ok, dict) and ok.get("ok"):
+                        uploaded = True
+                        await asyncio.sleep(1)
+                        continue
                 # Fallback: server-side download
                 c = get_http_client()
                 resp = await safe_fetch(c, url, headers={

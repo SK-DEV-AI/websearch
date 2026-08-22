@@ -70,12 +70,18 @@ async def _cdp_fetch(page, path: str) -> dict | None:
         result = await page.evaluate(f'''
             (async () => {{
                 try {{
-                    const r = await fetch({json.dumps(url)});
-                    if (r.status < 200 || r.status >= 300) {{
-                        return JSON.stringify({{_error: "HTTP " + r.status}});
+                    const ctl = new AbortController();
+                    const timer = setTimeout(() => ctl.abort(), 25000);
+                    try {{
+                        const r = await fetch({json.dumps(url)}, {{signal: ctl.signal}});
+                        if (r.status < 200 || r.status >= 300) {{
+                            return JSON.stringify({{_error: "HTTP " + r.status}});
+                        }}
+                        const text = await r.text();
+                        return JSON.stringify({{_data: text}});
+                    }} finally {{
+                        clearTimeout(timer);
                     }}
-                    const text = await r.text();
-                    return JSON.stringify({{_data: text}});
                 }} catch(e) {{
                     return JSON.stringify({{_error: e.message}});
                 }}

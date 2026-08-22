@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 
 from scrapling.fetchers import AsyncFetcher
 
+from security import SecurityError, validate_url as _validate_url
+
 _TXT_CT = "text/plain"
 
 
@@ -27,6 +29,12 @@ async def _get(url: str, timeout: float = 12) -> str | None:
         return None
     if resp.status != 200:
         return None
+    final = getattr(resp, "url", None)
+    if final and final != url:
+        try:
+            await _validate_url(final)
+        except SecurityError:
+            return None
     body = resp.body
     if isinstance(body, bytes):
         body = body.decode("utf-8", errors="replace")

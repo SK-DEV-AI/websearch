@@ -53,7 +53,7 @@ async def check_links(urls: list[str], concurrency: int = 10,
     sem = asyncio.Semaphore(max(1, min(int(concurrency), 25)))
     import httpx
 
-    async with httpx.AsyncClient(follow_redirects=True,
+    async with httpx.AsyncClient(follow_redirects=False,
                                  timeout=timeout,
                                  limits=httpx.Limits(max_connections=25)) as client:
         async def probe(url: str) -> dict:
@@ -72,12 +72,28 @@ async def check_links(urls: list[str], concurrency: int = 10,
                     return entry
                 exc = None
                 status = 0
+                current = entry["final_url"]
                 try:
-                    r = await client.head(entry["final_url"])
-                    status = r.status_code
-                    if status in (405, 403) or not r.headers.get("content-length"):
-                        r = await client.get(entry["final_url"])
+                    # Manual redirect hops: every hop is SSRF-validated
+                    # before it is requested (follow_redirects=False).
+                    for _hop in range(6):
+                        r = await client.request("HEAD", current)
+                        if r.status_code in (405, 403):
+                            r = await client.request("GET", current)
                         status = r.status_code
+                        if status in (301, 302, 303, 307, 308):
+                            loc = r.headers.get("location")
+                            if not loc:
+                                break
+                            current = str(r.url.join(loc))
+                            try:
+                                current = await validate_url(current)
+                            except SecurityError as e:
+                                entry["status"] = "skipped_internal"
+                                entry["reason"] = f"redirect: {e}"
+                                return entry
+                            continue
+                        break
                 except Exception as e:  # noqa: BLE001
                     exc = f"{type(e).__name__}: {e}"
                 entry["status"] = _classify(status, exc)

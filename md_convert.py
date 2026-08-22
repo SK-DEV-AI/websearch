@@ -75,10 +75,23 @@ def extract_and_convert(html: str, url: str = "", *, fast: bool = False,
         kw["fast"] = True
     if url:
         kw["url"] = url
-    try:
-        html_ext = trafilatura.extract(html, **kw)
-    except Exception:
-        html_ext = None
+    def _run(kws):
+        try:
+            return trafilatura.extract(html, **kws)
+        except Exception:
+            return None
+
+    html_ext = _run(kw)
+    # fast=True skips trafilatura's readability/jusText fallback chain;
+    # on forum/thread layouts the primary pass keeps a tiny fragment
+    # (phpBB 137KB → 1.4K chars vs 27K with fallbacks). Escalate to the
+    # full chain when the result looks starved relative to page size.
+    if not html_ext or len(html_ext) < max(1000, len(html) // 60):
+        full = dict(kw)
+        full.pop("fast", None)
+        alt = _run(full)
+        if alt and len(alt) > len(html_ext or ""):
+            html_ext = alt
     if html_ext:
         md = to_markdown(html_ext, include_links=include_links,
                          include_images=include_images,

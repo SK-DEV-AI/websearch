@@ -32,6 +32,11 @@ async def extract_content(
     max_pages: int = 1,
     css_selector: str | None = None,
 ) -> dict:
+    from security import SecurityError, validate_url as _validate_url
+    try:
+        url = await _validate_url(url)
+    except SecurityError as e:
+        return {"success": False, "url": url, "error": str(e)}
     try:
         extraction_strategy = None
 

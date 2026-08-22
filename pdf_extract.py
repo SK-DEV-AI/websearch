@@ -193,7 +193,9 @@ async def extract_pdf(
             if os.path.isfile(src):
                 local_files.append(src)
                 continue
-            if src.startswith(("http://", "https://", "file://")):
+            if src.startswith("file://"):
+                continue  # file:// not supported (SSRF risk)
+            if src.startswith(("http://", "https://")):
                 if not tmpdir:
                     tmpdir = tempfile.mkdtemp(prefix="pdfx_")
                 fname = os.path.basename(urlsplit(src).path) or f"download_{len(local_files)}.pdf"

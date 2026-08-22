@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import logging
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -11,6 +12,8 @@ from ddgs import DDGS
 from scrapling.fetchers import AsyncFetcher
 
 from config import GNEWS_RSS
+
+logger = logging.getLogger("ddg")
 
 DDGS.threads = 8  # parallelize across 8 metasearch engines
 
@@ -84,7 +87,7 @@ async def search_ddg(
                     for r in raw if r.get("href")]
     except Exception as e:
         logger.warning("DDG search failed: %s", e)
-        raise
+        return []
 
 
 

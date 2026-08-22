@@ -44,6 +44,11 @@ async def crawl_url(
     exclude_external_images: bool = False,
     min_content_chars: int = 0,
 ) -> dict:
+    from security import SecurityError, validate_url as _validate_url
+    try:
+        url = await _validate_url(url)
+    except SecurityError as e:
+        return {"success": False, "url": url, "error": str(e)}
     browser_kw: dict[str, Any] = {
         "headless": True, "verbose": False, "ignore_https_errors": True,
         "enable_stealth": True, "text_mode": True, "light_mode": True,
@@ -142,11 +147,6 @@ async def crawl_url(
         run_kw["log_console"] = True
     if bypass_cache:
         run_kw["cache_mode"] = CacheMode.BYPASS
-    if min_content_chars > 0:
-        # E4c: adaptive crawl — prune thin pages (nav shells, redirect
-        # stubs, empty JS renders) from the result set; the crawl itself
-        # is unchanged, only what counts as a deliverable narrows.
-        pass
     if exclude_all_images:
         run_kw["exclude_all_images"] = True
     if exclude_external_images:

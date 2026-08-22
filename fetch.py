@@ -314,6 +314,16 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                                   cached.get("content_type", ""),
                                                   offset, max_chars, method="cache")
 
+        # ── Robots.txt politeness gate ──────────────────────────────
+        # Runs before EVERY fetch path (fast paths included) so a
+        # Disallowed URL is refused regardless of which fetcher would
+        # have handled it.
+        if config.ROBOTS_POLITENESS:
+            import robots as robots_mod
+            if not await robots_mod.allowed(url):
+                return {"success": False, "url": url,
+                        "error": "blocked by robots.txt"}
+
         # ── Fast paths (llms.txt / YouTube / Reddit / GitHub) ──────
         # Shape-gated probes that skip the generic pipeline entirely;
         # responses are cached so repeat fetches don't re-probe (GitHub
@@ -372,11 +382,11 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                                   offset, max_chars, method="pdf")
             except Exception as e:
                 logger.warning("PDF extraction failed for %s: %s", url, e)
-            if url_lower.endswith('.epub'):
-                resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
-                if _bomb_capped(resp.body):
-                    return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
-                content = _extract_epub(
+        elif url_lower.endswith('.epub'):
+            resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
+            if _bomb_capped(resp.body):
+                return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
+            content = _extract_epub(
                 resp.body if isinstance(resp.body, bytes) else resp.body.encode(), 100000)
             full_content = content
             if focus:
@@ -384,11 +394,11 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             return _build_paginated_response(url, full_content, 200,
                                               url.split("/")[-1], {}, "",
                                               offset, max_chars, method="epub")
-            if url_lower.endswith(('.docx', '.doc')):
-                resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
-                if _bomb_capped(resp.body):
-                    return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
-                content = _extract_docx(
+        elif url_lower.endswith(('.docx', '.doc')):
+            resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
+            if _bomb_capped(resp.body):
+                return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
+            content = _extract_docx(
                 resp.body if isinstance(resp.body, bytes) else resp.body.encode(), 100000)
             full_content = content
             if focus:
@@ -403,11 +413,6 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         # per-host jar fed from Set-Cookie. Fresh entries skip the request.
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
-        if config.ROBOTS_POLITENESS:
-            import robots as robots_mod
-            if not await robots_mod.allowed(url):
-                return {"success": False, "url": url,
-                        "error": "blocked by robots.txt"}
         reval = _reval.check(url)
         resp = None
         raw_html = None
@@ -846,7 +851,10 @@ async def _cdp_fetch_page(
             await page.wait_for_load_state("domcontentloaded", timeout=timeout)
             if network_idle:
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=timeout)
+                    # capped: chat widgets / long-poll pages never settle,
+                    # burning the full budget (cs.rin.ru: +15s for nothing)
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=min(timeout, 8))
                 except Exception:
                     pass
             if wait_selector:
@@ -1014,6 +1022,13 @@ async def scrapling_stealthy_fetch(
             if page_setup:
                 fk["page_setup"] = page_setup
             p = await session.fetch(**fk)
+            final = getattr(p, "url", None)
+            if final and final != url:
+                try:
+                    await _validate_url(final)
+                except SecurityError:
+                    return {"success": False, "url": url,
+                            "error": f"Redirect to blocked URL ({final})"}
             captured = getattr(p, "captured_xhr", None)
             if css_selector:
                 el = p.css(css_selector)

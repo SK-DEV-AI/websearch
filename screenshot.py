@@ -7,11 +7,13 @@ import tempfile
 import time
 
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
+from security import validate_url, SecurityError
 
 
 async def cdpa11y_snapshot(url: str, verbose: bool = False, max_chars: int = 10000,
                            depth: int = 5, boxes: bool = False) -> dict:
     try:
+        await validate_url(url)
         page = await _get_optimized_page(block_resources=False)
         try:
             await page.goto(url, wait_until="commit", timeout=30)
@@ -99,6 +101,7 @@ async def screenshot_cdp(url: str, full_page: bool = True,
                          omit_background: bool = False,
                          caret: str = "initial") -> dict:
     try:
+        await validate_url(url)
         page = await _get_optimized_page(block_resources=False)
         try:
             await page.goto(url, wait_until="commit", timeout=30)

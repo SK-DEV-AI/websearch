@@ -122,8 +122,13 @@ def classify(status: int, content: str = "", title: str = "") -> str:
         return SERVER_ERROR
     if any(m in text for m in CHALLENGE_MARKERS) or any(m in title_l for m in CHALLENGE_MARKERS):
         return CHALLENGE
-    if any(m in title_l for m in AUTH_MARKERS) or (
-            len(text) < SHORT_SHELL_MAX and any(m in head for m in AUTH_MARKERS)):
+    if any(m in title_l for m in AUTH_MARKERS):
+        return AUTH_WALL
+    # Body evidence needs corroboration: generic phrases like "log in"
+    # appear innocently in real prose ("how much to log in before
+    # reaching the limit"), so one marker must not condemn a short page.
+    if len(text) < SHORT_SHELL_MAX and (
+            sum(1 for m in AUTH_MARKERS if m in head) >= 2):
         return AUTH_WALL
     if any(m in title_l for m in PAYWALL_MARKERS) or (
             len(text) < SHORT_SHELL_MAX and any(m in head for m in PAYWALL_MARKERS)):

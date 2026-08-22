@@ -437,6 +437,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
 
             # ── Escalation decision ─────────────────────────────────
             should_retry = False
+            cf_hits = 0
             if r is None:
                 should_retry = True
             elif not r.get("success"):

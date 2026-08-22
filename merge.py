@@ -17,6 +17,7 @@ Pure stdlib, no external deps.
 
 from __future__ import annotations
 
+import math
 import re
 import time
 import urllib.parse
@@ -105,7 +106,7 @@ def _relevance(query: str, docs: list[tuple[str, str]]) -> list[float]:
                 continue
             dfv = df.get(term, 0)
             idf = ((n - dfv + 0.5) / (dfv + 0.5) + 1.0) if dfv > 0 else 0.0
-            idf = __import__("math").log(idf) if idf else 0.0
+            idf = math.log(idf) if idf else 0.0
             len_norm = 1.0 - b + b * (len(toks) / max(avg_len, 1.0))
             score += idf * (tf * (k1 + 1.0)) / (tf + k1 * len_norm)
         out.append(score)
@@ -175,6 +176,7 @@ def merge_base(per_engine: dict[str, list[dict]], query: str, intent: str) -> li
             if not any(engine_family(x) == fam for x in independent):
                 independent.append(e)
         consensus = len(independent)
+        r["_consensus"] = consensus
         r["score"] *= 1.0 + CONSENSUS_MULT * max(consensus - 1.0, 0.0)
 
     # BM25 relevance bonus

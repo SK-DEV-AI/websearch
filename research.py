@@ -50,6 +50,20 @@ _ALL_ENGINES = {"google-news-rss", "tavily", "reddit", "wikipedia", "arxiv",
                 "anysearch", "tinyfish", "duckduckgo", "brave"}
 
 
+def _host_of(url: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _netloc_of(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).netloc
+    except ValueError:
+        return ""
+
+
 def _query_tokens(query: str) -> set[str]:
     return {w.lower() for w in _WORD_RE.findall(query or "") if w.lower() not in _STOPWORDS}
 
@@ -166,17 +180,20 @@ async def _groq_text(sys_prompt: str, user_prompt: str,
     try:
         from config import get_http_client
         c = get_http_client()
-        r = await c.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model": "openai/gpt-oss-120b",
-                  "messages": [{"role": "system", "content": sys_prompt},
-                               {"role": "user", "content": user_prompt}],
-                  "temperature": temperature, "max_tokens": max_tokens},
-            timeout=15,
-        )
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"].strip()
+        for attempt in range(3):
+            r = await c.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"model": "openai/gpt-oss-120b",
+                      "messages": [{"role": "system", "content": sys_prompt},
+                                   {"role": "user", "content": user_prompt}],
+                      "temperature": temperature, "max_tokens": max_tokens},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+                if content:
+                    return content
     except Exception as e:
         logging.getLogger("research").warning(f"_groq_text failed: {type(e).__name__}: {e}")
     return None
@@ -309,7 +326,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             ai_answer = rd.get("answer", "")
             follow_up = rd.get("followUp", "")
             for s in rd.get("sources", []):
-                _h = (urllib.parse.urlsplit(s["url"]).hostname or "").lower()
+                _h = _host_of(s["url"])
                 if _h and ((include_domains and not any(
                         d.lower() in _h for d in include_domains)) or
                         (exclude_domains and any(
@@ -318,7 +335,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 per_engine.setdefault("google-ai-mode", []).append({
                     "title": s["title"], "url": s["url"],
                     "snippet": s.get("snippet", ""),
-                    "source": urllib.parse.urlparse(s["url"]).netloc if s.get("url") else "",
+                    "source": _netloc_of(s["url"]) if s.get("url") else "",
                     "engine": "google-ai-mode",
                     "rank": len(per_engine.get("google-ai-mode", [])),
                 })
@@ -414,7 +431,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 count=min(count, 10), timelimit=timelimit)),
             **ddg_tasks,
         }
-        done = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        done = await asyncio.wait_for(
+            asyncio.gather(*tasks.values(), return_exceptions=True), timeout=90)
         done_map = dict(zip(tasks.keys(), done))
         # D2 need-bias: academic need overrides the detected intent so the
         # scholarly vertical lanes fire; discussion keeps the detected intent
@@ -445,14 +463,15 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 continue
             if ta > 0:
                 eng_name = "duckduckgo" if key.startswith("ddg") else (
-                    "google-news-rss" if key == "rss" else key)
+                    "google-news-rss" if key == "rss" else (
+                        "wikipedia" if key == "wiki" else key))
                 engine_totals[eng_name] = ta
             for r in results_list:
                 if isinstance(r, dict) and "error" not in r and r.get("url"):
                     # Post-merge domain scoping (landscape 🥉): tavily filters
                     # natively, but DDG/brave/rss/reddit/verticals don't —
                     # apply include/exclude uniformly here.
-                    _h = (urllib.parse.urlsplit(r["url"]).hostname or "").lower()
+                    _h = _host_of(r["url"])
                     if _h and ((include_domains and not any(
                             d.lower() in _h for d in include_domains)) or
                             (exclude_domains and any(
@@ -460,7 +479,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                         continue
                     if key != "reddit" or r.get("engine") in ("reddit", "reddit-comment", "reddit-ai-summary"):
                         new_eng = "duckduckgo" if key.startswith("ddg") else (
-                            "google-news-rss" if key == "rss" else key)
+                            "google-news-rss" if key == "rss" else (
+                                "wikipedia" if key == "wiki" else key))
                         if key.startswith("vert_"):
                             new_eng = key[5:]
                         # Preserve sub-engine (e.g., reddit-ai-summary, reddit-comment)
@@ -489,41 +509,45 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             engines_used.append("duckduckgo")
 
         try:
-            completed, _ = await asyncio.wait([gai_future], timeout=300)
-        except BaseException:
-            completed = set()
-        ai_answer = ""
-        if gai_future in completed:
             try:
-                r = gai_future.result()
+                completed, _ = await asyncio.wait([gai_future], timeout=300)
             except BaseException:
-                r = None
-            if r and r.get("success"):
-                engines_used.append("google-ai-mode")
-                rd = r["result"]
-                ai_answer = rd.get("answer", "")
-                follow_up = rd.get("followUp", "")
-                _seen_urls |= {norm_key(h["url"]) for hits in per_engine.values() for h in hits}
-                for s in rd.get("sources", []):
-                    _h = (urllib.parse.urlsplit(s["url"]).hostname or "").lower()
-                    if _h and ((include_domains and not any(
-                            d.lower() in _h for d in include_domains)) or
-                            (exclude_domains and any(
-                                d.lower() in _h for d in exclude_domains))):
-                        continue
-                    if norm_key(s["url"]) not in _seen_urls:
-                        _seen_urls.add(norm_key(s["url"]))
-                        per_engine.setdefault("google-ai-mode", []).append({
-                            "title": s["title"], "url": s["url"],
-                            "snippet": s.get("snippet", ""),
-                            "source": urllib.parse.urlparse(s["url"]).netloc if s.get("url") else "",
-                            "engine": "google-ai-mode",
-                            "rank": len(per_engine.get("google-ai-mode", [])),
-                        })
-        else:
-            gai_future.cancel()
+                completed = set()
+            ai_answer = ""
+            if gai_future in completed:
+                try:
+                    r = gai_future.result()
+                except BaseException:
+                    r = None
+                if r and r.get("success"):
+                    engines_used.append("google-ai-mode")
+                    rd = r["result"]
+                    ai_answer = rd.get("answer", "")
+                    follow_up = rd.get("followUp", "")
+                    _seen_urls |= {norm_key(h["url"]) for hits in per_engine.values() for h in hits}
+                    for s in rd.get("sources", []):
+                        _h = _host_of(s["url"])
+                        if _h and ((include_domains and not any(
+                                d.lower() in _h for d in include_domains)) or
+                                (exclude_domains and any(
+                                    d.lower() in _h for d in exclude_domains))):
+                            continue
+                        if norm_key(s["url"]) not in _seen_urls:
+                            _seen_urls.add(norm_key(s["url"]))
+                            per_engine.setdefault("google-ai-mode", []).append({
+                                "title": s["title"], "url": s["url"],
+                                "snippet": s.get("snippet", ""),
+                                "source": _netloc_of(s["url"]) if s.get("url") else "",
+                                "engine": "google-ai-mode",
+                                "rank": len(per_engine.get("google-ai-mode", [])),
+                            })
+            else:
+                gai_future.cancel()
+        finally:
+            if not gai_future.done():
+                gai_future.cancel()
     # Track which engines were expected but didn't contribute
-    engine_blocked = sorted(_ALL_ENGINES - set(engines_used))
+    engine_blocked = [] if google_ai_only else sorted(_ALL_ENGINES - set(engines_used))
 
     if per_engine:
         intent = detect_intent(effective_query)
