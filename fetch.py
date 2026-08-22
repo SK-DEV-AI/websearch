@@ -728,7 +728,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         # resident, seconds per page on CPU) — only for callers who
         # ask for it AND score below the requested floor. Minerva
         # never overrides a decent extraction.
-        if mineru and MINERU_ENABLED and q < (quality_floor or QUALITY_FLOOR):
+        if mineru and config.MINERU_ENABLED and q < (quality_floor or QUALITY_FLOOR):
             try:
                 from mineru_extract import extract_with_mineru
                 mr = await extract_with_mineru(raw_html, output_format=output_format)
