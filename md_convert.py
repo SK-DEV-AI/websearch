@@ -55,6 +55,47 @@ def to_markdown(
         return ""
 
 
+def _harvest_links(html: str, url: str = "", cap: int = 300) -> list[tuple[str, str]]:
+    """Absolute-resolved (text, href) pairs from source HTML, deduped by URL."""
+    try:
+        from lxml import html as LH
+        from urllib.parse import urljoin
+        doc = LH.fromstring(html)
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for a in doc.iter("a"):
+            href = (a.get("href") or "").strip()
+            if not href or href.startswith(("javascript:", "#", "mailto:")):
+                continue
+            text = " ".join(a.text_content().split())
+            if not text:
+                continue
+            absu = urljoin(url, href) if url else href
+            if absu in seen:
+                continue
+            seen.add(absu)
+            out.append((text[:200], absu))
+            if len(out) >= cap:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _ensure_links(md: str, html: str, url: str) -> str:
+    """Guarantee link coverage: trafilatura's link support is experimental
+    and dies on forum layouts (refs stripped during wild-text recovery,
+    verified 2.1.0 on phpBB — 455 anchors → 0 in output). When extraction
+    keeps less than half the page's links, append the full inventory."""
+    have = len(re.findall(r"\]\(", md))
+    links = _harvest_links(html, url)
+    if not links or have * 2 >= len(links):
+        return md
+    extra = "\n\n## Page links\n" + "\n".join(
+        f"- [{t}]({h})" for t, h in links[have:])
+    return md + extra
+
+
 def extract_and_convert(html: str, url: str = "", *, fast: bool = False,
                         include_links: bool = True, include_images: bool = True,
                         include_tables: bool = True, deduplicate: bool = True,
@@ -97,6 +138,8 @@ def extract_and_convert(html: str, url: str = "", *, fast: bool = False,
                          include_images=include_images,
                          include_tables=include_tables)
         if md:
+            if include_links:
+                md = _ensure_links(md, html, url)
             return md
     # extraction returned nothing usable — fall back to raw text
     try:
