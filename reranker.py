@@ -26,6 +26,9 @@ _PROC = None
 _LOCK = asyncio.Lock()
 _READER = None
 _WRITER = None
+_SPAWN_COOLDOWN = 120  # s: after a failed spawn (e.g. OOM-killed model load),
+# don't retry on every search — each attempt loads ~500MB into RAM before dying
+_last_spawn_fail = 0.0
 
 
 async def _close_connection():
@@ -70,8 +73,11 @@ async def _ensure_worker():
     listener exists. A flock guard prevents concurrent servers from
     double-spawning; whoever wins spawns, the rest just connect.
     """
-    global _PROC, _READER, _WRITER
+    global _PROC, _READER, _WRITER, _last_spawn_fail
     if killswitch_active():
+        return False
+    import time
+    if time.monotonic() - _last_spawn_fail < _SPAWN_COOLDOWN:
         return False
     try:
         _READER, _WRITER = await asyncio.open_unix_connection(_SOCKET_PATH, limit=2**20)
@@ -86,12 +92,19 @@ async def _ensure_worker():
             _READER, _WRITER = await asyncio.open_unix_connection(_SOCKET_PATH, limit=2**20)
             return True
         except (FileNotFoundError, ConnectionRefusedError, OSError):
+            _last_spawn_fail = time.monotonic()
             return False
     try:
         try:
             os.unlink(_SOCKET_PATH)
         except OSError:
             pass
+        # reap a previous crashed worker so it doesn't linger as a zombie
+        if _PROC is not None and _PROC.returncode is not None:
+            try:
+                _PROC.wait(timeout=1)
+            except Exception:
+                pass
         _PROC = subprocess.Popen(
             [_RERANKER_PYTHON, _RERANKER_WORKER],
             stdin=subprocess.DEVNULL,
@@ -106,9 +119,12 @@ async def _ensure_worker():
                 return True
             except (FileNotFoundError, ConnectionRefusedError, OSError):
                 await asyncio.sleep(0.1)
+        _last_spawn_fail = time.monotonic()
+        logger.warning("reranker: worker did not come up within 5s — cooldown %ds", _SPAWN_COOLDOWN)
         return False
     except Exception as e:
         logger.warning(f"reranker: start failed: {e}")
+        _last_spawn_fail = time.monotonic()
         return False
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
