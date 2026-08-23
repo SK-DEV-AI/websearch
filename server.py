@@ -103,13 +103,13 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated, next_offset, total_extracted_chars (full page size)."},
                 "focus": {"type": "string", "description": "BM25 relevance filter — extract only content blocks relevant to this query. Use ONLY to pull specific sections from a large page (e.g. focus='pricing'). On crucial pages INSTEAD omit focus and fetch the whole content. Misses drop content the page's own Ctrl-F would find (focus is semantic, not literal) — never use focus when the full content is the deliverable."},
                 "cache_ttl": {"type": "integer", "default": 3600, "description": "Cache TTL in seconds (0 = force fresh fetch). Cache keyed by URL+extraction_type+css_selector, not focus/offset."},
-                "css_selector": {"type": "string"},
+                "css_selector": {"type": "string", "description": "CSS selector — extract only the matching element's text (CDP tier only; ignored on the direct-fetch tier)"},
                 "extraction_type": {"type": "string", "enum": ["markdown","text","html"]},
                 "target_language": {"type": "string"},
                 "output_format": {"type": "string", "enum": ["markdown","txt","json","xml","csv"], "default": "markdown"},
                 "fast": {"type": "boolean"},
                 "raw": {"type": "boolean", "description": "Skip CDP/trafilatura, return raw text directly (use for GitHub raw files, pastebin, etc.)"},
-                "network_idle": {"type": "boolean", "default": True, "description": "Wait for network idle before extracting (slower but captures JS-rendered content)"},
+                "network_idle": {"type": "boolean", "default": True, "description": "Wait for network idle before extracting (slower but captures JS-rendered content; CDP tier only)"},
                    "include_images": {"type": "boolean", "default": True, "description": "Include image captions/alt text"},
                    "include_links": {"type": "boolean", "default": True, "description": "Include hyperlinks in output"},
                    "include_formatting": {"type": "boolean", "default": True, "description": "Preserve text formatting (bold, italic, etc)"},
@@ -118,6 +118,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                     "end_line": {"type": "integer", "description": "1-based end line (inclusive). Use with start_line for targeted reading."},
                     "quality_floor": {"type": "number", "default": 0, "description": "Min acceptable extraction quality 0-1 (length+density+structure score); below it the result is flagged low_quality"},
                     "mineru": {"type": "boolean", "default": False, "description": "Opt-in MinerU-HTML SLM re-extraction for low-quality pages (heavy, CPU, seconds per page)"},
+                    "cookies": {"type": "array", "items": {"type": "object"}, "description": "Optional cookies injected into the request: [{name, value, domain?, path?}] (e.g. session cookie for a page behind login)"},
                     },
                 "required": ["url"]}),
         Tool(name="crawl",
@@ -400,7 +401,8 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 # doomed tier-1 round-trip, solve straight in browser
                 r = None
             else:
-                cookies = ghost.vault(host) if route == "warm" else None
+                # explicit model-supplied cookies win over the ghost vault
+                cookies = arguments.get("cookies") or (ghost.vault(host) if route == "warm" else None)
                 r = await fetch_url(url,
                         max_chars=max_chars,
                         offset=offset,
@@ -452,7 +454,11 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                         or "network security" in content_lower or "rate limit" in content_lower
                         or "too many requests" in content_lower
                     )
-                ) or (len(content) < 100)
+                ) or (len(content) < 100 and (
+                    # tiny-but-real pages (small HTML, text extracted) don't
+                    # benefit from a browser re-render — skip the wasted CDP
+                    # round-trip; big HTML with no text is a JS shell → retry
+                    not r.get("raw_html_len") or r.get("raw_html_len", 0) > 5000))
 
             # ── Tier-2 browser solve + solve-and-bounce handoff ─────
             if should_retry and ghost.tier_allowed(host, "t2"):

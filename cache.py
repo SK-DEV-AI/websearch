@@ -97,6 +97,22 @@ async def get_cached(url: str, extraction_type: str = "markdown",
         }
 
 
+async def get_previous(url: str, extraction_type: str = "markdown",
+                       css_selector: str | None = None) -> dict | None:
+    """Most recent entry for this key regardless of age — change tracking
+    diffs a fresh fetch against whatever we saw last time, even if stale."""
+    key = _cache_key(url, extraction_type, css_selector)
+    db_path = await _ensure_db()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT content, fetched_at FROM fetch_cache WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {"content": row["content"], "fetched_at": row["fetched_at"]}
+
+
 async def set_cached(url: str, content: str,
                      extraction_type: str = "markdown",
                      css_selector: str | None = None,

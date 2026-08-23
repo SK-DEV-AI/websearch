@@ -6,6 +6,7 @@ import logging
 import random
 import re
 import time
+import difflib
 from typing import Any
 
 import trafilatura
@@ -207,6 +208,22 @@ def _extract_docx(content: bytes, max_chars: int = 50000) -> str:
         return f"[DOCX extraction error: {e}]"
 
 
+def _archive_extract(content: str, original_url: str) -> tuple[str, str]:
+    """Shared tail for archived-page fallbacks: trafilatura → markdown.
+    Returns (content, title); either may be empty."""
+    html_ext = trafilatura.extract(content, output_format="html", with_metadata=False,
+                                    include_links=False, include_tables=False,
+                                    url=original_url)
+    final_content = md_convert.to_markdown(
+        html_ext, include_links=False, include_tables=False) if html_ext else ""
+    if not final_content:
+        final_content = trafilatura.extract(content, output_format="txt",
+                                              with_metadata=False, url=original_url) or ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", content, re.S | re.I)
+    title = m.group(1).strip()[:200] if m else ""
+    return final_content.strip(), title
+
+
 async def _try_wayback(original_url: str) -> dict | None:
     """Check Wayback Machine for an archived copy of original_url.
 
@@ -244,19 +261,7 @@ async def _try_wayback(original_url: str) -> dict | None:
             return None
         # Run through trafilatura like the normal path — model gets clean text, not raw HTML
         # steal C1: trafilatura extracts, html-to-markdown serializes
-        html_ext = trafilatura.extract(content, output_format="html", with_metadata=False,
-                                        include_links=False, include_tables=False,
-                                        url=original_url)
-        title = ""
-        final_content = md_convert.to_markdown(
-            html_ext, include_links=False, include_tables=False) if html_ext else ""
-        if not final_content:
-            final_content = trafilatura.extract(content, output_format="txt",
-                                                  with_metadata=False, url=original_url) or ""
-        m = re.search(r"<title[^>]*>(.*?)</title>", content, re.S | re.I)
-        if m and not title:
-            title = m.group(1).strip()[:200]
-        final_content = final_content.strip()
+        final_content, title = _archive_extract(content, original_url)
         # Format a human-readable date from the timestamp
         date_str = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else ts
         return {
@@ -269,6 +274,44 @@ async def _try_wayback(original_url: str) -> dict | None:
             "snapshot_timestamp": ts,
             "title": title,
             "method": "wayback",
+        }
+    except Exception:
+        return None
+
+
+async def _try_archive_today(original_url: str) -> dict | None:
+    """Second dead-page source: newest archive.today snapshot.
+    /newest/<url> 302s to the latest capture; no-capture lands on a
+    near-empty search page whose extraction stays under our length floor."""
+    try:
+        from config import get_http_client
+        c = get_http_client()
+        r = await safe_fetch(c, f"https://archive.ph/newest/{original_url}", timeout=15)
+        # archive.today serves full snapshot bodies even under its
+        # aggressive 429 rate-limiting — only hard-fail on real errors
+        if r.status_code not in (200, 429):
+            return None
+        content = r.text
+        if _bomb_capped(content):
+            return None
+        final_content, _title = _archive_extract(content, original_url)
+        if not final_content or len(final_content) < 50:
+            return None
+        m = re.search(r"<title[^>]*>(.*?)</title>", content, re.S | re.I)
+        title = m.group(1).strip()[:200] if m else ""
+        # capture timestamp rides in the final redirect URL: .../YYYYMMDDHHMMSS/...
+        ts_m = re.search(r"/((?:19|20)\d{12})/", str(r.url))
+        date_str = (f"{ts_m.group(1)[:4]}-{ts_m.group(1)[4:6]}-{ts_m.group(1)[6:8]}"
+                    if ts_m else "snapshot")
+        return {
+            "success": True,
+            "content": final_content,
+            "url": original_url,
+            "status": 200,
+            "cached_from": f"archive.today ({date_str})",
+            "snapshot_url": str(r.url),
+            "title": title,
+            "method": "archive_today",
         }
     except Exception:
         return None
@@ -446,7 +489,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 if redir_err:
                     return {"success": False, "url": url, "error": redir_err}
             except Exception as e:
-                wayback = await _try_wayback(url)
+                wayback = await _try_wayback(url) or await _try_archive_today(url)
                 if wayback:
                     return wayback
                 return {"success": False, "url": url, "error": f"Fetch failed: {e}"}
@@ -482,7 +525,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                             offset, max_chars, method="proxy")
                 except Exception:
                     pass
-            wayback = await _try_wayback(url)
+            wayback = await _try_wayback(url) or await _try_archive_today(url)
             if wayback:
                 return wayback
             # No snapshot — let content extraction continue for error page info
@@ -655,8 +698,12 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     "error": f"Unknown bot challenge detected ({raw_len} bytes HTML, {len(full_content)} chars text)"}
 
         if min_output_size and len(full_content) < min_output_size:
+            # Page fetched and parsed fine — genuinely small content.
+            # raw_html_len lets server-side escalation tell this apart
+            # from a JS shell that could yield more after rendering.
             return {"success": False, "url": url,
-                    "error": f"Content too short ({len(full_content)} < {min_output_size} chars)"}
+                    "error": f"Content too short ({len(full_content)} < {min_output_size} chars)",
+                    "content": full_content, "raw_html_len": len(raw_html)}
 
         meta_str = trafilatura.extract(raw_html, output_format='json', with_metadata=True,
                                        include_links=False, include_tables=False,
@@ -704,6 +751,21 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         full_content = _drop_citation_markers(full_content)
         full_content = _token_polish(full_content)
 
+        # Change tracking: diff against whatever we cached last time
+        changed_info = None
+        try:
+            prev = await cache_mod.get_previous(url, extraction_type=extraction_type)
+            if prev and prev.get("content") is not None \
+                    and prev["content"] != full_content:
+                ratio = difflib.SequenceMatcher(
+                    None, prev["content"][:20000], full_content[:20000]).ratio()
+                changed_info = {"changed_pct": round((1 - ratio) * 100, 1),
+                                "previous_fetch": time.strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ",
+                                    time.gmtime(prev["fetched_at"]))}
+        except Exception as e:
+            logger.debug("fetch: change-tracking diff failed for %s: %s", url, e)
+
         # Cache the full content
         if cache_ttl > 0:
             _cache_task = asyncio.ensure_future(cache_mod.set_cached(
@@ -718,6 +780,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                           title or meta_title or meta.get("title", ""),
                                           {k: v for k, v in meta.items() if v}, "",
                                           offset, max_chars, method="httpx")
+        if changed_info:
+            result["changed"] = changed_info
         result["raw_size"] = raw_len
         q = _extraction_quality(full_content, title=title or meta_title or "",
                                 url=url, raw_html=(raw_html or "").encode("utf-8", errors="replace") if isinstance(raw_html, str) else (raw_html or b""))
