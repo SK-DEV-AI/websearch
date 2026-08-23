@@ -203,6 +203,9 @@ async def _get_ai_summary(page, query: str) -> dict | None:
     answers_url = info.get("answers_url")
     if answers_url:
         try:
+            # defense-in-depth: page-controlled URL still passes SSRF gate
+            from security import validate_url
+            await validate_url(answers_url)
             # "load" would block on reddit's heavy homepage scripts; the
             # shadow-root stability poll below handles the streaming wait
             await page.goto(answers_url, wait_until="domcontentloaded", referrer=search_url)
