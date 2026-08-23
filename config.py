@@ -142,10 +142,21 @@ def get_http_client() -> httpx.AsyncClient:
     if _http_client is None or _http_client.is_closed:
         with _http_client_lock:
             if _http_client is None or _http_client.is_closed:
+                from security import PinningNetworkBackend
+                import httpcore
+                transport = httpx.AsyncHTTPTransport(
+                    limits=httpx.Limits(
+                        max_keepalive_connections=10, max_connections=20))
+                # httpx 0.28 doesn't expose the pool's network_backend;
+                # rebuild its pool with our DNS-rebinding pinning backend
+                transport._pool = httpcore.AsyncConnectionPool(
+                    network_backend=PinningNetworkBackend(),
+                    max_keepalive_connections=10,
+                    max_connections=20)
                 _http_client = httpx.AsyncClient(
                     timeout=30.0,
                     follow_redirects=True,
-                    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+                    transport=transport,
                 )
     return _http_client
 

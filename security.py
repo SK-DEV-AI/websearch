@@ -1,6 +1,7 @@
 """URL validation with SSRF protection — private IP blocking, DNS rebinding detection, scheme validation."""
 
 import asyncio
+import httpcore
 import ipaddress
 import re
 from typing import Any
@@ -42,6 +43,49 @@ _PRIVATE_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
 class SecurityError(ValueError):
     """Raised when input fails security validation."""
     pass
+
+
+# ── DNS-rebinding TOCTOU pinning ─────────────────────────────────
+# validate_url resolves and checks a hostname, but the HTTP client
+# re-resolves at connect time — a short-TTL DNS record can flip a public
+# answer to a private one inside that window (classic rebinding TOCTOU).
+# validate_url stores its validated IPs; PinningNetworkBackend is wired
+# into the shared httpx clients so connect_tcp uses exactly those IPs,
+# keeping the hostname for TLS SNI/cert validation. Unvalidated hosts
+# pass through untouched; pins expire so behavior degrades to plain
+# resolution rather than failing.
+
+_PIN_TTL = 60.0  # s — covers the validate→connect window
+_pinned: dict[str, tuple[float, list[str]]] = {}
+
+
+def _pin_host(hostname: str, ips: list[str]) -> None:
+    import time as _t
+    _pinned[hostname] = (_t.monotonic(), list(ips))
+
+
+class PinningNetworkBackend(httpcore.AsyncNetworkBackend):
+    """httpcore network backend that connects to validated IPs."""
+
+    def __init__(self) -> None:
+        self._inner = httpcore.AnyIOBackend()
+
+    async def connect_tcp(self, host, port, timeout=None,
+                          local_address=None, socket_options=None):
+        entry = _pinned.get(host)
+        if entry:
+            import time as _t
+            stamp, ips = entry
+            if _t.monotonic() - stamp <= _PIN_TTL and ips:
+                idx = hash((host, port)) % len(ips) if len(ips) > 1 else 0
+                return await self._inner.connect_tcp(
+                    ips[idx], port, timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options)
+        return await self._inner.connect_tcp(
+            host, port, timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options)
 
 
 def _normalize_ip_notation(host: str) -> str | None:
@@ -206,6 +250,10 @@ async def validate_url(url: str, allow_internal: bool = False) -> str:
                 raise SecurityError(
                     f"URL resolves to internal IP ({hostname} -> {ip_str})"
                 )
+    # All resolved IPs public — pin them so the HTTP layer connects to
+    # exactly these addresses instead of re-resolving (DNS-rebinding TOCTOU)
+    if ips:
+        _pin_host(hostname, ips)
 
     return url
 
