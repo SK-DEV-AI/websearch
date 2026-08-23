@@ -11,7 +11,7 @@ from security import validate_url, SecurityError
 
 
 async def cdpa11y_snapshot(url: str, verbose: bool = False, max_chars: int = 10000,
-                           depth: int = 5, boxes: bool = False) -> dict:
+                           depth: int = 5) -> dict:
     try:
         await validate_url(url)
         page = await _get_optimized_page(block_resources=False)
@@ -20,16 +20,13 @@ async def cdpa11y_snapshot(url: str, verbose: bool = False, max_chars: int = 100
             await page.wait_for_load_state("domcontentloaded", timeout=10)
             await asyncio.sleep(0.3)
 
-            # Tries getFullAXTree first (real AX tree), falls back to Page.captureSnapshot
+            # Real AX tree (protocol param is "depth" — verified). Retry at
+            # full depth before giving up; Page.captureSnapshot is NOT a
+            # fallback (it only emits MHTML, not an accessibility tree).
             nodes = await page.get_ax_tree(depth=depth)
-            if nodes:
-                lines = _format_ax_nodes(nodes)
-            else:
-                snap_kwargs: dict = {"mode": "ai"}
-                if boxes:
-                    snap_kwargs["boxes"] = True
-                raw = await page.aria_snapshot(**snap_kwargs)
-                lines = raw.split("\n") if raw else []
+            if not nodes:
+                nodes = await page.get_ax_tree(depth=100)
+            lines = _format_ax_nodes(nodes) if nodes else []
 
             if not lines or all(not l.strip() for l in lines):
                 html_c = await page.document_html()
@@ -95,11 +92,8 @@ def _format_ax_nodes(nodes: list[dict], depth: int = 0) -> list[str]:
 async def screenshot_cdp(url: str, full_page: bool = True,
                          clip_x: float = 0, clip_y: float = 0,
                          clip_width: float = 0, clip_height: float = 0,
-                         scale: str = "css", animations: str = "allow",
                          quality: int | None = None,
-                         image_type: str = "png",
-                         omit_background: bool = False,
-                         caret: str = "initial") -> dict:
+                         image_type: str = "png") -> dict:
     try:
         await validate_url(url)
         page = await _get_optimized_page(block_resources=False)
@@ -108,17 +102,9 @@ async def screenshot_cdp(url: str, full_page: bool = True,
             await page.wait_for_load_state("domcontentloaded", timeout=10)
             await asyncio.sleep(0.3)
             ss_kwargs: dict = {"captureBeyondViewport": full_page, "format": image_type}
-            if omit_background:
-                ss_kwargs["omitBackground"] = True
-            if caret in ("hide", "initial"):
-                ss_kwargs["caret"] = caret
             if clip_width > 0 and clip_height > 0:
                 ss_kwargs["clip"] = {"x": clip_x, "y": clip_y,
                                      "width": clip_width, "height": clip_height}
-            if scale in ("css", "device"):
-                ss_kwargs["scale"] = scale
-            if animations in ("allow", "disabled"):
-                ss_kwargs["animations"] = animations
             if quality is not None and image_type == "jpeg":
                 ss_kwargs["quality"] = quality
             b64_bytes = await page.screenshot(**ss_kwargs)

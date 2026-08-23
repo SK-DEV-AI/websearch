@@ -16,6 +16,7 @@ import base64
 import json
 import logging
 import re
+import time
 from typing import Any, Callable
 
 import httpx
@@ -76,10 +77,10 @@ class CDPSession:
             return False
 
         try:
-            self._ws = await asyncio.wait_for(
-                websockets.connect(ws_url, max_size=4 * 1024 * 1024, open_timeout=10),
-                timeout=12,
-            )
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(ws_url, max_size=64 * 1024 * 1024, open_timeout=10),
+                    timeout=12,
+                )
         except Exception as e:
             logger.error("CDP WebSocket connect failed: %s", e)
             return False
@@ -250,22 +251,35 @@ class CDPPage:
 
     async def _init(self):
         """Enable page-level CDP events and register navigation + lifecycle tracking."""
-        # Track main frame URL changes
+        # Track main frame URL + loaderId changes (loaderId gates lifecycle
+        # waits so stale events from the previous document never satisfy them)
         def on_frame_navigated(params, sess_id):
             if sess_id == self._session_id:
                 frame = params.get("frame", {})
                 if frame.get("id") == frame.get("loaderId"):
                     self._url = frame.get("url", self._url)
+                    self._cur_loader = frame.get("loaderId")
 
         self._nav_listener = on_frame_navigated
         self._session.on("Page.frameNavigated", on_frame_navigated)
 
-        # Lifecycle events: resolve futures per event name
+        # Lifecycle events: resolve futures per event name.
+        # Every event is ALSO timestamped in _lifecycle_seen so a waiter
+        # registered after the event already fired returns immediately
+        # instead of burning its full timeout on a fast page.
         self._lifecycle_futures: dict[str, asyncio.Future] = {}
+        self._lifecycle_seen: dict[str, float] = {}
+        self._lifecycle_by_loader: dict[str, float] = {}
+        self._cur_loader: str | None = None
 
         def on_lifecycle(params, sess_id):
             if sess_id == self._session_id:
                 name = params.get("name", "")
+                now = time.monotonic()
+                self._lifecycle_seen[name] = now
+                loader = params.get("loaderId")
+                if loader:
+                    self._lifecycle_by_loader[f"{name}:{loader}"] = now
                 fut = self._lifecycle_futures.get(name)
                 if fut and not fut.done():
                     fut.set_result(True)
@@ -296,6 +310,7 @@ class CDPPage:
         params = {"url": url}
         if referrer:
             params["referrer"] = referrer
+        self._nav_started = time.monotonic()
         result = await self._session.send(
             "Page.navigate", params, session_id=self._session_id, timeout=timeout
         )
@@ -309,7 +324,29 @@ class CDPPage:
         return result
 
     async def _wait_lifecycle(self, event_name: str, timeout: float):
-        """Wait for a *lifecycleEvent* (event-driven, no polling)."""
+        """Wait for a *lifecycleEvent* (event-driven, no polling).
+
+        Loader-aware when the current document's loaderId is known: an event
+        from a previous document (about:blank's own load sequence) can never
+        satisfy the wait — only same-loader events or, without a known
+        loader, events newer than nav start do.
+        """
+        nav_start = getattr(self, "_nav_started", 0.0)
+        cur = getattr(self, "_cur_loader", None)
+        seen_at = None
+        if cur is not None:
+            seen_at = self._lifecycle_by_loader.get(f"{event_name}:{cur}")
+            if seen_at is None:
+                # current doc may predate our listener; accept any event of
+                # this name newer than nav start only if it matches no other
+                # live loader — conservative fallback
+                seen_at = self._lifecycle_seen.get(event_name)
+                if seen_at is not None and seen_at < nav_start:
+                    seen_at = None
+        else:
+            seen_at = self._lifecycle_seen.get(event_name)
+        if seen_at is not None and seen_at >= nav_start:
+            return
         # Clear any stale future from a prior navigation
         old = self._lifecycle_futures.pop(event_name, None)
         if old and not old.done():
@@ -335,12 +372,19 @@ class CDPPage:
         ``"networkidle"`` uses ``networkAlmostIdle`` from lifecycle events.
         """
         LIFECYCLE_MAP = {
-            "commit": "commit",
+            # "commit" is NOT in the map: Chrome never emits a "commit"
+            # lifecycleEvent (verified by raw event trace on Helium 151 —
+            # sequence is init → DOMContentLoaded → load), so waiting for
+            # it burned the full timeout on EVERY navigation. Playwright's
+            # "commit" ≈ Page.navigate having returned, which goto() already
+            # guarantees before calling this.
             "domcontentloaded": "DOMContentLoaded",
             "load": "load",
             "networkidle": "networkAlmostIdle",
         }
         name = LIFECYCLE_MAP.get(state)
+        if state == "commit":
+            return
         if name:
             await self._wait_lifecycle(name, timeout)
         else:
@@ -582,10 +626,12 @@ class CDPPage:
     async def disable_images(self):
         """Skip decoding of avif/webp images at the engine level (RAM saver).
 
-        NOTE: ``Emulation.setDisabledImageTypes`` accepts ONLY ``avif`` and
-        ``webp`` (protocol-verified — png/jpeg/gif are rejected). For
-        text-only fetches pair with ``set_blocked_resources`` to keep image
-        *bytes* off the wire too. Call before ``goto()``.
+        NOTE: ``Emulation.setDisabledImageTypes`` accepts ONLY ``avif``
+        and ``webp`` on this browser — upstream enum also lists ``jxl``
+        (protocol master), but Helium 151 rejects it with -32602.
+        png/jpeg/gif are rejected everywhere. For text-only fetches pair
+        with ``set_blocked_resources`` to keep image *bytes* off the
+        wire too. Call before ``goto()``.
         """
         await self._session.send(
             "Emulation.setDisabledImageTypes",
@@ -628,7 +674,7 @@ class CDPPage:
                 session_id=self._session_id, timeout=5,
             )
             result = await self._session.send(
-                "Accessibility.getFullAXTree", {"max_depth": depth},
+                "Accessibility.getFullAXTree", {"depth": depth},
                 session_id=self._session_id, timeout=10,
             )
             return result.get("nodes", [])

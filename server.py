@@ -152,12 +152,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "clip_y": {"type": "number", "description": "Clip region Y offset for screenshot"},
                 "clip_width": {"type": "number", "description": "Clip region width for screenshot"},
                 "clip_height": {"type": "number", "description": "Clip region height for screenshot"},
-                "scale": {"type": "string", "enum": ["css", "device"], "default": "css", "description": "Screenshot scale: css (default DPR) or device (device DPR)"},
-                "animations": {"type": "string", "enum": ["allow", "disabled"], "default": "allow", "description": "Whether to animate elements in screenshot"},
-                "omit_background": {"type": "boolean", "default": False, "description": "Transparent background (PNG only)"},
-                "caret": {"type": "string", "enum": ["hide", "initial"], "default": "initial", "description": "Whether to hide the caret before screenshot"},
                 "depth": {"type": "integer", "description": "ARIA snapshot tree depth limit"},
-                "boxes": {"type": "boolean", "default": False, "description": "Include bounding boxes in ARIA snapshot"},
                 "verbose": {"type": "boolean", "default": False, "description": "Show all ARIA roles (not just interactive)"},
                 "start_line": {"type": "integer", "description": "1-based start line for snapshot text range"},
                 "end_line": {"type": "integer", "description": "1-based end line (inclusive) for snapshot text range"}},
@@ -568,20 +563,15 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             if cap_type in ("snapshot","both"):
                 snap = await cdpa11y_snapshot(url, verbose=bool(arguments.get("verbose",False)),
                     max_chars=safe_int(arguments.get("max_chars",10000)),
-                    depth=arguments.get("depth") or 5,
-                    boxes=bool(arguments.get("boxes",False)))
+                    depth=arguments.get("depth") or 5)
             if cap_type in ("screenshot","both"):
                 ss = await screenshot_cdp(url, full_page=full,
                     clip_x=safe_float(arguments.get("clip_x",0)),
                     clip_y=safe_float(arguments.get("clip_y",0)),
                     clip_width=safe_float(arguments.get("clip_width",0)),
                     clip_height=safe_float(arguments.get("clip_height",0)),
-                    scale=str(arguments.get("scale","css")),
-                    animations=str(arguments.get("animations","allow")),
                     quality=arguments.get("quality"),
-                    image_type=str(arguments.get("image_type","png")),
-                    omit_background=bool(arguments.get("omit_background",False)),
-                    caret=str(arguments.get("caret","initial")))
+                    image_type=str(arguments.get("image_type","png")))
             if cap_type == "snapshot":
                 r = snap
             elif cap_type == "both":
