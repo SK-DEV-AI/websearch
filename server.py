@@ -18,13 +18,9 @@ from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 from config import MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client, _KeyRotator
 from errors import annotate as _err_annotate, classify_exception as _err_exc
 from ghost_state import CHALLENGE, CONTENT_OK, classify, ghost
-from search_ddg import ddgs_extract
 from fetch import fetch_url, scrapling_stealthy_fetch
-from cache import clear_cache
-from check_links import check_links
-from crawl import crawl_url
 from pdf_extract import extract_pdf
-from screenshot import cdpa11y_snapshot, screenshot_cdp
+from screenshot import cdpa11y_snapshot
 from wikipedia import (search_wikipedia, fetch_wikipedia_summary, fetch_wikipedia_summary_rest,
                        fetch_wikipedia_categories, fetch_wikipedia_links, fetch_wikipedia_extlinks,
                        fetch_wikipedia_pageviews, fetch_wikipedia_revisions,
@@ -46,10 +42,10 @@ Multi-engine search + content extraction.
 ## When to use what
 
 - **search** for finding information (9 engines, dedup+rerank+synthesis). **synthesize=false** when you only need raw results. Set `domain` for vertical search (code, academic, finance, health, travel, legal).
-- **fetch** to read a specific page (auto-CDP fallback on blocked pages. PDF/EPUB/DOCX support). **ddgs_extract** for a fast lightweight skim.
-- **screenshot type=snapshot** for LLM-readable page text. **type=screenshot** for visual capture.
+- **fetch** to read a specific page (auto-CDP fallback on blocked pages. PDF/EPUB/DOCX support).
+- **screenshot** for LLM-readable page text (ARIA snapshot).
 - **extract** for structured JSON: **strategy=css** fastest+free (simple fields), **strategy=llm** works on any content (costs quota).
-- **crawl** for site exploration (BFS/DFS). **map_site** for sitemap discovery.
+- **map_site** for sitemap discovery.
 - **pdf_extract** for PDFs (OCR+formulas+tables). **wikipedia/arxiv** for those dedicated sources.
 
 ## Pipeline (search)
@@ -121,47 +117,20 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                     "cookies": {"type": "array", "items": {"type": "object"}, "description": "Optional cookies injected into the request: [{name, value, domain?, path?}] (e.g. session cookie for a page behind login)"},
                     },
                 "required": ["url"]}),
-        Tool(name="crawl",
-            description="BFS/DFS deep crawl. Returns per-page markdown + combined text. e.g. crawl(url='https://example.com', max_depth=2)",
-            input_schema={"type": "object", "properties": {
-                "url": {"type": "string"}, "max_depth": {"type": "integer", "default": 1},
-                "max_pages": {"type": "integer", "default": 10},
-                "extract_links": {"type": "boolean", "default": True},
-                "strategy": {"type": "string", "enum": ["bfs","dfs"], "default": "bfs"},
-                "exclude_domains": {"type": "array", "items": {"type": "string"}},
-                "content_filter": {"type": "string", "enum": ["","pruning","bm25","bm25_hq","cosine"]},
-                "filter_query": {"type": "string"},
-                "page_timeout": {"type": "integer", "default": 60000, "description": "Page load timeout in ms"},
-                "check_robots_txt": {"type": "boolean", "default": False},
-                "capture_console_messages": {"type": "boolean", "default": False, "description": "Capture console.log output"},
-                "capture_network_requests": {"type": "boolean", "default": False},
-                "css_selector": {"type": "string", "description": "CSS selector to target specific content"},
-                "bypass_cache": {"type": "boolean", "default": False, "description": "Force fresh crawl, skip cache"},
-                 "exclude_all_images": {"type": "boolean", "default": False},
-                 "exclude_external_images": {"type": "boolean", "default": False},
-                 "min_content_chars": {"type": "integer", "default": 0, "description": "Adaptive crawl: prune result pages whose markdown is shorter than this many chars (nav shells, redirect stubs, empty JS renders)"}},
-                 "required": ["url"]}),
           Tool(name="screenshot",
-            description="Screenshot or ARIA accessibility snapshot (AI-optimized for LLMs). Use type=snapshot for LLM-readable text, type=screenshot for visual capture. start_line/end_line for range reads. e.g. screenshot(url='https://example.com', type='snapshot')",
+            description="ARIA accessibility snapshot (LLM-readable page text). e.g. screenshot(url='https://example.com')",
             input_schema={"type": "object", "properties": {
-                "url": {"type": "string"}, "full_page": {"type": "boolean", "default": True},
-                "type": {"type": "string", "enum": ["screenshot","snapshot","both"]},
+                "url": {"type": "string"},
                 "max_chars": {"type": "integer", "default": 10000},
-                "quality": {"type": "integer", "description": "JPEG quality 1-100"},
-                "image_type": {"type": "string", "enum": ["png", "jpeg"], "default": "png", "description": "Screenshot image format"},
-                "clip_x": {"type": "number", "description": "Clip region X offset for screenshot"},
-                "clip_y": {"type": "number", "description": "Clip region Y offset for screenshot"},
-                "clip_width": {"type": "number", "description": "Clip region width for screenshot"},
-                "clip_height": {"type": "number", "description": "Clip region height for screenshot"},
                 "depth": {"type": "integer", "description": "ARIA snapshot tree depth limit"},
                 "verbose": {"type": "boolean", "default": False, "description": "Show all ARIA roles (not just interactive)"},
                 "start_line": {"type": "integer", "description": "1-based start line for snapshot text range"},
                 "end_line": {"type": "integer", "description": "1-based end line (inclusive) for snapshot text range"}},
                 "required": ["url"]}),
          Tool(name="wikipedia",
-            description="Search Wikipedia: articles, summaries, geosearch, random. Actions: search, summary (REST API v1 fast), summary_action (Action API with images/sections), categories, links, extlinks, categorymembers, pageviews, revisions, backlinks, recentchanges. e.g. wikipedia(query='Python', action='summary')",
+            description="Search Wikipedia: articles, summaries, categories, links, pageviews. e.g. wikipedia(query='Python', action='summary')",
             input_schema={"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["search","summary","summary_action","geosearch","random","categories","links","extlinks","categorymembers","pageviews","revisions","backlinks","recentchanges","langlinks","allpages"], "default": "search", "description": "search=find articles, summary=REST fast extract, summary_action=Action API+images, categories=list page cats, links=page links, extlinks=external links, categorymembers=pages in cat, pageviews=traffic stats, revisions=edit history, backlinks=what links here, recentchanges=recent edits, geosearch=near coordinates, random=random pages, langlinks=cross-lang links, allpages=list all pages"},
+                "action": {"type": "string", "enum": ["search","summary","summary_action","categories","links","pageviews"], "default": "search", "description": "search=find articles, summary=REST fast extract, summary_action=Action API+images, categories=list page cats, links=page links, pageviews=traffic stats"},
                 "query": {"type": "string"},
                 "count": {"type": "integer", "default": 3},
                 "language": {"type": "string", "default": "en"},
@@ -196,25 +165,6 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "same_domain": {"type": "boolean", "default": True, "description": "Only include URLs from the same domain"},
                  "exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex patterns to exclude matching URLs"}},
                  "required": ["url"]}),
-         Tool(name="check_links",
-            description="Dead-link detection: probe a batch of URLs (HEAD with GET fallback, bounded concurrency) and classify each as ok/gone/broken/blocked/rate_limited/timeout/ssl/dns/server_error. SSRF-validated; internal targets and media/archive extensions are skipped and reported. e.g. check_links(urls=['https://example.com/a','https://example.com/b']) or check_links(links=[...]) with concurrency=10, timeout=8",
-            input_schema={"type": "object", "properties": {
-                "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs to probe (alias: links)"},
-                "links": {"type": "array", "items": {"type": "string"}},
-                "concurrency": {"type": "integer", "default": 10, "description": "Max parallel probes (1-25)"},
-                "timeout": {"type": "number", "default": 8, "description": "Per-request timeout in seconds"}},
-                "required": []}),
-         Tool(name="clear_cache",
-            description="Explicit fetch-cache invalidation for fast-moving topics. clear_cache() wipes all entries; clear_cache(url='https://x/y') drops that exact URL (all extraction variants); clear_cache(prefix='https://example.com/') drops everything under a prefix. Returns deleted count + scope.",
-            input_schema={"type": "object", "properties": {
-                "url": {"type": "string"},
-                "prefix": {"type": "string"}},
-                "required": []}),
-         Tool(name="ddgs_extract",
-            description="Lightweight URL content extraction via DuckDuckGo's extract endpoint. Faster than fetch for simple pages — markdown or plain text. Best for search snippets and quick page reads where trafilatura is overkill. e.g. ddgs_extract(url='https://example.com')",
-            input_schema={"type": "object", "properties": {
-                "url": {"type": "string"}, "extract_type": {"type": "string", "enum": ["markdown","text_plain","raw"], "default": "markdown"}},
-                "required": ["url"]}),
          Tool(name="extract",
             description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Persistent cache — repeat calls free. For LLM strategy, describe what you want and get clean JSON back. For CSS strategy, provide field names (fastest, free). For raw page content, use `fetch` instead. Examples: extract(url='...', instruction='extract product name and price') or extract(url='...', fields=['name','price'], strategy='css')",
             input_schema={"type": "object", "properties": {
@@ -538,52 +488,12 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                     r["content"] = "\n".join(all_lines[start_line - 1:])
                 r["returned_lines"] = r["content"].count("\n") + 1
             return _res(r)
-        elif name == "crawl":
-            r = await crawl_url(arguments["url"],
-                max_depth=safe_int(arguments.get("max_depth",1)),
-                max_pages=safe_int(arguments.get("max_pages",10)),
-                extract_links=bool(arguments.get("extract_links",True)),
-                strategy=str(arguments.get("strategy","bfs")),
-                css_selector=str(arguments.get("css_selector","")),
-                exclude_domains=arguments.get("exclude_domains"),
-                content_filter=str(arguments.get("content_filter","")),
-                filter_query=str(arguments.get("filter_query","")),
-                page_timeout=safe_int(arguments.get("page_timeout",60000)),
-                check_robots_txt=bool(arguments.get("check_robots_txt",False)),
-                capture_console_messages=bool(arguments.get("capture_console_messages",False)),
-                capture_network_requests=bool(arguments.get("capture_network_requests",False)),
-                bypass_cache=bool(arguments.get("bypass_cache",False)),
-                exclude_all_images=bool(arguments.get("exclude_all_images",False)),
-                exclude_external_images=bool(arguments.get("exclude_external_images",False)),
-                min_content_chars=safe_int(arguments.get("min_content_chars",0)),
-                cdp_url=HELIUM_CDP)
-            return _res(r)
         elif name == "screenshot":
-            url = arguments["url"]
-            cap_type = str(arguments.get("type","screenshot"))
-            if cap_type not in ("screenshot", "snapshot", "both"):
-                return _res({"success": False, "error": f"invalid type {cap_type!r}; expected screenshot, snapshot, or both"})
-            full = bool(arguments.get("full_page",True))
-            snap = None
-            ss = None
-            if cap_type in ("snapshot","both"):
-                snap = await cdpa11y_snapshot(url, verbose=bool(arguments.get("verbose",False)),
-                    max_chars=safe_int(arguments.get("max_chars",10000)),
-                    depth=arguments.get("depth") or 5)
-            if cap_type in ("screenshot","both"):
-                ss = await screenshot_cdp(url, full_page=full,
-                    clip_x=safe_float(arguments.get("clip_x",0)),
-                    clip_y=safe_float(arguments.get("clip_y",0)),
-                    clip_width=safe_float(arguments.get("clip_width",0)),
-                    clip_height=safe_float(arguments.get("clip_height",0)),
-                    quality=arguments.get("quality"),
-                    image_type=str(arguments.get("image_type","png")))
-            if cap_type == "snapshot":
-                r = snap
-            elif cap_type == "both":
-                r = {"screenshot": ss, "snapshot": snap}
-            else:
-                r = ss
+            snap = await cdpa11y_snapshot(url=str(arguments["url"]),
+                verbose=bool(arguments.get("verbose",False)),
+                max_chars=safe_int(arguments.get("max_chars",10000)),
+                depth=arguments.get("depth") or 5)
+            r = snap
             # Line range slicing for snapshot content (cdpa11y_snapshot returns "snapshot", pdf extract "content")
             text_key = None
             if isinstance(r, dict):
@@ -680,12 +590,6 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 raw_query=str(arguments.get("raw_query","")))
             return _res({"success": True, **r})
 
-        elif name == "ddgs_extract":
-            r = await ddgs_extract(url=str(arguments.get("url", "")),
-                extract_type=str(arguments.get("extract_type", "markdown")))
-            if r is None:
-                return _res({"success": False, "error": "ddgs_extract: extraction returned no content (URL unreachable or blocked)"})
-            return _res({"success": True, "result": r})
         elif name == "extract":
             r = await extract_content(
                 url=str(arguments["url"]),
@@ -720,18 +624,6 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 include_links=bool(arguments.get("include_links",True)),
                 same_domain=bool(arguments.get("same_domain",True)),
                 exclude_patterns=arguments.get("exclude_patterns"))
-            return _res(r)
-        elif name == "check_links":
-            urls = arguments.get("urls") or arguments.get("links")
-            if not urls or not isinstance(urls, list):
-                return _res({"success": False, "error": "urls must be a list"})
-            r = await check_links(urls,
-                concurrency=safe_int(arguments.get("concurrency",10)),
-                timeout=safe_float(arguments.get("timeout",8.0)))
-            return _res(r)
-        elif name == "clear_cache":
-            r = await clear_cache(url=str(arguments.get("url","")),
-                prefix=str(arguments.get("prefix","")))
             return _res(r)
         else:
             return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": f"Unknown tool: {name}"})))], is_error=True)

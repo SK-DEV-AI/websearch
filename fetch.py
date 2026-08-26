@@ -517,20 +517,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 raw_html = resp.body if isinstance(resp.body, str) else body.decode("utf-8", errors="replace")
                 status_used = resp.status
 
-        # If the page is dead (404, 410, 5xx), try a proxy fallback, then Wayback
+        # If the page is dead (404, 410, 5xx), try Wayback
         if status_used in (404, 410) or status_used >= 500:
-            if config.PROXY_POOL_ENABLED:
-                try:
-                    from proxy_pool import proxy_fetch
-                    proxy_body = await proxy_fetch(url)
-                    if proxy_body and len(proxy_body) > 500:
-                        if focus:
-                            proxy_body = focus_mod.filter_by_relevance(proxy_body, focus)
-                        return _build_paginated_response(
-                            url, proxy_body, 200, "", {}, "text/html",
-                            offset, max_chars, method="proxy")
-                except Exception:
-                    pass
             wayback = await _try_wayback(url) or await _try_archive_today(url)
             if wayback:
                 return wayback
