@@ -427,6 +427,9 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 logger.warning("PDF extraction failed for %s: %s", url, e)
         elif url_lower.endswith('.epub'):
             resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
+            redir_err = await _revalidate_redirect(url, resp)
+            if redir_err:
+                return {"success": False, "url": url, "error": redir_err}
             if _bomb_capped(resp.body):
                 return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
             content = _extract_epub(
@@ -439,6 +442,9 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                               offset, max_chars, method="epub")
         elif url_lower.endswith(('.docx', '.doc')):
             resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
+            redir_err = await _revalidate_redirect(url, resp)
+            if redir_err:
+                return {"success": False, "url": url, "error": redir_err}
             if _bomb_capped(resp.body):
                 return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
             content = _extract_docx(

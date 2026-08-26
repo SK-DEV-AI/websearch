@@ -25,7 +25,7 @@ async def search_tavily(query: str, n: int = 10, topic: str = "general",
     if not key:
         return []
     body: dict[str, Any] = {"query": query, "search_depth": search_depth,
-                            "max_results": min(n, 10), "include_answer": include_answer,
+                            "max_results": min(n, 20), "include_answer": include_answer,
                             "include_raw_content": include_raw_content,
                             "topic": topic, "auto_parameters": auto_parameters}
     if include_images:

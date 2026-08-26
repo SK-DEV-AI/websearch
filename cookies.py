@@ -38,11 +38,16 @@ class CookieJar:
         pairs: list[tuple[str, str]] = []
         if headers is None:
             return pairs
-        get_all = getattr(headers, "get_all", None)
-        if get_all is not None:
-            for v in get_all("set-cookie", []):
-                pairs.append(("set-cookie", v))
-            return pairs
+        # httpx.Headers exposes get_list for multi-valued headers; get_all does not exist
+        get_list = getattr(headers, "get_list", None)
+        if callable(get_list):
+            try:
+                for v in get_list("set-cookie"):
+                    pairs.append(("set-cookie", v))
+                if pairs:
+                    return pairs
+            except Exception:
+                pass
         if isinstance(headers, dict):
             for k, v in headers.items():
                 if k.lower() == "set-cookie" and isinstance(v, str):

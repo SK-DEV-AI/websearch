@@ -151,8 +151,11 @@ def _parse_json(vertical: str, body: str) -> list[dict]:
     if vertical == "mdn":
         out = []
         for rank, it in enumerate(v.get("documents", [])[:MAX_PER_VERTICAL]):
+            mdn_url = it.get("mdn_url", "")
+            if not mdn_url:
+                continue
             out.append(_entry(rank, it.get("title", ""),
-                              f"https://developer.mozilla.org{it.get('mdn_url', '')}",
+                              f"https://developer.mozilla.org{mdn_url}",
                               it.get("summary", "")))
         return out
     if vertical == "scholar":
