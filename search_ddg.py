@@ -26,6 +26,8 @@ async def search_ddg(
     license_image: str = "", resolution: str = "", duration: str = "",
     license_videos: str = "",
 ) -> list[dict]:
+    if region == "wt-wt":
+        region = "us-en"
     try:
         ddgs = DDGS(proxy=proxy or None, timeout=timeout)
         if search_type == "news":
