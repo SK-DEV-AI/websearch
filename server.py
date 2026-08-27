@@ -267,11 +267,11 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             query = str(arguments.get("query", "")).strip()
             if not query:
                 return _res({"success": False, "error": "query must not be empty"})
-            count = min(safe_int(arguments.get("count",10)), MAX_RESULTS)
             depth = safe_int(arguments.get("depth",1))
+            count = min(max(safe_int(arguments.get("count",10)), depth * 3), MAX_RESULTS)
             lang = str(arguments.get("language","en"))
             google_ai_only = bool(arguments.get("google_ai_only", False))
-            r = await search_multi(query, count=max(count, depth * 3),
+            r = await search_multi(query, count=count,
                 google_ai_only=google_ai_only,
                 search_type=str(arguments.get("search_type","auto")),
                 timelimit=str(arguments.get("timelimit","")),
@@ -400,7 +400,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                               if kw in content_lower[:800])
                 should_retry = (not _is_js_shell) and (
                     "cloudflare" in r_error
-                ) or status in (403, 429, 503) or cf_hits >= 2 or (
+                    or status in (403, 429, 503) or cf_hits >= 2 or (
                     len(content) < 300 and (
                         "blocked" in content_lower or "access denied" in content_lower
                         or "network security" in content_lower or "rate limit" in content_lower
@@ -410,7 +410,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                     # tiny-but-real pages (small HTML, text extracted) don't
                     # benefit from a browser re-render — skip the wasted CDP
                     # round-trip; big HTML with no text is a JS shell → retry
-                    not r.get("raw_html_len") or r.get("raw_html_len", 0) > 5000))
+                    not r.get("raw_html_len") or r.get("raw_html_len", 0) > 5000)))
 
             # ── Tier-2 browser solve + solve-and-bounce handoff ─────
             if should_retry and ghost.tier_allowed(host, "t2"):
