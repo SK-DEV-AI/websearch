@@ -660,10 +660,9 @@ async def _warmup_gai():
 
 async def _parent_watchdog():
     import os
-    ppid = os.getppid()
     while True:
         await asyncio.sleep(2)
-        if os.getppid() == 1 or os.getppid() != ppid:
+        if os.getppid() == 1:
             # parent died / reparented to init — opencode closed, exit with it
             import sys
             sys.exit(0)
