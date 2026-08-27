@@ -658,7 +658,18 @@ async def _warmup_gai():
     except Exception:
         pass
 
+async def _parent_watchdog():
+    import os
+    ppid = os.getppid()
+    while True:
+        await asyncio.sleep(2)
+        if os.getppid() == 1 or os.getppid() != ppid:
+            # parent died / reparented to init — opencode closed, exit with it
+            import sys
+            sys.exit(0)
+
 async def main():
+    asyncio.create_task(_parent_watchdog())
     asyncio.create_task(_warmup_gai())
     try:
         async with stdio_server() as (rs, ws):
