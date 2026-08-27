@@ -688,8 +688,12 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         # dense HTML with genuinely thin text (small threads) — never gate.
         raw_len = len(raw_html)
         if dedicated is None and raw_len > 5000 and len(full_content) < 500:
-            return {"success": False, "url": url,
-                    "error": f"Unknown bot challenge detected ({raw_len} bytes HTML, {len(full_content)} chars text)"}
+            # JS shells (GTM/Next.js) look like bot walls (big HTML, thin text) but are not — don't burn CDP on them
+            if "gtm.start" in raw_html[:2000] or "__NEXT_DATA__" in raw_html[:2000]:
+                pass  # fall through with thin content, don't trigger CDP
+            else:
+                return {"success": False, "url": url,
+                        "error": f"Unknown bot challenge detected ({raw_len} bytes HTML, {len(full_content)} chars text)"}
 
         if min_output_size and len(full_content) < min_output_size:
             # Page fetched and parsed fine — genuinely small content.

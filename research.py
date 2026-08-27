@@ -631,7 +631,7 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
     deduplicates by embedding cosine similarity, and reranks by query relevance.
     Also enriches Wikipedia results with full summary extracts.
     """
-    urls = [r["url"] for r in results if r.get("url")][:5]  # ponytail: depth=2 enrich caps at 5 fetches — 8×32K + rerank + Groq blows past 60s and looks stuck; 5 is enough for synthesis
+    urls = [r["url"] for r in (results or []) if r.get("url")][:5]  # ponytail: depth=2 enrich caps at 5 fetches — 8×32K + rerank + Groq blows past 60s and looks stuck; 5 is enough for synthesis
     if not urls:
         return {"fetched_content": []}
     fetched = await asyncio.gather(

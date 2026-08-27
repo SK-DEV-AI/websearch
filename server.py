@@ -392,11 +392,13 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 status = r.get("status", 0)
                 r_error = (r.get("error", "") or "").lower()
                 content_lower = content.lower()
+                # ponytail: twelvedata/docs is a JS shell (GTM) not a bot wall — don't burn CDP on it
+                _is_js_shell = "gtm.start" in content_lower[:2000] or "__NEXT_DATA__" in content_lower[:2000]
                 cf_hits = sum(1 for kw in ["just a moment", "checking your browser",
                                "cf-challenge", "__cf_chl_", "cf-turnstile",
                                "verify you are human", "attention required"]
                               if kw in content_lower[:800])
-                should_retry = (
+                should_retry = (not _is_js_shell) and (
                     "cloudflare" in r_error
                 ) or status in (403, 429, 503) or cf_hits >= 2 or (
                     len(content) < 300 and (
