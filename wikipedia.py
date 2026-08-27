@@ -11,16 +11,19 @@ from config import get_http_client
 _WIKI_BASE = "https://{lang}.wikipedia.org/w/api.php"
 _REST_BASE = "https://{lang}.wikipedia.org/api/rest_v1/"
 _UA = "mcp-codesearch/1.0"
+_ALLOWED_LANGS = {"en","de","fr","es","it","pt","ru","ja","zh","pl","nl","ar","ko","tr","sv","no","da","fi","hu","cs","ro","uk","th","vi","id","he","el","fa","hi","bn","ta","te","ur","ms","bg","hr","sr","sk","sl","lt","lv","et","is","mk"}
+def _lang(lang: str) -> str:
+    return lang if lang in _ALLOWED_LANGS else "en"
 
 
 async def _get(params: dict, language: str = "en", timeout: int = 10) -> dict | None:
     c = get_http_client()
-    r = await c.get(_WIKI_BASE.format(lang=language), params=params, headers={"User-Agent": _UA}, timeout=timeout)
+    r = await c.get(_WIKI_BASE.format(lang=_lang(language)), params=params, headers={"User-Agent": _UA}, timeout=timeout)
     return r.json() if r.status_code == 200 else None
 
 
 def _page_url(title: str, language: str = "en") -> str:
-    return f"https://{language}.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+    return f"https://{_lang(language)}.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
 
 
 def _clean_snippet(s: str) -> str:
@@ -87,7 +90,7 @@ async def fetch_wikipedia_summary_rest(title: str, language: str = "en") -> dict
     try:
         c = get_http_client()
         r = await c.get(
-            _REST_BASE.format(lang=language) + f"page/summary/{urllib.parse.quote(title.replace(' ', '_'))}",
+            _REST_BASE.format(lang=_lang(language)) + f"page/summary/{urllib.parse.quote(title.replace(' ', '_'))}",
             headers={"User-Agent": _UA}, timeout=10)
         if r.status_code != 200:
             return None
@@ -167,7 +170,7 @@ async def fetch_wikipedia_pageviews(title: str, language: str = "en",
         end = datetime.now()
         start = end - timedelta(days=days)
         r = await c.get(
-            _REST_BASE.format(lang=language) + f"page/per-day/{encoded}/daily/{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}",
+            _REST_BASE.format(lang=_lang(language)) + f"page/per-day/{encoded}/daily/{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}",
             headers={"User-Agent": _UA}, timeout=10)
         if r.status_code != 200:
             return []

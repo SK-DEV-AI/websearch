@@ -442,11 +442,16 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             _intent = "paper"
         _verticals = [v for v in verticals_for(_intent, effective_query)
                       if v not in ("wikipedia", "arxiv", "news")]
-        for _v in _verticals:
+        if _verticals:
             try:
-                done_map[f"vert_{_v}"] = await vertical_run(_v, effective_query)
+                v_results = await asyncio.gather(
+                    *[asyncio.wait_for(vertical_run(_v, effective_query), timeout=5) for _v in _verticals],
+                    return_exceptions=True,
+                )
             except BaseException:
-                done_map[f"vert_{_v}"] = []
+                v_results = [[] for _ in _verticals]
+            for _v, r in zip(_verticals, v_results):
+                done_map[f"vert_{_v}"] = [] if isinstance(r, BaseException) else r
         for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "brave")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
             if key not in done_map:
                 continue
