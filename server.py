@@ -442,10 +442,13 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                             ghost.set_replay_ok(host, True)
                             r = replay
                 if not cf_cookies or not r.get("success"):
-                    cdp_r = await scrapling_stealthy_fetch(url,
-                        css_selector=arguments.get("css_selector"),
-                        extraction_type=str(arguments.get("extraction_type", "markdown")),
-                        cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle", True)))
+                    try:
+                        cdp_r = await asyncio.wait_for(scrapling_stealthy_fetch(url,
+                            css_selector=arguments.get("css_selector"),
+                            extraction_type=str(arguments.get("extraction_type", "markdown")),
+                            cdp_url=HELIUM_CDP, network_idle=bool(arguments.get("network_idle", True))), timeout=12)
+                    except (asyncio.TimeoutError, Exception):
+                        cdp_r = {"success": False}
                     if cdp_r.get("success"):
                         # browser solved the wall → store clearance cookies
                         ghost.record_solved(host, cdp_r.get("cookies", []),
