@@ -43,7 +43,7 @@ async def expand_query(query: str) -> list[str]:
     """Expand a short/vague query into diverse search variations.
 
     Returns [original, variation1, variation2, ...] up to 4 total.
-    Only expands queries that are short (<5 words or <=60 chars).
+    Only expands queries that are short (<5 words or <=80 chars).
     """
     if len(query.split()) >= 8 or len(query) > 80:
         return [query]
