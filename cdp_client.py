@@ -694,6 +694,8 @@ class CDPPage:
         """
         if self._nav_listener:
             self._session.off("Page.frameNavigated", self._nav_listener)
+        if hasattr(self, '_lifecycle_listener') and self._lifecycle_listener:
+            self._session.off("Page.lifecycleEvent", self._lifecycle_listener)
         for attempt in (1, 2):
             try:
                 await self._session.send(

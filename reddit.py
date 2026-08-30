@@ -319,135 +319,134 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
     """
     async with _reddit_sem:
         page = await _new_reddit_page()
-    if not page:
-        return []
+        if not page:
+            return []
+        try:
+            # --- Phase 1: AI summary (navigates the page for AI content) ------
+            ai_summary_result = None
+            if include_ai_summary:
+                try:
+                    ai_summary_result = await _get_ai_summary(page, query)
+                except Exception as e:
+                    logger.warning("AI summary failed: %s", e)
 
-    try:
-        # --- Phase 1: AI summary (navigates the page for AI content) ------
-        ai_summary_result = None
-        if include_ai_summary:
-            try:
-                ai_summary_result = await _get_ai_summary(page, query)
-            except Exception as e:
-                logger.warning("AI summary failed: %s", e)
+            # --- Phase 2: fetch search results via in-browser fetch -----------
+            limit = max(count, min(count * 5, 100))
+            params = {"q": query, "limit": str(limit), "sort": sort, "t": time_filter,
+                      "type": "link", "raw_json": "1"}
+            if subreddit:
+                params["restrict_sr"] = "on"
+                path = f"/r/{subreddit}/search.json"
+            else:
+                path = "/search.json"
 
-        # --- Phase 2: fetch search results via in-browser fetch -----------
-        limit = max(count, min(count * 5, 100))
-        params = {"q": query, "limit": str(limit), "sort": sort, "t": time_filter,
-                  "type": "link", "raw_json": "1"}
-        if subreddit:
-            params["restrict_sr"] = "on"
-            path = f"/r/{subreddit}/search.json"
-        else:
-            path = "/search.json"
+            qs = "&".join(f"{k}={_quote(v)}" for k, v in params.items())
+            data = await _cdp_fetch(page, f"{path}?{qs}")
 
-        qs = "&".join(f"{k}={_quote(v)}" for k, v in params.items())
-        data = await _cdp_fetch(page, f"{path}?{qs}")
+            # --- Phase 3: fetch comments (concurrent) ------------------------
+            post_comments: dict[str, list[dict]] = {}
+            if include_comments and isinstance(data, dict):
+                children = data.get("data", {}).get("children", [])
+                posts_raw = [c.get("data", {}) for c in children if isinstance(c, dict) and c.get("kind") == "t3"]
 
-        # --- Phase 3: fetch comments (concurrent) ------------------------
-        post_comments: dict[str, list[dict]] = {}
-        if include_comments and isinstance(data, dict):
+                async def _cmts(post: dict) -> None:
+                    sub = post.get("subreddit") or ""
+                    pid = post.get("id") or ""
+                    if not sub or not pid:
+                        return
+                    cdata = await _cdp_fetch(page, f"/r/{sub}/comments/{pid}.json")
+                    if isinstance(cdata, list) and len(cdata) >= 2:
+                        comments = _extract_comments(cdata[1], comments_per_post)
+                        if comments:
+                            post_comments[post["id"]] = comments
+
+                await asyncio.gather(*[_cmts(p) for p in posts_raw[:count]], return_exceptions=True)
+
+            # --- Phase 4: build unified results ------------------------------
+            results: list[dict] = []
+
+            if ai_summary_result:
+                raw = ai_summary_result.get("full_answer") or ai_summary_result.get("summary") or ""
+                summary = raw.strip()
+                if summary:
+                    subreddits = ai_summary_result.get("source_subreddits", [])
+                    sub_str = f" (sources: {', '.join(subreddits)})" if subreddits else ""
+                    ai_url = ai_summary_result.get("answers_url") or f"https://www.reddit.com/search/?q={_quote(query)}"
+                    results.append({
+                        "title": f"Reddit AI summary{ sub_str }",
+                        "url": ai_url,
+                        "snippet": summary[:1600],
+                        "source": "reddit.com",
+                        "engine": "reddit-ai-summary",
+                    })
+
+            if not isinstance(data, dict):
+                return results
+
             children = data.get("data", {}).get("children", [])
-            posts_raw = [c.get("data", {}) for c in children if isinstance(c, dict) and c.get("kind") == "t3"]
+            posts = []
+            for c in children:
+                if not isinstance(c, dict) or c.get("kind") != "t3":
+                    continue
+                posts.append(_parse_post(c.get("data", {})))
 
-            async def _cmts(post: dict) -> None:
-                sub = post.get("subreddit") or ""
-                pid = post.get("id") or ""
-                if not sub or not pid:
-                    return
-                cdata = await _cdp_fetch(page, f"/r/{sub}/comments/{pid}.json")
-                if isinstance(cdata, list) and len(cdata) >= 2:
-                    comments = _extract_comments(cdata[1], comments_per_post)
-                    if comments:
-                        post_comments[post["id"]] = comments
+            for p in posts:
+                permalink = p.get("permalink", "")
+                url = f"https://www.reddit.com{permalink}" if permalink else ""
+                sub = p.get("subreddit", "")
+                snippet = p.get("selftext", "").strip()
+                if not snippet:
+                    snippet = p.get("title", "")
+                snippet = f"[r/{sub}] {snippet}"
+                comments = post_comments.get(p.get("id"), [])
+                if comments:
+                    lines = [f"\n\nTop comments:"]
+                    for c in comments:
+                        lines.append(f"  u/{c['author']}: {c['body']}")
+                    snippet = (snippet + "\n".join(lines))[:1600]
 
-            await asyncio.gather(*[_cmts(p) for p in posts_raw[:count]], return_exceptions=True)
-
-        # --- Phase 4: build unified results ------------------------------
-        results: list[dict] = []
-
-        if ai_summary_result:
-            raw = ai_summary_result.get("full_answer") or ai_summary_result.get("summary") or ""
-            summary = raw.strip()
-            if summary:
-                subreddits = ai_summary_result.get("source_subreddits", [])
-                sub_str = f" (sources: {', '.join(subreddits)})" if subreddits else ""
-                ai_url = ai_summary_result.get("answers_url") or f"https://www.reddit.com/search/?q={_quote(query)}"
-                results.append({
-                    "title": f"Reddit AI summary{ sub_str }",
-                    "url": ai_url,
-                    "snippet": summary[:1600],
+                entry: dict[str, Any] = {
+                    "title": p.get("title", ""),
+                    "url": url,
+                    "snippet": snippet,
                     "source": "reddit.com",
-                    "engine": "reddit-ai-summary",
-                })
-
-        if not isinstance(data, dict):
-            return results
-
-        children = data.get("data", {}).get("children", [])
-        posts = []
-        for c in children:
-            if not isinstance(c, dict) or c.get("kind") != "t3":
-                continue
-            posts.append(_parse_post(c.get("data", {})))
-
-        for p in posts:
-            permalink = p.get("permalink", "")
-            url = f"https://www.reddit.com{permalink}" if permalink else ""
-            sub = p.get("subreddit", "")
-            snippet = p.get("selftext", "").strip()
-            if not snippet:
-                snippet = p.get("title", "")
-            snippet = f"[r/{sub}] {snippet}"
-            comments = post_comments.get(p.get("id"), [])
-            if comments:
-                lines = [f"\n\nTop comments:"]
-                for c in comments:
-                    lines.append(f"  u/{c['author']}: {c['body']}")
-                snippet = (snippet + "\n".join(lines))[:1600]
-
-            entry: dict[str, Any] = {
-                "title": p.get("title", ""),
-                "url": url,
-                "snippet": snippet,
-                "source": "reddit.com",
-                "engine": "reddit",
-                "author": p.get("author", ""),
-                "score": p.get("score", 0),
-                "num_comments": p.get("num_comments", 0),
-                "subreddit": sub,
-            }
-            if comments:
-                entry["comments"] = comments
-            results.append(entry)
-
-            for c in comments:
-                cid = c.get("id", "")
-                results.append({
-                    "title": f"r/{sub} comment by u/{c['author']}",
-                    "url": f"{url}#t1_{cid}" if url else "",
-                    "snippet": c.get("body", ""),
-                    "source": "reddit.com",
-                    "engine": "reddit-comment",
-                    "author": c.get("author", ""),
-                    "score": c.get("score", 0),
+                    "engine": "reddit",
+                    "author": p.get("author", ""),
+                    "score": p.get("score", 0),
+                    "num_comments": p.get("num_comments", 0),
                     "subreddit": sub,
-                })
+                }
+                if comments:
+                    entry["comments"] = comments
+                results.append(entry)
 
-        return results
-    finally:
-        try:
-            await page.close()
-        except Exception:
-            pass
-        try:
-            from search_gai import _cleanup_orphan_tabs
-            asyncio.ensure_future(_cleanup_orphan_tabs())
-        except Exception:
-            pass
+                for c in comments:
+                    cid = c.get("id", "")
+                    results.append({
+                        "title": f"r/{sub} comment by u/{c['author']}",
+                        "url": f"{url}#t1_{cid}" if url else "",
+                        "snippet": c.get("body", ""),
+                        "source": "reddit.com",
+                        "engine": "reddit-comment",
+                        "author": c.get("author", ""),
+                        "score": c.get("score", 0),
+                        "subreddit": sub,
+                    })
+
+            return results
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                from search_gai import _cleanup_orphan_tabs
+                asyncio.ensure_future(_cleanup_orphan_tabs())
+            except Exception:
+                pass
 
 
-# ── CLI smoke test ──────────────────────────────────────────────────────────
+    # ── CLI smoke test ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     r = asyncio.run(search_reddit("python programming", count=2, comments_per_post=1))

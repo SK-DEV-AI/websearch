@@ -170,7 +170,7 @@ async def fetch_wikipedia_pageviews(title: str, language: str = "en",
         end = datetime.now()
         start = end - timedelta(days=days)
         r = await c.get(
-            _REST_BASE.format(lang=_lang(language)) + f"page/per-day/{encoded}/daily/{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}",
+            _REST_BASE.format(lang=_lang(language)) + f"metrics/pageviews/per-article/{_lang(language)}.wikipedia/all-access/user/{encoded}/daily/{start.strftime('%Y%m%d%H')}/{end.strftime('%Y%m%d%H')}",
             headers={"User-Agent": _UA}, timeout=10)
         if r.status_code != 200:
             return []
