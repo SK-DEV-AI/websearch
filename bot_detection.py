@@ -337,13 +337,47 @@ _PROVIDERS = [
         ],
     },
     {
-        "name": "fullstory-challenge",
-        "detections": [
-            {"type": "html", "rules": [{"contains": "_fs-ch-"}]},
-            {"type": "cookies", "rules": [{"cookie": "_fs_ch_st_"}]},
-        ],
-    },
-]
+         "name": "fullstory-challenge",
+         "detections": [
+             {"type": "html", "rules": [{"contains": "_fs-ch-"}]},
+             {"type": "cookies", "rules": [{"cookie": "_fs_ch_st_"}]},
+         ],
+     },
+     {
+         "name": "aws-waf",
+         "detections": [
+             {"type": "headers", "rules": [{"header": "x-amzn-waf-action", "exists": True}]},
+             {"type": "html", "rules": [{"regex": r"aws-waf\.\w+\s*\("}, {"contains": "gokuProps"}]},
+             {"type": "html", "statusCodes": [202, 403, 405, 429, 503], "rules": [{"regex": r"awswaf\.com|\/awswaf\/"}]},
+             {"type": "cookies", "statusCodes": [202, 403, 405, 429, 503], "rules": [{"cookie": "aws-waf-token="}]},
+         ],
+     },
+     {
+         "name": "cloudfront",
+         "detections": [
+             {"type": "headers", "statusCodes": [403, 502, 503, 504], "rules": [{"header": "x-cache", "startsWith": "Error from cloudfront"}]},
+             {"type": "html", "statusCodes": [403, 502, 503, 504], "rules": [{"contains": "The request could not be satisfied"}]},
+         ],
+     },
+     {
+         "name": "weibo",
+         "detections": [
+             {"type": "html", "domainWithoutSuffix": "weibo", "rules": [{"contains": "Sina Visitor System"}]},
+         ],
+     },
+     {
+         "name": "dribbble",
+         "detections": [
+             {"type": "status_code", "domain": "dribbble.com", "rules": [{"status": 403}]},
+         ],
+     },
+     {
+         "name": "douban",
+         "detections": [
+             {"type": "status_code", "domain": "doubanio.com", "rules": [{"status": 418}]},
+         ],
+     },
+ ]
 
 # ---------------------------------------------------------------------------
 # Compiled rules
