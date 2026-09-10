@@ -357,14 +357,37 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                                   cached.get("content_type", ""),
                                                   offset, max_chars, method="cache")
 
+        # ── Reddit pre-gate probe ───────────────────────────────────
+        # Threads resolve inside the user's own Helium session
+        # (same-origin .json with their cookies) — user browsing, not
+        # crawling. Runs before the robots gate: reddit serves
+        # `User-agent: * / Disallow: /`, which would otherwise neuter
+        # this probe for the one site that needs it most.
+        if config.FAST_PATHS_ENABLED and fast_paths._REDDIT_RE.search(url):
+            try:
+                fp = await fast_paths._reddit_json(url)
+            except Exception:
+                fp = None
+            if fp:
+                if cache_ttl > 0:
+                    asyncio.ensure_future(cache_mod.set_cached(
+                        url, fp["content"], extraction_type=extraction_type,
+                        status=200, content_type=fp.get("content_type", ""),
+                        title=fp.get("title", ""), metadata=fp.get("metadata") or {},
+                        ttl=cache_ttl))
+                return _build_paginated_response(
+                    url, fp["content"], 200, fp.get("title", ""),
+                    fp.get("metadata") or {}, fp.get("content_type", ""),
+                    offset, max_chars, method=fp.get("method", "fast-path"))
+
         # ── Robots.txt politeness gate ──────────────────────────────
-        # Runs before EVERY fetch path (fast paths included) so a
-        # Disallowed URL is refused regardless of which fetcher would
-        # have handled it.
+        # Runs before every unattended fetch path so a Disallowed URL
+        # is refused regardless of which fetcher would have handled it
+        # (reddit-json user-session probe above excepted — see above).
         if config.ROBOTS_POLITENESS:
             import robots as robots_mod
             if not await robots_mod.allowed(url):
-                return {"success": False, "url": url,
+                return {"success": False, "url": url, "verdict": "blocked",
                         "error": "blocked by robots.txt"}
 
         # ── Fast paths (llms.txt / YouTube / Reddit / GitHub) ──────

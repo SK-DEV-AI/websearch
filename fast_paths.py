@@ -134,7 +134,11 @@ async def _reddit_json(url: str) -> dict | None:
     m = _REDDIT_RE.search(url)
     if not m:
         return None
-    json_url = url.rstrip("/") + ".json"
+    # Same-origin with the www.reddit.com page above: old/new hosts share
+    # the same JSON backend, but cross-origin fetch is CORS-blocked
+    # ("Failed to fetch") — normalize the host, keep the path.
+    json_url = (re.sub(r"^https?://(?:www\.|old\.|new\.)?reddit\.com",
+                       "https://www.reddit.com", url.rstrip("/")) + ".json")
     try:
         from cdp_client import get_cdp_session
         session = await get_cdp_session()

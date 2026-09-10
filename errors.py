@@ -93,7 +93,12 @@ def annotate(data: dict) -> dict:
     error = data.get("error") or data.get("message") or ""
     kind = classify(verdict, status, error)
     data.setdefault("errorKind", kind)
-    data.setdefault("next_action", next_action(verdict, status, kind))
+    if "robots.txt" in error.lower():
+        # retrying never helps — say what actually happened
+        data["next_action"] = ("blocked by the site's robots.txt (automated fetching "
+                               "disallowed) — open the URL in your own browser instead")
+    else:
+        data.setdefault("next_action", next_action(verdict, status, kind))
     return data
 
 
@@ -131,4 +136,7 @@ if __name__ == "__main__":
     d2 = annotate({"success": False, "verdict": "rate_limited", "status": 429,
                    "error": "slow down"})
     assert d2["errorKind"] == TRANSIENT and "30-60s" in d2["next_action"]
+    d3 = annotate({"success": False, "verdict": "blocked",
+                   "error": "blocked by robots.txt"})
+    assert d3["errorKind"] == PERMANENT and "your own browser" in d3["next_action"]
     print("ERRORS-OK")
