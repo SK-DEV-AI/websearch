@@ -163,6 +163,13 @@ async def _cleanup_orphan_tabs():
         session = await get_cdp_session()
         if not session:
             return
+        try:
+            from cdp_client import adopt_dead_owners
+            n = await adopt_dead_owners(session)
+            if n:
+                logger.info("adopted %d tabs from dead processes", n)
+        except Exception:
+            pass
         mine = owned_targets()
         if not mine:
             return

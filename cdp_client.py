@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Callable
@@ -219,20 +221,111 @@ class CDPSession:
 
 # Owned target IDs for orphan cleanup — tracks only tabs we created,
 # so cleanup never touches the user's own tabs in their Helium browser.
+# In-memory map (fast path for the live process) + disk registry (survives
+# process death so the NEXT process can adopt tabs orphaned by "MCP
+# connection closed" — the recurring killer; only entries whose creator PID
+# is dead are ever adopted).
 _owned_targets: dict[str, float] = {}
+_REGISTRY_PATH = "/tmp/helium_owned_tabs.json"
+
+
+def _registry_update(target_id: str | None, create: bool):
+    """Atomic read-modify-write of one disk-registry entry (flock-guarded:
+    every MCP server process shares this file)."""
+    try:
+        fd = os.open(_REGISTRY_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                raw = os.read(fd, 1024 * 1024).decode("utf-8", "replace")
+                reg = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                reg = {}
+            if not isinstance(reg, dict):
+                reg = {}
+            if create:
+                reg[target_id] = {"pid": os.getpid(), "created": time.time()}
+            else:
+                reg.pop(target_id, None)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps(reg).encode("utf-8"))
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+    except Exception:
+        logger.debug("tab registry write failed", exc_info=True)
 
 
 def _mark_owned(target_id: str):
-    import time as _t
-    _owned_targets[target_id] = _t.monotonic()
+    _owned_targets[target_id] = time.monotonic()
+    _registry_update(target_id, True)
 
 
 def _unmark_owned(target_id: str):
     _owned_targets.pop(target_id, None)
+    _registry_update(target_id, False)
 
 
 def owned_targets() -> dict[str, float]:
     return dict(_owned_targets)
+
+
+def dead_owner_targets() -> list[str]:
+    """Target IDs whose creator process is gone (dead PID = nobody can be
+    actively using the tab — CDP sessions are per-process)."""
+    try:
+        with open(_REGISTRY_PATH, encoding="utf-8") as f:
+            reg = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(reg, dict):
+        return []
+    out = []
+    for tid, info in reg.items():
+        try:
+            pid = int((info or {}).get("pid", -1))
+        except (TypeError, ValueError):
+            out.append(tid)  # malformed entry — adopt, don't strand
+            continue
+        if pid <= 0:
+            out.append(tid)
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            out.append(tid)  # owner dead → orphan
+        except PermissionError:
+            pass  # alive (other user) → not ours to touch
+        except Exception:
+            pass
+    return out
+
+
+async def adopt_dead_owners(session: "CDPSession") -> int:
+    """Close tabs orphaned by dead MCP server processes. Returns count.
+
+    Only tabs listed in the disk registry with a dead creator PID are
+    touched — the user's own tabs are never listed, so never matched."""
+    adopted = dead_owner_targets()
+    if not adopted:
+        return 0
+    try:
+        result = await session.send("Target.getTargets")
+    except Exception:
+        return 0
+    live = {t["targetId"] for t in result.get("targetInfos", [])}
+    closed = 0
+    for tid in adopted:
+        try:
+            if tid in live:
+                await session.send("Target.closeTarget", {"targetId": tid},
+                                   timeout=5)
+            _unmark_owned(tid)  # closed, or already gone → drop either way
+            closed += 1
+        except Exception:
+            continue  # keep entry, retry next round
+    return closed
 
 
 class CDPPage:
@@ -689,6 +782,9 @@ class CDPPage:
     async def close(self):
         """Close the tab.
 
+        Cancel-safe: the closeTarget send is shielded so a task cancelled
+        mid-close (session abort — the observed orphan source) still closes
+        the tab; CancelledError is re-raised afterwards to preserve semantics.
         Unmark only AFTER the close succeeds — if closeTarget fails, the
         tab stays open and must remain owned so cleanup can retry it.
         """
@@ -696,21 +792,31 @@ class CDPPage:
             self._session.off("Page.frameNavigated", self._nav_listener)
         if hasattr(self, '_lifecycle_listener') and self._lifecycle_listener:
             self._session.off("Page.lifecycleEvent", self._lifecycle_listener)
+        cancelled = False
         for attempt in (1, 2):
             try:
-                await self._session.send(
+                await asyncio.shield(self._session.send(
                     "Target.closeTarget",
                     {"targetId": self._target_id},
                     timeout=5,
-                )
+                ))
                 _unmark_owned(self._target_id)
-                return
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                continue  # retry immediately, no sleep — we're being torn down
             except Exception:
                 if attempt == 1:
-                    await asyncio.sleep(1)
-        # Failed twice — keep ownership for _cleanup_orphan_tabs, which
-        # retries about:blank targets that never navigated.
-        logger.warning("closeTarget failed for tab %s; kept owned for cleanup retry", self._target_id)
+                    try:
+                        await asyncio.sleep(1)
+                    except asyncio.CancelledError:
+                        cancelled = True
+        else:
+            # Failed twice — keep ownership for _cleanup_orphan_tabs, which
+            # retries about:blank targets that never navigated.
+            logger.warning("closeTarget failed for tab %s; kept owned for cleanup retry", self._target_id)
+        if cancelled:
+            raise asyncio.CancelledError()
 
 
 # ── Singleton management ──────────────────────────────────────────
@@ -722,15 +828,15 @@ _cdp_lock = asyncio.Lock()
 async def get_cdp_session(cdp_url: str | None = None) -> CDPSession | None:
     """Get or create the shared CDP session to Helium."""
     global _cdp_session
-    if _cdp_session:
-        ok = await _cdp_session.ensure_connected(cdp_url)
-        if ok:
-            return _cdp_session
-        _cdp_session = None
-
+    # Whole body under the lock: the old lock-free ensure_connected let two
+    # concurrent callers double-close/double-connect a dead session (two
+    # reader tasks, _ws overwritten mid-flight).
     async with _cdp_lock:
         if _cdp_session:
-            return _cdp_session
+            ok = await _cdp_session.ensure_connected(cdp_url)
+            if ok:
+                return _cdp_session
+            _cdp_session = None
         session = CDPSession()
         ok = await session.connect(cdp_url)
         if not ok:
