@@ -130,7 +130,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
          Tool(name="wikipedia",
             description="Search Wikipedia: articles, summaries, categories, links, pageviews. e.g. wikipedia(query='Python', action='summary')",
             input_schema={"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["search","summary","summary_action","categories","links","pageviews"], "default": "search", "description": "search=find articles, summary=REST fast extract, summary_action=Action API+images, categories=list page cats, links=page links, pageviews=traffic stats"},
+                "action": {"type": "string", "enum": ["search","summary","summary_action","categories","links","pageviews","extlinks","categorymembers","revisions","backlinks","recentchanges","geosearch","random","langlinks","allpages"], "default": "search", "description": "search=find articles, summary=REST fast extract, summary_action=Action API+images, categories=list page cats, links=page links, pageviews=traffic stats"},
                 "query": {"type": "string"},
                 "count": {"type": "integer", "default": 3},
                 "language": {"type": "string", "default": "en"},
@@ -184,6 +184,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "password": {"type": "string", "description": "PDF password for protected files"},
                 "pages": {"type": "string", "description": "Page range e.g. 1-5,8,10-12"},
                 "hybrid": {"type": "string", "enum": ["", "docling-fast"], "description": "Force the Docling OCR fallback regardless of text layer (upper bound: CPU cost only)"},
+                "hybrid_mode": {"type": "string", "description": "Alias for hybrid (same values)"},
                 "force_ocr": {"type": "boolean", "default": False, "description": "Shortcut: force the Docling OCR fallback even when a text layer exists"},
             },
                 "required": ["input_path"]}),
