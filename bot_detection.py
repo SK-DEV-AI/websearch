@@ -527,9 +527,11 @@ def detect_antibot(
     html_lower = html.lower() if html else ""
     url_lower = url.lower() if url else ""
 
-    # Normalize headers dict
+    # Normalize headers dict (case-insensitive: CF-Mitigated,
+    # cf-mitigated, CF-MITIGATED must all match).
     if headers:
-        get_header = lambda n, h=headers: h.get(n.lower(), h.get(n, None))
+        _lower = {str(k).lower(): v for k, v in headers.items()}
+        get_header = lambda n, _l=_lower: _l.get(n.lower(), None)
         header_names = list(headers.keys())
     else:
         get_header = lambda n: None

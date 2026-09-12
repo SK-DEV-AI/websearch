@@ -23,6 +23,12 @@ _TXT_CT = "text/plain"
 
 
 async def _get(url: str, timeout: float = 12) -> str | None:
+    # Pre-validate: some callers pass derived URLs (yt-dlp caption c_url)
+    # that never went through fetch_url's gate — fail closed here too.
+    try:
+        await _validate_url(url)
+    except SecurityError:
+        return None
     try:
         resp = await AsyncFetcher.get(url, timeout=timeout, stealthy_headers=True)
     except Exception:

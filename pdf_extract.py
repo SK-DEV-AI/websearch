@@ -180,6 +180,7 @@ async def extract_pdf(
 ) -> dict[str, Any]:
     sources = [input_path] if isinstance(input_path, str) else input_path
     local_files: list[str] = []
+    skipped: list[str] = []
     tmpdir = ""
     out_tmpdir = ""
     force_ocr = bool(hybrid) or bool(hybrid_mode)
@@ -194,7 +195,8 @@ async def extract_pdf(
                 local_files.append(src)
                 continue
             if src.startswith("file://"):
-                continue  # file:// not supported (SSRF risk)
+                skipped.append(f"{src} (file:// URLs not supported — pass a local path instead)")
+                continue
             if src.startswith(("http://", "https://")):
                 if not tmpdir:
                     tmpdir = tempfile.mkdtemp(prefix="pdfx_")
@@ -208,6 +210,9 @@ async def extract_pdf(
             local_files.append(src)
 
         if not local_files:
+            if skipped:
+                return {"success": False,
+                        "error": "No valid PDF files provided. Skipped: " + "; ".join(skipped)}
             return {"success": False, "error": "No valid PDF files provided"}
 
         for fp in local_files:

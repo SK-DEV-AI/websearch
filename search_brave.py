@@ -35,9 +35,10 @@ _SNIPPET_A = (
     ".//*[contains(concat(' ', normalize-space(@class), ' '), ' generic-snippet ')]"
     "//*[contains(concat(' ', normalize-space(@class), ' '), ' content ')]"
 )
+# Fallback: no svelte-hash predicate (hashes rotate per deploy); runs only
+# when _SNIPPET_A misses, so a looser match beats no snippet.
 _SNIPPET_B = (
-    ".//*[contains(concat(' ', normalize-space(@class), ' '), ' snippet ')"
-    " and contains(@class, 'svelte-jmfu5f')]"
+    ".//*[contains(concat(' ', normalize-space(@class), ' '), ' snippet ')]"
 )
 
 

@@ -522,8 +522,13 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 if wayback:
                     return wayback
                 return {"success": False, "url": url, "error": f"Fetch failed: {e}"}
+            # Per-hop cookie scope: a redirect hop's Set-Cookie belongs to
+            # THAT hop's host, not the original — storing all under `host`
+            # replays b.com's cookies to a.com (and vice versa).
             for hop in list(getattr(resp, "history", []) or []) + [resp]:
-                _jar.store_from_headers(host, hop.headers)
+                hop_url = getattr(hop, "url", None)
+                hop_host = urlparse(str(hop_url)).hostname if hop_url else None
+                _jar.store_from_headers(hop_host or host, hop.headers)
             if resp.status == 304:
                 stored = _reval.stored(url)
                 if stored:

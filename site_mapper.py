@@ -109,9 +109,12 @@ async def map_site(
                 parsed_link = urllib.parse.urlparse(absolute)
                 if not parsed_link.scheme.startswith("http"):
                     continue
+                # Keep the query string: ?p=/?page= URLs are distinct
+                # pages; drop only the fragment (same-document anchor).
                 normalised = urllib.parse.urlunparse((
                     parsed_link.scheme, parsed_link.netloc,
-                    parsed_link.path.rstrip("/") or "/", "", "", "",
+                    parsed_link.path.rstrip("/") or "/", "",
+                    parsed_link.query, "",
                 ))
                 if exclude and exclude.search(normalised):
                     continue

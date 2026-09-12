@@ -94,8 +94,10 @@ def _extract_xml(text, url):
         link = _attr(item, "link") or _text(item, "link") or _text(item, "guid")
         date = _text(item, "pubdate") or _text(item, "published") or \
             _text(item, "updated") or _text(item, "date")
+        # _local() strips namespaces, so content:encoded arrives as
+        # "encoded" — the prefixed literal never matched (empty bodies).
         summary = _text(item, "description") or _text(item, "summary") or \
-            _text(item, "content:encoded") or _text(item, "content")
+            _text(item, "encoded") or _text(item, "content")
         summary = _clean_html(summary)[:SUMMARY_CAP]
 
         if title:

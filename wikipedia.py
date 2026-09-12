@@ -31,7 +31,7 @@ def _clean_snippet(s: str) -> str:
 
 
 async def search_wikipedia(query: str, count: int = 3, language: str = "en",
-                           namespace: int = 0) -> list[dict]:
+                           namespace: int = 0) -> list[dict] | dict:
     try:
         params: dict[str, Any] = {"action": "query", "list": "search", "srsearch": query, "format": "json",
                            "srlimit": min(count, 10), "srprop": "snippet|titlesnippet|timestamp|sectiontitle|wordcount"}

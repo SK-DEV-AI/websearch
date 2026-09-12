@@ -84,8 +84,14 @@ def _format_ax_nodes(nodes: list[dict], depth: int = 0) -> list[str]:
                 if child is not None:
                     emit(child, depth + 1)
 
+    # Emit true roots only: a flat getFullAXTree lists every node, so
+    # emitting all of them as roots duplicates each child under its parent.
+    child_ids: set = set()
     for node in nodes:
-        emit(node, depth)
+        child_ids.update(node.get("childIds", []))
+    for node in nodes:
+        if node.get("nodeId") not in child_ids:
+            emit(node, depth)
     return lines
 
 

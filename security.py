@@ -117,6 +117,13 @@ def _normalize_ip_notation(host: str) -> str | None:
                 resolved.append(int(p, 0))
             else:
                 resolved.append(int(p))
+        if len(resolved) == 1:
+            # Single-int hex/octal (0x7f000001): expand to 4 octets so
+            # alternate-notation loopback doesn't slip past as fail-open.
+            val = resolved[0]
+            if val < 0 or val > 0xFFFFFFFF:
+                return None
+            resolved = [(val >> s) & 0xFF for s in (24, 16, 8, 0)]
         if len(resolved) == 2:
             resolved = [resolved[0], 0, 0, resolved[1]]
         elif len(resolved) == 3:
