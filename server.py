@@ -71,7 +71,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
             input_schema={"type": "object", "properties": {}},
         ),
         Tool(name="search",
-            description="Multi-engine web search with dedup, reranking, and synthesis. depth=1 returns snippets with relevance_score+fetch_relevance per result. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode. e.g. search(query='latest AI models', depth=1)",
+            description="Multi-engine web search with dedup, reranking, and synthesis. Use for open research questions; for a known URL use fetch, for papers use arxiv, for encyclopedic facts use wikipedia. depth=1 returns snippets with relevance_score+fetch_relevance per result. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode. e.g. search(query='latest AI models', depth=1)",
             input_schema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 10},
                 "depth": {"type": "integer", "default": 1, "description": "1=snippets, 2+=fetch full pages + rerank"},
@@ -118,7 +118,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                     },
                 "required": ["url"]}),
           Tool(name="screenshot",
-            description="ARIA accessibility snapshot (LLM-readable page text). e.g. screenshot(url='https://example.com')",
+            description="ARIA accessibility snapshot (LLM-readable page text). Use to see a page's interactive structure and what is actually visible; for readable article content use fetch. e.g. screenshot(url='https://example.com')",
             input_schema={"type": "object", "properties": {
                 "url": {"type": "string"},
                 "max_chars": {"type": "integer", "default": 10000},
@@ -128,7 +128,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "end_line": {"type": "integer", "description": "1-based end line (inclusive) for snapshot text range"}},
                 "required": ["url"]}),
          Tool(name="wikipedia",
-            description="Search Wikipedia: articles, summaries, categories, links, pageviews. e.g. wikipedia(query='Python', action='summary')",
+            description="Full Wikipedia API client: articles, summaries, categories, links, pageviews, revisions, backlinks, geosearch, recent changes, random pages. Use for encyclopedic facts; for open research use search. e.g. wikipedia(query='Python', action='summary')",
             input_schema={"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["search","summary","summary_action","categories","links","pageviews","extlinks","categorymembers","revisions","backlinks","recentchanges","geosearch","random","langlinks","allpages"], "default": "search", "description": "search=find articles, summary=REST fast extract, summary_action=Action API+images, categories=list page cats, links=page links, pageviews=traffic stats"},
                 "query": {"type": "string"},
@@ -143,7 +143,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "distance": {"type": "integer", "default": 1000, "description": "Search radius in meters for geosearch"}},
                 "required": []}),
         Tool(name="arxiv",
-            description="Search arXiv academic papers. Use raw_query for boolean operators (AND, OR, ANDNOT), phrase search (ti:\"exact phrase\"), wildcards (au:smith*). e.g. arxiv(query='cs.AI transformer', count=5)",
+            description="Search arXiv academic papers (single-source; for multi-source paper search use codesearch papers). Use raw_query for boolean operators (AND, OR, ANDNOT), phrase search (ti:\"exact phrase\"), wildcards (au:smith*). e.g. arxiv(query='cs.AI transformer', count=5)",
             input_schema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 3},
                 "search_field": {"type": "string", "enum": ["all","ti","au","abs","cat","co","jr","id"], "default": "all"},
@@ -155,7 +155,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "raw_query": {"type": "string", "description": "Raw arXiv search_query syntax with boolean operators (AND/OR/ANDNOT), phrase, wildcards. Overrides query+search_field."}},
                 "required": ["query"]}),
         Tool(name="map_site",
-            description="Discover all pages on a website via sitemap XML (primary) and HTML link extraction (fallback). Returns the base domain, source type, total count, and an array of discovered URLs with metadata (last_modified, priority, changefreq when available). e.g. map_site(url='https://example.com')",
+            description="Discover all pages on a website via sitemap XML (primary) and HTML link extraction (fallback). Use to survey a site's pages before fetching individually. Returns the base domain, source type, total count, and an array of discovered URLs with metadata (last_modified, priority, changefreq when available). e.g. map_site(url='https://example.com')",
             input_schema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "Full URL of the site to map (e.g. https://example.com)"},
                 "max_urls": {"type": "integer", "default": 1000, "description": "Cap on returned URLs"},
