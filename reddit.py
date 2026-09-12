@@ -125,24 +125,28 @@ async def _get_ai_summary(page, query: str) -> dict | None:
     # Poll for the AI summary AND stream settlement (up to 15s).
     # The marker appears while the answer is still streaming — extract only
     # after the section stops growing (3x no-growth), so no partial answers.
+    # Some layouts skip the inline section: the AI entity then lives ONLY
+    # behind the /answers/ "See More" link (renders ~4s, no marker ever) —
+    # watch for that link too, or step 2 never fires and we return None.
     deadline = time.monotonic() + 15
     section_len = 0
     stable = 0
-    no_marker = 0
+    no_signal = 0
     section_js = (
         "(() => {"
         "  const t = document.body?.innerText || '';"
+        "  const seeMore = !!document.querySelector('a[href*=\"/answers/\"]');"
         "  const sIdx = t.indexOf('What people are saying');"
-        "  if (sIdx < 0) return {ready: false, len: 0};"
+        "  if (sIdx < 0) return {ready: false, len: 0, seeMore};"
         "  const endIdx = t.indexOf('\\nPosts\\n', sIdx);"
         "  const sec = endIdx > 0 ? t.substring(sIdx, endIdx) : t.substring(sIdx, 2500);"
-        "  return {ready: true, len: sec.length};"
+        "  return {ready: true, len: sec.length, seeMore};"
         "})()"
     )
     while time.monotonic() < deadline:
         state = await page.evaluate(section_js)
         if state and state.get("ready"):
-            no_marker = 0
+            no_signal = 0
             cur = state.get("len", 0)
             if cur == section_len:
                 stable += 1
@@ -151,12 +155,15 @@ async def _get_ai_summary(page, query: str) -> dict | None:
             else:
                 section_len = cur
                 stable = 0
+        elif state and state.get("seeMore"):
+            # AI entity exists but inline section isn't rendering — the
+            # extraction below grabs answers_url and step 2 takes over.
+            break
         else:
-            # Reddit AI answers are precomputed per query: if the marker
-            # hasn't rendered within the grace window it never will —
-            # don't burn the full 15s deadline waiting for nothing.
-            no_marker += 1
-            if no_marker >= 6:
+            # No marker AND no answers link within the grace window: no AI
+            # entity for this query — don't burn the deadline on nothing.
+            no_signal += 1
+            if no_signal >= 8:
                 break
         await asyncio.sleep(0.5)
 
@@ -164,6 +171,12 @@ async def _get_ai_summary(page, query: str) -> dict | None:
 (() => {
     const r = {};
     const body = document.body?.innerText || '';
+
+    // 1b first: the /answers/ link must survive even when the inline
+    // section never renders (marker absent) — step 2 needs it.
+    // 1b — find the answers-page link
+    const seeMore = document.querySelector('a[href*="/answers/"]');
+    if (seeMore) r['answers_url'] = seeMore.href;
 
     // 1a — extract the "What people are saying" section from innerText
     const startIdx = body.indexOf('What people are saying');
@@ -173,10 +186,6 @@ async def _get_ai_summary(page, query: str) -> dict | None:
     const endIdx = fromStart.indexOf('\\nPosts\\n');
     const summary = endIdx > 0 ? fromStart.substring(0, endIdx) : fromStart.substring(0, 2500);
     r['summary'] = summary.trim();
-
-    // 1b — find the answers-page link
-    const seeMore = document.querySelector('a[href*="/answers/"]');
-    if (seeMore) r['answers_url'] = seeMore.href;
 
     // 1c — parse sources line
     const srcMatch = summary.match(/Sources:\\s*(.+?)(?:\\n|$)/i);
@@ -239,10 +248,11 @@ async def _get_ai_summary(page, query: str) -> dict | None:
                         prev = cur
                         stable = 0
                 else:
-                    # The stream either starts within the grace window or
-                    # not at all — don't burn the full 20s deadline.
+                    # Fresh /answers/ entities cold-build server-side: the
+                    # first chunk can take ~10s. Give it room; the 20s
+                    # deadline above stays as the backstop.
                     no_chunk += 1
-                    if no_chunk >= 6:
+                    if no_chunk >= 20:
                         break
                 await asyncio.sleep(0.5)
             if full and isinstance(full, str) and len(full.strip()) > 100:
