@@ -270,11 +270,16 @@ async def extract_pdf(
             out_tmpdir = tempfile.mkdtemp(prefix="pdfx_out_")
             out = Path(out_tmpdir)
         for name, r in results.items():
+            # H1-para: contain writes inside `out` — `name` derives from a remote
+            # URL path basename which can carry `..` and escape output_dir.
+            safe_stem = Path(name).stem
+            if ".." in safe_stem or "" == safe_stem or safe_stem in (".", ".."):
+                safe_stem = "extract"
             if isinstance(r["content"], str):
-                (out / f"{Path(name).stem}.{_EXT[fmts[0]]}").write_text(r["content"], encoding="utf-8")
+                (out / f"{safe_stem}.{_EXT[fmts[0]]}").write_text(r["content"], encoding="utf-8")
             else:
                 for f, c in r["content"].items():
-                    (out / f"{Path(name).stem}.{_EXT[f]}").write_text(c, encoding="utf-8")
+                    (out / f"{safe_stem}.{_EXT[f]}").write_text(c, encoding="utf-8")
 
         return {
             "success": True,
