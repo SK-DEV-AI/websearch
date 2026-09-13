@@ -4,8 +4,9 @@ Each path is shape-gated: returns a ready response dict (fetch_url-compatible)
 or None to fall through to the generic pipeline. Zero cost when the URL does
 not match — the gate is a regex on the URL, no requests issued.
 
-Paths: llms.txt (site root), YouTube transcript (yt-dlp, youtube URLs only),
-Reddit .json (comments threads), GitHub API (repo README / raw blob).
+Paths: llms.txt (site root), YouTube transcript (yt-dlp, watch/shorts/live/embed),
+Reddit .json (comments threads), GitHub API (repo README / raw blob /
+PR+issue threads with diff / tree listing / releases+tags / open lists).
 """
 
 import asyncio
@@ -69,7 +70,7 @@ async def _llms_txt(url: str) -> dict | None:
 # ── YouTube transcript ────────────────────────────────────────────────
 
 _YT_RE = re.compile(
-    r"^https?://(?:www\.|m\.)?(?:youtube\.com/watch\?.*?v=|youtu\.be/)([\w-]{11})")
+    r"^https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?.*?v=|shorts/|live/|embed/)|youtu\.be/)([\w-]{11})")
 
 
 async def _youtube_transcript(url: str) -> dict | None:
@@ -83,8 +84,17 @@ async def _youtube_transcript(url: str) -> dict | None:
             "--extractor-args", "youtube:player_client=android",
             f"https://www.youtube.com/watch?v={vid}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
     except Exception:
+        return None
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        # wait_for cancels communicate() but leaves yt-dlp running —
+        # kill it or every slow video leaks a zombie process.
+        try:
+            proc.kill()
+        except Exception:
+            pass
         return None
     try:
         info = json.loads(out)
@@ -143,8 +153,9 @@ async def _reddit_json(url: str) -> dict | None:
     # Same-origin with the www.reddit.com page above: old/new hosts share
     # the same JSON backend, but cross-origin fetch is CORS-blocked
     # ("Failed to fetch") — normalize the host, keep the path.
-    json_url = (re.sub(r"^https?://(?:www\.|old\.|new\.)?reddit\.com",
-                       "https://www.reddit.com", url.rstrip("/")) + ".json")
+    # Path-only rebuild: drops ?sort=/fragments (which would corrupt the
+    # .json suffix) and normalizes old/new hosts to www (same-origin fetch).
+    json_url = "https://www.reddit.com" + urlparse(url.rstrip("/")).path + ".json"
     try:
         from cdp_client import get_cdp_session
         session = await get_cdp_session()
@@ -226,7 +237,7 @@ async def _reddit_json(url: str) -> dict | None:
 _GITHUB_RE = re.compile(r"^https?://(?:www\.)?github\.com/([\w.-]+)/([\w.-]+)(/.*)?$")
 
 
-def _gh_thread_md(item: dict, comments: list[dict], kind_label: str, url: str) -> str:
+def _gh_thread_md(item: dict, comments: list[dict], kind_label: str) -> str:
     """Render a PR/issue + its comments as markdown."""
     num = item.get("number", "")
     title = (item.get("title") or "").strip()
@@ -248,45 +259,205 @@ def _gh_thread_md(item: dict, comments: list[dict], kind_label: str, url: str) -
     return "\n\n".join(p for p in parts if p)
 
 
+def _gh_files_md(files: list[dict]) -> str:
+    """Render the PR diff file list (patches capped per file)."""
+    lines = [f"## Files changed ({len(files)})"]
+    for f in files[:30]:
+        name = f.get("filename", "")
+        status = f.get("status", "")
+        lines.append(f"### `{name}` ({status}, "
+                     f"+{f.get('additions', 0)}/-{f.get('deletions', 0)})")
+        patch = f.get("patch") or ""
+        if patch:
+            lines.append("```diff\n" + patch[:3000] + "\n```")
+    if len(files) > 30:
+        lines.append(f"\u2026and {len(files) - 30} more files")
+    return "\n\n".join(lines)
+
+
 async def _github_thread(owner: str, repo: str, kind: str, num: str) -> dict | None:
-    """Fetch a PR or issue thread via the keyless GitHub API."""
+    """Fetch a PR or issue thread via the keyless GitHub API.
+
+    PRs also pull the file diff + code-review comments — a PR page
+    without its diff is half the page.
+    """
     hdr = {"Accept": "application/vnd.github+json", "User-Agent": "websearch-mcp"}
     is_pr = kind in ("pull", "pulls")
     base = f"https://api.github.com/repos/{owner}/{repo}"
-    thread_url = f"{base}/{'pulls' if is_pr else 'issues'}/{num}"
-    comments_url = f"{thread_url}/comments" if is_pr else f"{thread_url}/comments"
-    try:
-        item_r = await AsyncFetcher.get(thread_url, timeout=12,
-                                        stealthy_headers=False, headers=hdr)
-        comments_r = await AsyncFetcher.get(comments_url, timeout=12,
-                                            stealthy_headers=False, headers=hdr)
-    except Exception:
-        return None
-    if item_r.status != 200:
-        return None
-    try:
-        item = json.loads(item_r.body if isinstance(item_r.body, str)
-                          else item_r.body.decode("utf-8", errors="replace"))
-    except Exception:
-        return None
-    comments: list[dict] = []
-    if comments_r.status == 200:
+    sub = "pulls" if is_pr else "issues"
+
+    async def _api(path: str):
         try:
-            comments = json.loads(comments_r.body if isinstance(comments_r.body, str)
-                                  else comments_r.body.decode("utf-8", errors="replace"))
+            r = await AsyncFetcher.get(f"{base}{path}", timeout=12,
+                                       stealthy_headers=False, headers=hdr)
         except Exception:
-            comments = []
+            return None
+        if r.status != 200:
+            return None
+        try:
+            return json.loads(r.body if isinstance(r.body, str)
+                              else r.body.decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+
+    item = await _api(f"/{sub}/{num}")
+    if not isinstance(item, dict):
+        return None
+    # Conversation comments live on the issues endpoint for BOTH kinds —
+    # /pulls/N/comments holds only inline code-review comments.
+    conv = await _api(f"/issues/{num}/comments") or []
+    files = rev = []
+    if is_pr:
+        files = await _api(f"/pulls/{num}/files?per_page=30") or []
+        rev = await _api(f"/pulls/{num}/comments?per_page=20") or []
+
     label = "PR" if is_pr else "Issue"
     url_kind = "pull" if is_pr else "issues"
-    md = _gh_thread_md(item if isinstance(item, dict) else {},
-                        comments if isinstance(comments, list) else [],
-                        label,
-                        f"https://github.com/{owner}/{repo}/{url_kind}/{num}")
-    if not md.strip():
+    sections = [_gh_thread_md(item, conv if isinstance(conv, list) else [], label)]
+    if is_pr and isinstance(rev, list) and rev:
+        rc = ["## Code review comments"]
+        for c in rev[:20]:
+            cu = ((c.get("user") or {}).get("login") or "?")
+            cd = (c.get("created_at", "") or "")[:10]
+            where = c.get("path", "")
+            if c.get("line"):
+                where += f":{c.get('line')}"
+            cb = html_mod.unescape(c.get("body") or "").strip()
+            if not cb:
+                continue
+            rc.append(f"- **{cu}** ({where}, {cd}): {cb[:1000]}")
+        if len(rc) > 1:
+            sections.append("\n\n".join(rc))
+    if is_pr and isinstance(files, list) and files:
+        sections.append(_gh_files_md(files))
+    md = "\n\n".join(s for s in sections if s).strip()
+    if not md:
         return None
-    title = (item.get("title", "") or "").strip() if isinstance(item, dict) else ""
+    title = (item.get("title", "") or "").strip()
     return _resp(f"https://github.com/{owner}/{repo}/{url_kind}/{num}",
                   md, "github-pr", f"{label} #{num}: {title}")
+
+
+async def _github_contents(owner: str, repo: str, path: str, branch: str) -> dict | None:
+    """Directory listing (or single file) via the contents API."""
+    hdr = {"Accept": "application/vnd.github+json", "User-Agent": "websearch-mcp"}
+    ep = (f"https://api.github.com/repos/{owner}/{repo}/contents?ref={branch}"
+          if not path else
+          f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}")
+    try:
+        r = await AsyncFetcher.get(ep, timeout=12,
+                                   stealthy_headers=False, headers=hdr)
+    except Exception:
+        return None
+    if r.status != 200:
+        return None
+    try:
+        data = json.loads(r.body if isinstance(r.body, str)
+                          else r.body.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if isinstance(data, dict) and data.get("type") == "file":
+        dl = data.get("download_url")
+        body = await _get(dl) if dl else None
+        if body is None:
+            return None
+        return _resp(f"https://github.com/{owner}/{repo}/blob/{branch}/{path}",
+                      body, "github-raw", data.get("name", path.split("/")[-1]))
+    if not isinstance(data, list):
+        return None
+    head = f"/{path}" if path else ""
+    lines = [f"# {owner}/{repo} — {head or '/'} @ {branch}"]
+    for e in data[:200]:
+        name = e.get("name", "")
+        if e.get("type") == "dir":
+            lines.append(f"- \U0001F4C1 {name}/")
+        else:
+            lines.append(f"- `{name}` ({e.get('size', 0)} bytes)")
+    if len(data) > 200:
+        lines.append(f"\u2026and {len(data) - 200} more")
+    url = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/")
+    return _resp(url, "\n\n".join(lines), "github-tree",
+                  f"{owner}/{repo} {head or '/'}")
+
+
+async def _github_releases(owner: str, repo: str, rest: str) -> dict | None:
+    """Release/tag pages via the API."""
+    hdr = {"Accept": "application/vnd.github+json", "User-Agent": "websearch-mcp"}
+    base = f"https://api.github.com/repos/{owner}/{repo}"
+    if rest == "/tags":
+        ep, mode = f"{base}/tags?per_page=30", "tags"
+    elif rest in ("/releases", "/releases/latest"):
+        ep = f"{base}/releases/latest" if rest.endswith("latest") else f"{base}/releases?per_page=10"
+        mode = "releases"
+    else:
+        m = re.match(r"^/releases/tag/(.+)$", rest)
+        if not m:
+            return None
+        ep, mode = f"{base}/releases/tags/{m.group(1)}", "release"
+    try:
+        r = await AsyncFetcher.get(ep, timeout=12,
+                                   stealthy_headers=False, headers=hdr)
+    except Exception:
+        return None
+    if r.status != 200:
+        return None
+    try:
+        data = json.loads(r.body if isinstance(r.body, str)
+                          else r.body.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if mode == "tags":
+        if not isinstance(data, list) or not data:
+            return None
+        lines = [f"# Tags \u2014 {owner}/{repo}"] + [f"- `{t.get('name', '')}`" for t in data[:30]]
+        return _resp(f"https://github.com/{owner}/{repo}/tags",
+                      "\n\n".join(lines), "github-tags", f"Tags \u2014 {owner}/{repo}")
+    items = [data] if mode == "release" else (data if isinstance(data, list) else [])
+    if not items:
+        return None
+    cap = 3000 if mode == "release" else 800
+    parts = [f"# Releases \u2014 {owner}/{repo}"] if mode == "releases" else []
+    for rel in items:
+        name = (rel.get("name") or rel.get("tag_name") or "").strip()
+        tag = rel.get("tag_name", "")
+        date = (rel.get("published_at", "") or "")[:10]
+        body = (rel.get("body") or "").strip()[:cap]
+        parts.append(f"## {name} (`{tag}`, {date})\n\n{body}")
+    content = "\n\n".join(p for p in parts if p).strip()
+    if not content:
+        return None
+    return _resp(f"https://github.com/{owner}/{repo}{rest}",
+                  content, "github-releases", f"Releases \u2014 {owner}/{repo}")
+
+
+async def _github_issue_list(owner: str, repo: str, kind: str) -> dict | None:
+    """Bare /pulls or /issues list page — open items, not the README."""
+    hdr = {"Accept": "application/vnd.github+json", "User-Agent": "websearch-mcp"}
+    ep = ("pulls?state=open&per_page=20" if kind == "pulls"
+          else "issues?state=open&per_page=20")
+    try:
+        r = await AsyncFetcher.get(f"https://api.github.com/repos/{owner}/{repo}/{ep}",
+                                   timeout=12, stealthy_headers=False, headers=hdr)
+    except Exception:
+        return None
+    if r.status != 200:
+        return None
+    try:
+        items = json.loads(r.body if isinstance(r.body, str)
+                           else r.body.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(items, list) or not items:
+        return None
+    label = "PRs" if kind == "pulls" else "Issues"
+    lines = [f"# Open {label} \u2014 {owner}/{repo}"]
+    for it in items:
+        n = it.get("number", "")
+        t = (it.get("title") or "").strip()
+        u = ((it.get("user") or {}).get("login") or "?")
+        lines.append(f"- #{n}: {t} (*{u}*, {it.get('comments', 0)} comments)")
+    return _resp(f"https://github.com/{owner}/{repo}/{kind}",
+                  "\n\n".join(lines), "github-list", f"Open {label} \u2014 {owner}/{repo}")
 
 
 async def _github_api(url: str) -> dict | None:
@@ -294,7 +465,9 @@ async def _github_api(url: str) -> dict | None:
     if not m:
         return None
     owner, repo = m.group(1), m.group(2)
-    rest = (m.group(3) or "").rstrip("/")
+    # Strip query/fragment: /pulls?q=... must route as /pulls, and
+    # /pull/18#discussion_r... as /pull/18.
+    rest = (m.group(3) or "").split("?")[0].split("#")[0].rstrip("/")
 
     fm = re.match(r"^/(?:blob|raw)/(.+?)/(.*)$", rest)
     if fm:  # blob/<branch>/<path> — branch may contain '/', first split wins
@@ -307,12 +480,37 @@ async def _github_api(url: str) -> dict | None:
     # PR / issue pages: the old code ignored `rest` and returned the repo
     # README, so /pull/18 fetched the README instead of the PR. Serve the
     # actual thread via the keyless GitHub API (same 60 req/hr budget).
-    pm = re.match(r"^/(pull|pulls|issues|discussions)/(\d+)(/.*)?$", rest)
+    pm = re.match(r"^/(pull|pulls|issues)/(\d+)(/.*)?$", rest)
     if pm:
         kind, num = pm.group(1), pm.group(2)
         pr = await _github_thread(owner, repo, kind, num)
         if pr is not None:
             return pr
+        return None
+
+    # REST has no discussions endpoint (GraphQL-only) — generic pipeline,
+    # never the README (which would misrepresent the page).
+    if rest.startswith("/discussions"):
+        return None
+
+    if rest in ("/pulls", "/issues"):
+        lst = await _github_issue_list(owner, repo, rest.lstrip("/"))
+        if lst is not None:
+            return lst
+        return None
+
+    tm = re.match(r"^/tree/([^/]+)(?:/(.*))?$", rest)
+    if tm:
+        branch, path = tm.group(1), (tm.group(2) or "").rstrip("/")
+        listing = await _github_contents(owner, repo, path, branch)
+        if listing is not None:
+            return listing
+        return None
+
+    if rest == "/tags" or rest == "/releases" or rest.startswith("/releases/"):
+        rel = await _github_releases(owner, repo, rest)
+        if rel is not None:
+            return rel
         return None
 
     hdr = {"Accept": "application/vnd.github+json", "User-Agent": "websearch-mcp"}
