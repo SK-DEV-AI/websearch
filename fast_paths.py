@@ -6,7 +6,9 @@ not match — the gate is a regex on the URL, no requests issued.
 
 Paths: llms.txt (site root), YouTube transcript (yt-dlp, watch/shorts/live/embed),
 Reddit .json (comments threads), GitHub API (repo README / raw blob /
-PR+issue threads with diff / tree listing / releases+tags / open lists).
+PR+issue threads with diff / tree listing / releases+tags / open lists),
+StackOverflow/Stack Exchange (question + answers via API), Hacker News
+(Firebase API threads), PyPI/npm/crates.io (registry metadata + README).
 """
 
 import asyncio
@@ -548,6 +550,244 @@ async def _github_api(url: str) -> dict | None:
     return _resp(url, content, "github-api", md.get("full_name", f"{owner}/{repo}"))
 
 
+# ── StackOverflow / Stack Exchange ────────────────────────────────────
+# Q&A pages mangle in trafilatura the same way PRs did (question detached
+# from answers, votes/accepted lost). Keyless Stack Exchange API v2.3
+# (300 req/day unauthenticated — fine for occasional fetches).
+
+_SE_RE = re.compile(
+    r"^https?://((?:www\.)?stackoverflow\.com|(?:[\w-]+\.)?stackexchange\.com|"
+    r"superuser\.com|serverfault\.com|askubuntu\.com|mathoverflow\.net)/questions/(\d+)")
+
+_SE_SITES = {"stackoverflow.com": "stackoverflow", "superuser.com": "superuser",
+             "serverfault.com": "serverfault", "askubuntu.com": "askubuntu",
+             "mathoverflow.net": "mathoverflow"}
+
+
+def _se_site(host: str) -> str:
+    host = host.lower()
+    if host in _SE_SITES:
+        return _SE_SITES[host]
+    # *.stackexchange.com -> the subdomain IS the site param
+    # (apple, unix, gaming, ...); www.so redirects are already canonical.
+    if host.endswith(".stackexchange.com"):
+        return host.split(".")[0]
+    return "stackoverflow"
+
+
+def _se_strip(html: str) -> str:
+    return re.sub(r"<[^>]+>", "", html_mod.unescape(html or "")).strip()
+
+
+async def _se_api(url: str) -> dict | None:
+    m = _SE_RE.search(url)
+    if not m:
+        return None
+    host, qid = m.group(1), m.group(2)
+    site = _se_site(host)
+    # Default filter (!nNPvSNPI7A) drops answer bodies; withbody keeps
+    # bodies but drops score/accepted — so: question call + answers call.
+    q_ep = (f"https://api.stackexchange.com/2.3/questions/{qid}"
+            f"?order=desc&sort=votes&site={site}&filter=withbody")
+    a_ep = (f"https://api.stackexchange.com/2.3/questions/{qid}/answers"
+            f"?order=desc&sort=votes&site={site}&filter=withbody")
+    try:
+        q_r = await AsyncFetcher.get(q_ep, timeout=12, stealthy_headers=False)
+        a_r = await AsyncFetcher.get(a_ep, timeout=12, stealthy_headers=False)
+    except Exception:
+        return None
+    if q_r.status not in (200, 400):
+        return None
+    try:
+        items = (json.loads(q_r.body if isinstance(q_r.body, str)
+                            else q_r.body.decode("utf-8", errors="replace"))
+                 .get("items", []))
+    except Exception:
+        return None
+    if not items:
+        return None
+    q = items[0]
+    accepted = q.get("accepted_answer_id")
+    title = html_mod.unescape(q.get("title", "")).strip()
+    parts = [f"# {title}",
+             f"score {q.get('score', 0)} | {q.get('view_count', 0)} views | "
+             f"tags: {', '.join(q.get('tags', []))}",
+             _se_strip(q.get("body", ""))[:4000]]
+    answers: list[dict] = []
+    if a_r.status == 200:
+        try:
+            answers = (json.loads(a_r.body if isinstance(a_r.body, str)
+                                  else a_r.body.decode("utf-8", errors="replace"))
+                       .get("items", []))
+        except Exception:
+            answers = []
+    for a in (answers or [])[:15]:
+        owner = ((a.get("owner") or {}).get("display_name") or "?")
+        flag = " ✓ ACCEPTED" if a.get("answer_id") == accepted else ""
+        parts.append(f"## Answer by {owner} (score {a.get('score', 0)}){flag}\n\n"
+                     + _se_strip(a.get("body", ""))[:3000])
+    content = "\n\n".join(p for p in parts if p).strip()
+    if not content:
+        return None
+    canon = f"https://{host}/questions/{qid}"
+    return _resp(canon, content, "stackexchange", title)
+
+
+# ── Hacker News ─────────────────────────────────────────────────────────
+# Minimalist DOM threads mangle into pipe rows; Firebase API (no key,
+# no rate limit per the official docs) serves the tree as JSON.
+
+_HN_RE = re.compile(r"^https?://news\.ycombinator\.com/item\?id=(\d+)")
+
+
+def _hn_time(ts: int) -> str:
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+async def _hn_api(url: str) -> dict | None:
+    m = _HN_RE.search(url)
+    if not m:
+        return None
+    item_id = m.group(1)
+
+    async def _item(iid) -> dict | None:
+        try:
+            r = await AsyncFetcher.get(
+                f"https://hacker-news.firebaseio.com/v0/item/{iid}.json",
+                timeout=12, stealthy_headers=False)
+        except Exception:
+            return None
+        if r.status != 200:
+            return None
+        try:
+            return json.loads(r.body if isinstance(r.body, str)
+                              else r.body.decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+
+    top = await _item(item_id)
+    if not top:
+        return None
+    title = top.get("title") or top.get("text", "")[:80] or f"HN {item_id}"
+    parts = [f"# {title}",
+             f"by {top.get('by', '?')} | score {top.get('score', 0)} | "
+             f"{_hn_time(top.get('time', 0))}"]
+    if top.get("url"):
+        parts.append(top["url"])
+    if top.get("text"):
+        parts.append(_se_strip(top["text"])[:3000])
+
+    # Breadth-first comment walk, capped (each comment = 1 request).
+    seen = 0
+    queue = [(kid, 0) for kid in (top.get("kids") or [])[:10]]
+    while queue and seen < 30:
+        kid, depth = queue.pop(0)
+        c = await _item(kid)
+        seen += 1
+        if not c:
+            continue
+        text = _se_strip(c.get("text", ""))
+        if text:
+            parts.append(f"{'  ' * depth}- **{c.get('by', '?')}**: {text[:1500]}")
+        if depth < 2:
+            queue.extend((k, depth + 1) for k in (c.get("kids") or [])[:5])
+    content = "\n\n".join(p for p in parts if p).strip()
+    if not content:
+        return None
+    return _resp(f"https://news.ycombinator.com/item?id={item_id}",
+                  content, "hackernews", title)
+
+
+# ── Package registries (PyPI / npm / crates.io) ─────────────────────────
+# Registry pages are metadata + README; scraping them loses structure.
+# All three JSON APIs are keyless (codesearch already speaks them).
+
+_PYPI_RE = re.compile(r"^https?://pypi\.org/project/([\w_.-]+)(?:/.*)?$")
+_NPM_RE = re.compile(r"^https?://(?:www\.)?npmjs\.com/package/(@?[\w_.-]+(?:/[\w_.-]+)?)(?:/.*)?$")
+_CRATES_RE = re.compile(r"^https?://crates\.io/crates/([\w_-]+)(?:/.*)?$")
+
+
+async def _registry_api(url: str) -> dict | None:
+    m = _PYPI_RE.search(url)
+    kind = "pypi" if m else None
+    name = m.group(1) if m else None
+    if not m:
+        m = _NPM_RE.search(url)
+        if m:
+            kind, name = "npm", m.group(1)
+    if not m:
+        m = _CRATES_RE.search(url)
+        if m:
+            kind, name = "crates", m.group(1)
+    if not m or not kind or not name:
+        return None
+    try:
+        if kind == "pypi":
+            r = await AsyncFetcher.get(f"https://pypi.org/pypi/{name}/json",
+                                       timeout=12, stealthy_headers=False)
+            if r.status != 200:
+                return None
+            d = json.loads(r.body if isinstance(r.body, str)
+                           else r.body.decode("utf-8", errors="replace"))
+            info = d.get("info", {})
+            lines = [f"# {info.get('name', name)} {info.get('version', '')}",
+                     (info.get("summary") or "").strip(),
+                     f"license {info.get('license') or 'unknown'} | "
+                     f"requires-python {info.get('requires_python') or 'any'} | "
+                     f"home {info.get('home_page') or ''}"]
+            deps = info.get("requires_dist") or []
+            if deps:
+                lines.append("## Dependencies\n\n" + "\n".join(f"- `{x}`" for x in deps[:30]))
+            desc = (info.get("description") or "").strip()[:4000]
+            if desc:
+                lines.append(desc)
+            return _resp(f"https://pypi.org/project/{name}/", "\n\n".join(
+                p for p in lines if p).strip(), "pypi-json", f"{name} {info.get('version', '')}")
+        if kind == "npm":
+            r = await AsyncFetcher.get(f"https://registry.npmjs.org/{name}/latest",
+                                       timeout=12, stealthy_headers=False)
+            if r.status != 200:
+                return None
+            d = json.loads(r.body if isinstance(r.body, str)
+                           else r.body.decode("utf-8", errors="replace"))
+            lines = [f"# {d.get('name', name)} {d.get('version', '')}",
+                     (d.get("description") or "").strip(),
+                     f"license {d.get('license') or 'unknown'}"]
+            deps = d.get("dependencies") or {}
+            if deps:
+                lines.append("## Dependencies\n\n" + "\n".join(
+                    f"- `{k}@{v}`" for k, v in list(deps.items())[:30]))
+            readme = (d.get("readme") or "").strip()[:4000]
+            if readme:
+                lines.append(readme)
+            return _resp(f"https://www.npmjs.com/package/{name}", "\n\n".join(
+                p for p in lines if p).strip(), "npm-json", f"{name} {d.get('version', '')}")
+        r = await AsyncFetcher.get(
+            f"https://crates.io/api/v1/crates/{name}", timeout=12,
+            stealthy_headers=False,
+            headers={"Accept": "application/json", "User-Agent": "websearch-mcp"})
+        if r.status != 200:
+            return None
+        d = json.loads(r.body if isinstance(r.body, str)
+                       else r.body.decode("utf-8", errors="replace"))
+        crate = d.get("crate", {})
+        lines = [f"# {crate.get('name', name)} {crate.get('max_version', '')}",
+                 (crate.get("description") or "").strip(),
+                 f"downloads {crate.get('downloads', 0)} | "
+                 f"updated {(crate.get('updated_at', '') or '')[:10]} | "
+                 f"home {crate.get('homepage') or ''} | repo {crate.get('repository') or ''}"]
+        return _resp(f"https://crates.io/crates/{name}", "\n\n".join(
+            p for p in lines if p).strip(), "crates-json",
+            f"{name} {crate.get('max_version', '')}")
+    except Exception:
+        return None
+    return None
+
+
 # ── dispatch ──────────────────────────────────────────────────────────
 
 def _is_root_url(url: str) -> bool:
@@ -567,6 +807,12 @@ async def fast_path_fetch(url: str) -> dict | None:
         probes.append(_reddit_json)
     if _GITHUB_RE.search(url):
         probes.append(_github_api)
+    if _SE_RE.search(url):
+        probes.append(_se_api)
+    if _HN_RE.search(url):
+        probes.append(_hn_api)
+    if _PYPI_RE.search(url) or _NPM_RE.search(url) or _CRATES_RE.search(url):
+        probes.append(_registry_api)
     for fn in probes:
         try:
             r = await fn(url)
