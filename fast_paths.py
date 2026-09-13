@@ -226,6 +226,69 @@ async def _reddit_json(url: str) -> dict | None:
 _GITHUB_RE = re.compile(r"^https?://(?:www\.)?github\.com/([\w.-]+)/([\w.-]+)(/.*)?$")
 
 
+def _gh_thread_md(item: dict, comments: list[dict], kind_label: str, url: str) -> str:
+    """Render a PR/issue + its comments as markdown."""
+    num = item.get("number", "")
+    title = (item.get("title") or "").strip()
+    user = ((item.get("user") or {}).get("login") or "?")
+    state = item.get("state", "")
+    created = (item.get("created_at", "") or "")[:10]
+    merged = item.get("merged_at")
+    status = f"{state}" + (" (merged)" if merged else "")
+    parts = [f"# {kind_label} #{num}: {title}",
+             f"*{user}* — {status}, opened {created}",
+             html_mod.unescape(item.get("body") or "").strip()]
+    for c in comments:
+        cu = ((c.get("user") or {}).get("login") or "?")
+        cd = (c.get("created_at", "") or "")[:10]
+        cb = html_mod.unescape(c.get("body") or "").strip()
+        if not cb:
+            continue
+        parts.append(f"- **{cu}** ({cd}): {cb[:2000]}")
+    return "\n\n".join(p for p in parts if p)
+
+
+async def _github_thread(owner: str, repo: str, kind: str, num: str) -> dict | None:
+    """Fetch a PR or issue thread via the keyless GitHub API."""
+    hdr = {"Accept": "application/vnd.github+json", "User-Agent": "websearch-mcp"}
+    is_pr = kind in ("pull", "pulls")
+    base = f"https://api.github.com/repos/{owner}/{repo}"
+    thread_url = f"{base}/{'pulls' if is_pr else 'issues'}/{num}"
+    comments_url = f"{thread_url}/comments" if is_pr else f"{thread_url}/comments"
+    try:
+        item_r = await AsyncFetcher.get(thread_url, timeout=12,
+                                        stealthy_headers=False, headers=hdr)
+        comments_r = await AsyncFetcher.get(comments_url, timeout=12,
+                                            stealthy_headers=False, headers=hdr)
+    except Exception:
+        return None
+    if item_r.status != 200:
+        return None
+    try:
+        item = json.loads(item_r.body if isinstance(item_r.body, str)
+                          else item_r.body.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    comments: list[dict] = []
+    if comments_r.status == 200:
+        try:
+            comments = json.loads(comments_r.body if isinstance(comments_r.body, str)
+                                  else comments_r.body.decode("utf-8", errors="replace"))
+        except Exception:
+            comments = []
+    label = "PR" if is_pr else "Issue"
+    url_kind = "pull" if is_pr else "issues"
+    md = _gh_thread_md(item if isinstance(item, dict) else {},
+                        comments if isinstance(comments, list) else [],
+                        label,
+                        f"https://github.com/{owner}/{repo}/{url_kind}/{num}")
+    if not md.strip():
+        return None
+    title = (item.get("title", "") or "").strip() if isinstance(item, dict) else ""
+    return _resp(f"https://github.com/{owner}/{repo}/{url_kind}/{num}",
+                  md, "github-pr", f"{label} #{num}: {title}")
+
+
 async def _github_api(url: str) -> dict | None:
     m = _GITHUB_RE.search(url)
     if not m:
@@ -240,6 +303,17 @@ async def _github_api(url: str) -> dict | None:
         if body is None:
             return None
         return _resp(url, body, "github-raw", path.split("/")[-1])
+
+    # PR / issue pages: the old code ignored `rest` and returned the repo
+    # README, so /pull/18 fetched the README instead of the PR. Serve the
+    # actual thread via the keyless GitHub API (same 60 req/hr budget).
+    pm = re.match(r"^/(pull|pulls|issues|discussions)/(\d+)(/.*)?$", rest)
+    if pm:
+        kind, num = pm.group(1), pm.group(2)
+        pr = await _github_thread(owner, repo, kind, num)
+        if pr is not None:
+            return pr
+        return None
 
     hdr = {"Accept": "application/vnd.github+json", "User-Agent": "websearch-mcp"}
     try:
