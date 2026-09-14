@@ -8,7 +8,8 @@ Paths: llms.txt (site root), YouTube transcript (yt-dlp, watch/shorts/live/embed
 Reddit .json (comments threads), GitHub API (repo README / raw blob /
 PR+issue threads with diff / tree listing / releases+tags / open lists),
 StackOverflow/Stack Exchange (question + answers via API), Hacker News
-(Firebase API threads), PyPI/npm/crates.io (registry metadata + README).
+(Firebase API threads), PyPI/npm/crates.io (registry metadata + README),
+arXiv (abs API), HuggingFace (hub API), DOI (Crossref/unpaywall), GitHub gists.
 """
 
 import asyncio
@@ -788,6 +789,213 @@ async def _registry_api(url: str) -> dict | None:
     return None
 
 
+# ── arXiv ─────────────────────────────────────────────────────────────
+# Abstract pages are the one shape trafilatura handles — but the API gives
+# title/authors/abstract/PDF link as structure, not prose. Keyless.
+
+_ARXIV_RE = re.compile(r"^https?://(?:www\.)?(?:arxiv\.org/(?:abs|html|pdf)|"
+                       r"export\.arxiv\.org/api/query)[^\s]*?(\d{4}\.\d{4,5})(?:v\d+)?")
+
+
+async def _arxiv_api(url: str) -> dict | None:
+    m = _ARXIV_RE.search(url)
+    if not m:
+        return None
+    arxiv_id = m.group(1)
+    try:
+        r = await AsyncFetcher.get(
+            f"https://export.arxiv.org/api/query?id_list={arxiv_id}",
+            timeout=12, stealthy_headers=False)
+    except Exception:
+        return None
+    if r.status != 200:
+        return None
+    try:
+        body = r.body if isinstance(r.body, str) else r.body.decode("utf-8", errors="replace")
+        import xml.etree.ElementTree as _ET
+        root = _ET.fromstring(body)
+        ns = {"a": "http://www.w3.org/2005/Atom"}
+        entry = root.find("a:entry", ns)
+        if entry is None:
+            return None
+        title = (entry.findtext("a:title", "", ns) or "").strip()
+        abstract = (entry.findtext("a:summary", "", ns) or "").strip()
+        authors = [a.findtext("a:name", "", ns)
+                   for a in entry.findall("a:author", ns)]
+        cats = [c.get("term", "") for c in entry.findall("a:category", ns)]
+        pdf = ""
+        for link in entry.findall("a:link", ns):
+            if link.get("title") == "pdf":
+                pdf = link.get("href", "")
+        pub = (entry.findtext("a:published", "", ns) or "")[:10]
+        parts = [f"# {title}",
+                 f"{' | '.join(a for a in authors if a)} | {pub} | {', '.join(cats)}",
+                 abstract]
+        if pdf:
+            parts.append(f"PDF: {pdf}")
+        content = "\n\n".join(p for p in parts if p).strip()
+        if not content or not title:
+            return None
+        return _resp(f"https://arxiv.org/abs/{arxiv_id}", content,
+                      "arxiv-api", title)
+    except Exception:
+        return None
+
+
+# ── HuggingFace ─────────────────────────────────────────────────────────
+# Model/dataset pages are React shells; the Hub API is keyless for public
+# repos and returns README + metadata + stats as structure.
+
+_HF_RE = re.compile(r"^https?://huggingface\.co/(?:datasets/|spaces/)?([\w.-]+/[\w.-]+)(?:/(?:blob|tree|resolve)/[^\s]*)?/?(?:\?.*)?$")
+
+
+async def _hf_api(url: str) -> dict | None:
+    m = _HF_RE.search(url)
+    if not m:
+        return None
+    # Group 1 may carry the prefix (datasets/squad) since the regex
+    # optionally consumes it — strip to the bare owner/repo slug.
+    repo = m.group(1).removeprefix("datasets/").removeprefix("spaces/")
+    if repo in ("models", "datasets", "spaces"):
+        return None  # listing pages, not repos
+    kind = "dataset" if "/datasets/" in url else "model"
+    api = (f"https://huggingface.co/api/{'datasets' if kind == 'dataset' else 'models'}/{repo}")
+    try:
+        r = await AsyncFetcher.get(api, timeout=12, stealthy_headers=False)
+    except Exception:
+        return None
+    if r.status != 200:
+        return None
+    try:
+        d = json.loads(r.body if isinstance(r.body, str)
+                       else r.body.decode("utf-8", errors="replace"))
+        if not isinstance(d, dict) or "error" in d:
+            return None
+        repo = d.get("id", repo)  # canonical slug (renames: squad -> rajpurkar/squad)
+        mid = repo
+        likes = d.get("likes", 0) or 0
+        dl = d.get("downloads", 0) or 0
+        task = " | ".join(d.get("pipeline_tag", "") and [d["pipeline_tag"]] or [])
+        tags = ", ".join((d.get("tags") or [])[:12])
+        sibs = [s.get("rfilename", "") for s in (d.get("siblings") or [])]
+        readme = ""
+        try:
+            rr = await AsyncFetcher.get(
+                f"https://huggingface.co/{repo}/raw/main/README.md",
+                timeout=12, stealthy_headers=False)
+            if rr.status == 200:
+                readme = (rr.body if isinstance(rr.body, str)
+                          else rr.body.decode("utf-8", errors="replace"))[:4000]
+        except Exception:
+            pass
+        parts = [f"# {mid}",
+                 f"{task + ' | ' if task else ''}{likes} likes | {dl} downloads | tags: {tags}",
+                 readme]
+        if sibs:
+            parts.append("## Files\n\n" + "\n".join(f"- `{s}`" for s in sibs[:40]))
+        content = "\n\n".join(p for p in parts if p).strip()
+        if not content:
+            return None
+        return _resp(f"https://huggingface.co/{repo}", content,
+                      f"hf-{kind}", mid)
+    except Exception:
+        return None
+
+
+# ── DOI ─────────────────────────────────────────────────────────────────
+# doi.org links 302 to publisher pages (often paywalled shells). Crossref
+# is keyless and returns title/authors/venue/date; Unpaywall adds the OA
+# PDF link when one exists (no email = keyless, rate-limited but fine).
+
+_DOI_RE = re.compile(r"^https?://(?:dx\.)?doi\.org/(10\.\S+?)/?$")
+
+
+async def _doi_api(url: str) -> dict | None:
+    m = _DOI_RE.search(url)
+    if not m:
+        return None
+    doi = m.group(1).rstrip("/")
+    try:
+        r = await AsyncFetcher.get(
+            f"https://api.crossref.org/works/{doi}", timeout=12,
+            stealthy_headers=False,
+            headers={"User-Agent": "websearch-mcp/1.0 (mailto:none)",
+                     "Accept": "application/json"})
+    except Exception:
+        return None
+    if r.status != 200:
+        return None
+    try:
+        msg = (json.loads(r.body if isinstance(r.body, str)
+                          else r.body.decode("utf-8", errors="replace"))
+               .get("message", {}))
+        title = " ".join(msg.get("title") or [])
+        authors = ", ".join(
+            f"{a.get('family', '')} {a.get('given', '')}".strip()
+            for a in (msg.get("author") or [])[:8])
+        venue = " ".join(msg.get("container-title") or [])
+        year = ((msg.get("issued", {}).get("date-parts") or [[None]])[0][0])
+        oa = ""
+        try:
+            ru = await AsyncFetcher.get(f"https://api.unpaywall.org/v2/{doi}?email=none",
+                                        timeout=12, stealthy_headers=False)
+            if ru.status == 200:
+                um = (json.loads(ru.body if isinstance(ru.body, str)
+                                 else ru.body.decode("utf-8", errors="replace")))
+                best = um.get("best_oa_location") or {}
+                oa = best.get("url_for_pdf") or best.get("url") or ""
+        except Exception:
+            pass
+        parts = [f"# {title}" if title else f"# DOI {doi}",
+                 f"{authors} | {venue} | {year}",
+                 f"Open-access PDF: {oa}" if oa else ""]
+        content = "\n\n".join(p for p in parts if p).strip()
+        if not content:
+            return None
+        return _resp(f"https://doi.org/{doi}", content, "doi-crossref",
+                      title or f"DOI {doi}")
+    except Exception:
+        return None
+
+
+# ── GitHub gists ────────────────────────────────────────────────────────
+# gist pages are React shells; the keyless Gist API returns files as text.
+
+_GIST_RE = re.compile(r"^https?://gist\.github\.com/(?:[\w.-]+/)?([0-9a-f]{20,40})(?:[/?#].*)?$")
+
+
+async def _gist_api(url: str) -> dict | None:
+    m = _GIST_RE.search(url)
+    if not m:
+        return None
+    gid = m.group(1)
+    try:
+        r = await AsyncFetcher.get(f"https://api.github.com/gists/{gid}",
+                                   timeout=12, stealthy_headers=False)
+    except Exception:
+        return None
+    if r.status != 200:
+        return None
+    try:
+        d = json.loads(r.body if isinstance(r.body, str)
+                       else r.body.decode("utf-8", errors="replace"))
+        desc = (d.get("description") or "").strip()
+        owner = ((d.get("owner") or {}).get("login") or "?")
+        files = d.get("files") or {}
+        parts = [f"# {desc or f'Gist {gid[:8]}'} (by {owner})", desc] \
+            if desc else [f"# Gist {gid[:8]} (by {owner})"]
+        for fname, f in list(files.items())[:10]:
+            text = (f.get("content") or "")[:3000]
+            parts.append(f"## {fname}\n\n```\n{text}\n```" if text else f"## {fname}")
+        content = "\n\n".join(p for p in parts if p).strip()
+        if not content:
+            return None
+        return _resp(f"https://gist.github.com/{gid}", content,
+                      "github-gist", desc or f"Gist {gid[:8]}")
+    except Exception:
+        return None
+
+
 # ── dispatch ──────────────────────────────────────────────────────────
 
 def _is_root_url(url: str) -> bool:
@@ -813,6 +1021,14 @@ async def fast_path_fetch(url: str) -> dict | None:
         probes.append(_hn_api)
     if _PYPI_RE.search(url) or _NPM_RE.search(url) or _CRATES_RE.search(url):
         probes.append(_registry_api)
+    if _ARXIV_RE.search(url):
+        probes.append(_arxiv_api)
+    if _HF_RE.search(url):
+        probes.append(_hf_api)
+    if _DOI_RE.search(url):
+        probes.append(_doi_api)
+    if _GIST_RE.search(url):
+        probes.append(_gist_api)
     for fn in probes:
         try:
             r = await fn(url)

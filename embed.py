@@ -80,8 +80,10 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
 def _dedup_rank(items: list[dict], query_embed: list[float] | None, sim_threshold: float = 0.92) -> list[dict]:
     if not items:
         return items
+    # any(), not all(): one missing embedding must not demote every other
+    # item to title-only dedup — _dedup_within_cluster handles None per item.
     embeds = [r.get("_embedding") for r in items]
-    has_embeds = query_embed is not None and all(e is not None for e in embeds)
+    has_embeds = query_embed is not None and any(e is not None for e in embeds)
     if has_embeds:
         deduped: list[dict] = []
         kept_embeds: list[list[float]] = []
