@@ -3,6 +3,8 @@
 export NV_KEY="nvapi-YOUR_KEY"
 export GROQ_API_KEYS="gsk-YOUR_KEY"
 export TAVILY_KEYS="tvly-dev-YOUR_KEY"
+export TINYFISH_KEYS="sk-tinyfish-YOUR_KEY"
+export ANYSEARCH_KEY="as_sk_YOUR_KEY"
 
 export RERANKER_MODEL="Alibaba-NLP/gte-reranker-modernbert-base"
 exec /home/sk/.local/share/venvs/mcp/bin/python3 "$(dirname "$0")/server.py" "$@"
