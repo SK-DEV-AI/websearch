@@ -1,16 +1,23 @@
-"""Structured extraction using crawl4ai — LLM-powered + CSS-driven + regex extraction."""
+"""Structured extraction — LLM-powered + CSS-driven + regex extraction.
+
+Runs on page HTML fetched through our own pipeline (fetch_url: httpx +
+trafilatura, CDP fallback for walled pages) — NOT a second Chromium.
+crawl4ai's AsyncWebCrawler used to launch its own Playwright Chromium here
+(~1 GB) alongside our Helium session; the strategies only need HTML, so we
+feed them directly. crawl4ai stays a dependency for the strategy classes.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 
-from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, LLMConfig
 from crawl4ai.extraction_strategy import (
     LLMExtractionStrategy,
     JsonCssExtractionStrategy,
     RegexExtractionStrategy,
 )
+from crawl4ai import LLMConfig
 
 _DEFAULT_LLM = "groq/openai/gpt-oss-120b"
 
@@ -74,42 +81,56 @@ async def extract_content(
         else:
             return {"success": False, "error": f"Unknown strategy: {strategy}"}
 
-        config = CrawlerRunConfig(
-            extraction_strategy=extraction_strategy,
-            cache_mode=None,
-            verbose=False,
-            page_timeout=30000,
-        )
+        # Page HTML via our own pipeline (shares Helium CDP + cache +
+        # SSRF gates with fetch) instead of a second Chromium.
+        from fetch import fetch_url
+        fetched = await fetch_url(url, max_chars=100000, output_format="html",
+                                  include_tables=True, cache_ttl=3600)
+        if not fetched.get("success"):
+            return {"success": False, "url": url,
+                    "error": fetched.get("error", "page fetch failed")}
+        page_html = fetched.get("content", "") or ""
+        if not page_html.strip():
+            return {"success": False, "url": url, "error": "empty page HTML"}
 
-        async with AsyncWebCrawler(verbose=False) as crawler:
-            result = await crawler.arun(url=url, config=config)
-
-        if not result.success:
-            return {"success": False, "error": str(result.error_message or "crawl failed")}
+        # Strategy .run() is SYNC (verified: not a coroutine) — call
+        # directly, never await (awaiting a list = "can't be awaited").
+        if strategy == "llm":
+            # LLM strategy still needs markdown input for chunking — derive
+            # it from the same fetch (no second request).
+            md_fetch = await fetch_url(url, max_chars=100000,
+                                       output_format="markdown",
+                                       include_tables=True, cache_ttl=3600)
+            page_md = md_fetch.get("content", "") if md_fetch.get("success") else ""
+            sections = [page_md[i:i + chunk_threshold * 4]
+                        for i in range(0, len(page_md), chunk_threshold * 4)] or [page_md]
+            raw = extraction_strategy.run(url, sections)
+        else:
+            raw = extraction_strategy.run(url, [page_html])
 
         output: dict[str, object] = {
-            "url": result.url,
+            "url": url,
             "success": True,
         }
 
         # Extract the structured data
-        raw = result.extracted_content
         if raw:
             try:
-                data = json.loads(raw) if isinstance(raw, str) else raw
+                data = raw[0] if isinstance(raw, list) and len(raw) == 1 else raw
+                data = json.loads(data) if isinstance(data, str) else data
                 output["data"] = data
             except (json.JSONDecodeError, TypeError):
                 s = str(raw)
                 output["data"] = s[:10000] + ("\n\n[... truncated ...]" if len(s) > 10000 else "")
 
-        # Include markdown if short
-        if hasattr(result, "markdown") and result.markdown:
-            md = result.markdown
-            if hasattr(md, "raw_markdown"):
-                text = md.raw_markdown
-            else:
-                text = str(md)
-            output["markdown"] = text[:5000] + ("\n\n[... truncated ...]" if len(text) > 5000 else "")
+        # Include markdown if short (reuse the fetched HTML->text; no crawler)
+        if strategy != "llm":
+            text_fetch = await fetch_url(url, max_chars=5000,
+                                         output_format="markdown",
+                                         cache_ttl=3600)
+            if text_fetch.get("success") and text_fetch.get("content"):
+                text = text_fetch["content"]
+                output["markdown"] = text[:5000] + ("\n\n[... truncated ...]" if len(text) > 5000 else "")
 
         return output
 

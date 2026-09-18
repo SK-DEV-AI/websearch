@@ -19,11 +19,11 @@ async def search_tavily(query: str, n: int = 10, topic: str = "general",
                         include_domains: list | None = None,
                         exclude_domains: list | None = None,
                         chunks_per_source: int = 0,
-                        start_date: str = "", end_date: str = "") -> list[dict]:
+                        start_date: str = "", end_date: str = "") -> dict:
     """Tavily search — AI-optimized with 1K free reqs/month per key. Returns answer + results."""
     key = _next_tavily_key()
     if not key:
-        return []
+        return {"results": [], "answer": ""}
     body: dict[str, Any] = {"query": query, "search_depth": search_depth,
                             "max_results": min(n, 20), "include_answer": include_answer,
                             "include_raw_content": include_raw_content,
@@ -50,13 +50,14 @@ async def search_tavily(query: str, n: int = 10, topic: str = "general",
                          timeout=15)
         if r.status_code != 200:
             logger.warning("Tavily non-200: %s %s", r.status_code, r.text[:200])
-            return []
+            return {"results": [], "answer": ""}
         data = r.json()
         results: list[dict] = []
+        # Tavily's synthesized answer is surfaced as a first-class field,
+        # NOT a result entry: url-less entries are dropped by the consume
+        # loop (research.py requires r.get("url")), so an entry here paid
+        # quota + tokens and never reached the model.
         answer = data.get("answer", "")
-        if answer:
-            results.append({"title": "Tavily Answer", "url": "",
-                           "snippet": answer[:1000], "engine": "tavily-answer"})
         for item in (data.get("results", []) or []):
             url = item.get("url", "")
             if not url:
@@ -67,10 +68,10 @@ async def search_tavily(query: str, n: int = 10, topic: str = "general",
             if item.get("score"):
                 entry["score"] = item["score"]
             results.append(entry)
-        return results
+        return {"results": results, "answer": answer}
     except httpx.HTTPError as e:
         logger.warning("Tavily search failed: %s", e)
-        return []
+        return {"results": [], "answer": ""}
 
 
 

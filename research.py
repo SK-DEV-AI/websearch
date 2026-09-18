@@ -302,6 +302,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     _seen_urls: set[str] = set()
     engine_totals: dict[str, int] = {}
     ai_answer = ""
+    tavily_answer = ""
     follow_up = ""
 
     async def _gai_search():
@@ -381,14 +382,22 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             )
             out = []
             total_available = 0
+            tavily_answer = ""
             for r in results:
                 if isinstance(r, dict):
                     out.extend(r.get("results", []))
                     if r.get("total_available", 0) > total_available:
                         total_available = r["total_available"]
+                    # Tavily's synthesized answer rides along here (first
+                    # non-empty wins) — surfaced as a field, not an entry.
+                    if not tavily_answer and r.get("answer"):
+                        tavily_answer = r["answer"]
                 elif isinstance(r, list):
                     out.extend(r)
-            return {"results": out, "total_available": total_available}
+            merged_out: dict = {"results": out, "total_available": total_available}
+            if tavily_answer:
+                merged_out["tavily_answer"] = tavily_answer
+            return merged_out
 
         multi_variants = queries[:2]  # original query + best expanded variant
 
@@ -461,6 +470,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             if isinstance(val, dict):
                 results_list = val.get("results", [])
                 ta = val.get("total_available", 0)
+                if key == "tavily" and val.get("tavily_answer"):
+                    tavily_answer = val["tavily_answer"]
             elif isinstance(val, list):
                 results_list = val
                 ta = 0
@@ -606,7 +617,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     out: dict = {"success": True, "engines_used": engines_used,
                  "engine_blocked": engine_blocked,
                  "engine_totals": engine_totals,
-                 "ai_answer": ai_answer, "follow_up": follow_up,
+                 "ai_answer": ai_answer, "tavily_answer": tavily_answer,
+                 "follow_up": follow_up,
                  "related_queries": related,
                  "merged_total": total_merged, "weak": weak,
                  "results": deduped[:count], "total": len(deduped[:count]),
