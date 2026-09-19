@@ -813,12 +813,15 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                                 url=url, raw_html=(raw_html or "").encode("utf-8", errors="replace") if isinstance(raw_html, str) else (raw_html or b""))
         result["quality"] = q
         result["low_quality"] = q < QUALITY_FLOOR
-        # ── C3: MinerU-HTML rescue (opt-in) ────────────────────────
+        # ── C3: MinerU-HTML rescue (auto-escalate) ─────────────────
         # The SLM main-content extractor is heavy (model ~1.2 GB
-        # resident, seconds per page on CPU) — only for callers who
-        # ask for it AND score below the requested floor. Minerva
-        # never overrides a decent extraction.
-        if mineru and config.MINERU_ENABLED and q < (quality_floor or QUALITY_FLOOR):
+        # resident, seconds per page on CPU) — but the quality scorer
+        # already knows when extraction failed, so escalate automatically
+        # when enabled instead of waiting for the model to pass the flag.
+        # Explicit mineru=True forces it even at decent quality; the
+        # default path fires on low quality alone. MinerU never overrides
+        # a decent extraction unless explicitly asked.
+        if config.MINERU_ENABLED and (mineru or q < (quality_floor or QUALITY_FLOOR)):
             try:
                 from mineru_extract import extract_with_mineru
                 mr = await extract_with_mineru(raw_html, output_format=output_format)

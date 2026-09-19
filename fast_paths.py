@@ -70,6 +70,39 @@ async def _llms_txt(url: str) -> dict | None:
     return _resp(url, body, "llms.txt", f"llms.txt for {p.netloc}")
 
 
+async def _md_accept(url: str) -> dict | None:
+    """Accept: text/markdown fast path (Parallel docs convention, now
+    standard on docs sites): fetch the page itself asking for markdown.
+    Sites that honor it (Mintlify, Docusaurus v3, Starlight) return clean
+    LLM-ready markdown — no trafilatura mangling. Others ignore the header
+    and return HTML, which we reject so the generic pipeline handles it."""
+    try:
+        await _validate_url(url)
+    except SecurityError:
+        return None
+    try:
+        resp = await AsyncFetcher.get(url, timeout=12, stealthy_headers=False,
+                                      headers={"Accept": "text/markdown"})
+    except Exception:
+        return None
+    if resp is None or resp.status != 200:
+        return None
+    ct = ""
+    try:
+        ct = (resp.headers.get("content-type", "") or "").lower()
+    except Exception:
+        pass
+    if "markdown" not in ct and "text/plain" not in ct:
+        return None  # server ignored the header — fall through
+    body = resp.body
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+    if not body or not body.strip() or len(body) > 2_000_000:
+        return None
+    return _resp(url, body.strip(), "md-accept",
+                  f"markdown via Accept header for {urlparse(url).netloc}")
+
+
 # ── YouTube transcript ────────────────────────────────────────────────
 
 _YT_RE = re.compile(
@@ -1029,6 +1062,9 @@ async def fast_path_fetch(url: str) -> dict | None:
         probes.append(_doi_api)
     if _GIST_RE.search(url):
         probes.append(_gist_api)
+    # Last resort before the generic pipeline: docs sites honoring
+    # Accept: text/markdown return clean markdown; others fall through.
+    probes.append(_md_accept)
     for fn in probes:
         try:
             r = await fn(url)

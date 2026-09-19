@@ -600,6 +600,16 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             apply_coverage(query, merged)
             apply_authority(query, intent, merged)
             apply_six_signal(effective_query, intent, merged, ai_answer)
+            # Feed consensus back into ghost-tier learning: a host whose
+            # results survive merge with high blended scores teaches
+            # success; hosts that merge but score ~0 teach failure. Fetch
+            # outcomes alone taught the wrong lesson (fetchable-but-junk
+            # domains looked healthy).
+            # NOTE: consensus feedback intentionally NOT wired —
+            # record_fetch's else-branch stamps last_cold_check for
+            # TERMINAL verdicts (ghost_state.py:284), which would route
+            # low-scoring-but-fetchable hosts straight to the browser.
+            # Search relevance must not poison fetch-tier routing.
             deduped = finalize(merged, count + 1)
             total_merged = merged_total(per_engine)
             weak = is_weak(deduped, total_merged)
