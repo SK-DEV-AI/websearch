@@ -49,6 +49,7 @@ async def map_site(
     include_links: bool = True,
     same_domain: bool = True,
     exclude_patterns: list[str] | None = None,
+    rank: bool = False,
 ) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
@@ -129,6 +130,13 @@ async def map_site(
             if results and source == "none":
                 source = "links"
 
+    # Ranked mode: score each URL by fetch quality + merge priors so the
+    # caller gets important-first order instead of sitemap-alphabetical.
+    # Canonical dedupe via merge.norm_key (sitemap vs link variants of the
+    # same page collapse). Off by default — costs one scored pass.
+    if rank and results:
+        results = await _rank_urls(results, max_urls)
+
     return {
         "success": True,
         "url": url,
@@ -137,6 +145,41 @@ async def map_site(
         "total": len(results),
         "urls": results[:max_urls],
     }
+
+
+async def _rank_urls(
+    entries: list[dict[str, Any]], max_urls: int,
+) -> list[dict[str, Any]]:
+    """Dedupe by canonical key, score by fetch quality, important-first."""
+    from merge import norm_key
+    from fetch import fetch_url
+    import asyncio
+
+    # Canonical dedupe: first occurrence wins (sitemap beats link-follow).
+    uniq: dict[str, dict[str, Any]] = {}
+    for e in entries:
+        k = norm_key(e["url"])
+        if k not in uniq:
+            uniq[e["url"]] = e
+    deduped = list(uniq.values())
+
+    async def _score(e: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+        try:
+            f = await fetch_url(e["url"], max_chars=2000, cache_ttl=86400)
+            q = float(f.get("quality", 0.0)) if f.get("success") else 0.0
+        except Exception:
+            q = 0.0
+        # Sitemap signals: priority/changefreq/lastmod are author-ranked
+        # importance — use them directly instead of a domain guess.
+        prior = float(e.get("priority", 0.0) or 0.0) / 1.0
+        freq_boost = {"always": 0.3, "hourly": 0.25, "daily": 0.2,
+                      "weekly": 0.1, "monthly": 0.05}.get(
+            str(e.get("changefreq", "")).lower(), 0.0)
+        return (q * 0.7 + prior * 0.2 + freq_boost, e)
+
+    scored = await asyncio.gather(*[_score(e) for e in deduped[:max_urls]])
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [{**e, "rank_score": round(s, 3)} for s, e in scored]
 
 
 async def _parse_sitemap_recursive(

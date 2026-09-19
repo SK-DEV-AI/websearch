@@ -163,8 +163,9 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "include_sitemap": {"type": "boolean", "default": True, "description": "Try sitemap discovery first"},
                 "include_links": {"type": "boolean", "default": True, "description": "Fall back to HTML link extraction when no sitemap"},
                 "same_domain": {"type": "boolean", "default": True, "description": "Only include URLs from the same domain"},
-                 "exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex patterns to exclude matching URLs"}},
-                 "required": ["url"]}),
+                 "exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex patterns to exclude matching URLs"},
+                 "rank": {"type": "boolean", "default": False, "description": "Score each URL by fetch quality + sitemap priority and return important-first with rank_score (costs one scored pass; use before deep-fetching a site)"}},
+                  "required": ["url"]}),
          Tool(name="extract",
             description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Persistent cache — repeat calls free. For LLM strategy, describe what you want and get clean JSON back. For CSS strategy, provide field names (fastest, free). For raw page content, use `fetch` instead. Examples: extract(url='...', instruction='extract product name and price') or extract(url='...', fields=['name','price'], strategy='css')",
             input_schema={"type": "object", "properties": {
@@ -629,7 +630,8 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 include_sitemap=bool(arguments.get("include_sitemap",True)),
                 include_links=bool(arguments.get("include_links",True)),
                 same_domain=bool(arguments.get("same_domain",True)),
-                exclude_patterns=arguments.get("exclude_patterns"))
+                exclude_patterns=arguments.get("exclude_patterns"),
+                rank=bool(arguments.get("rank", False)))
             return _res(r)
         else:
             return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": f"Unknown tool: {name}"})))], is_error=True)
