@@ -3,7 +3,9 @@
 Architecture:
 - Single CDP connection to Helium (http://127.0.0.1:9222), shared across calls
 - Hidden pages via Target.createTarget(background=true) — no tab flashing
-- 4-stage completion detection (SVG → aria-label → text → timeout)
+- Completion detection: explicit marker (thumbs-up / ready announcement) plus a
+  settled-length check, backed by a content-stability watchdog so a Google UI
+  change can never burn the full deadline again
 - SERPO citation extraction with [CITE-N] markers → sequential footnotes
 
 Reference: https://github.com/PleasePrompto/google-ai-mode-mcp
@@ -52,6 +54,47 @@ AI_COMPLETION_TEXT_INDICATORS = [
 GAI_ERROR_TEXT_INDICATORS = [
     "something went wrong and an ai response wasn't generated",
 ]
+
+# Google AI Mode announces a finished answer in a polite aria-live region.
+# Localized per locale, so only the common substring is matched.
+GAI_READY_TEXT_INDICATORS = [
+    "response is ready", "answer is ready",
+    "ki-modus ist fertig", "modus ia est prête",
+    "modo ia está lista",
+]
+
+# Locale-independent completion marker: the per-answer overflow menu is not
+# localized ("More options for this response" stays English on de/fr/es), and it
+# renders inside the answer turn only once that turn is complete. This is the
+# marker that keeps non-English locales off the slow watchdog path.
+GAI_MORE_OPTIONS_LABEL = "More options for this response"
+
+# Thumbs-up/down feedback labels, localized. Only checked as a fallback.
+GAI_THUMBS_LABEL_RE = (
+    r"^(good|bad) response$"
+    r"|^(gute|schlechte) antwort$"
+    r"|^(bonne|mauvaise) réponse$"
+    r"|^(buena|mala) respuesta$"
+    r"|^(buona|cattiva) risposta$"
+    r"|^(goed|slecht) antwoord$"
+)
+
+# Streaming-in-progress controls, localized. Suppresses the marker path.
+GAI_STOP_LABEL_RE = (
+    r"^(stop|stop generating|stop responding)$"
+    r"|^(stoppen|generierung stoppen)$"
+    r"|^(arrêter|arrêter la génération)$"
+    r"|^(detener|detener la generación)$"
+    r"|^(interrompi|interrompi la generazione)$"
+)
+
+# Marker path: an explicit "finished" signal plus settled content length.
+# Watchdog: last-resort safety net for a future Google UI change. Deliberately
+# lax — it must never cut a slow answer short, only rescue the case where every
+# marker has disappeared.
+GAI_STABLE_POLLS_MARKER = 8      # 4.0s of no growth after an explicit marker
+GAI_STABLE_POLLS_WATCHDOG = 120   # 60.0s of no growth with no usable marker
+GAI_WATCHDOG_MIN_CHARS = 1200    # below this it is the pre-stream shell
 
 CUTOFF_MARKERS = [
     "AI-generated answers may contain mistakes", "AI can make mistakes",
@@ -195,7 +238,8 @@ class CompletionResult:
     """Result from _wait_for_completion, letting the caller know which stage fired."""
     def __init__(self, success: bool, method: str):
         self.success = success
-        self.method = method  # "svg" | "aria" | "text" | "timeout" | "captcha" | "blocked"
+        # "menu" | "thumbs" | "ready" | "svg" | "text" | "watchdog" | "timeout" | "error-text"
+        self.method = method
 
 
 class GoogleAIClient:
@@ -401,16 +445,60 @@ class GoogleAIClient:
     # ── Completion detection ──────────────────────────────────────
 
     async def _wait_for_completion(self, p: CDPPage, deadline_seconds: float) -> CompletionResult:
-        """5-stage detection: SVG → aimc → content-settled → text → timeout.
+        """Wait for the AI answer to finish streaming.
+
+        Two independent paths, polled together at 500ms:
+
+        1. Marker path (fast, ~4s) — an explicit finished signal, all scoped to
+           the last ``[data-subtree=aimc]`` answer turn so unrelated page chrome
+           can never satisfy it:
+             a. the per-answer "More options for this response" overflow menu
+                (locale-independent — the primary signal)
+             b. the localized Good/Bad response feedback buttons
+             c. the localized aria-live "... response is ready" announcement
+             d. the legacy AI disclaimer text
+           plus the content length holding still for GAI_STABLE_POLLS_MARKER
+           polls, and no visible Stop control.
+
+        2. Watchdog (lax, 60s) — no usable marker but the answer is already
+           substantial and completely stopped growing. Only rescues the case
+           where Google changed its UI again; never fires during real streaming.
 
         Vectorized: a SINGLE ``Runtime.evaluate`` per poll returns all state
-        (svg/aimc presence, error hit, AI-marker hit, text length) instead of
-        4 round-trips + 2 whole-body innerText transfers per 500ms.
+        instead of 4 round-trips + 2 whole-body innerText transfers per 500ms.
         """
         sniff_js = f"""() => {{
-            const out = {{svg: false, aimc: false, err: '', ai: false, len: 0}};
-            out.svg = !!document.querySelector('button svg[viewBox="3 3 18 18"]');
-            out.aimc = !!document.querySelector('[data-subtree=aimc]');
+            const out = {{svg: false, aimc: false, err: false, ai: false,
+                         ready: false, thumbs: false, menu: false,
+                         streaming: false, len: 0}};
+            function isVisible(el) {{
+                if (!el) return false;
+                try {{
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden'
+                        && s.opacity !== '0' && el.offsetParent !== null
+                        && r.width > 0 && r.height > 0;
+                }} catch (e) {{ return false; }}
+            }}
+            const turns = document.querySelectorAll('[data-subtree=aimc]');
+            const turn = turns[turns.length - 1];
+            out.aimc = !!turn;
+            const thumbsRe = new RegExp({json.dumps(GAI_THUMBS_LABEL_RE)}, 'i');
+            const stopRe = new RegExp({json.dumps(GAI_STOP_LABEL_RE)}, 'i');
+            const menuRe = new RegExp('^' + {json.dumps(GAI_MORE_OPTIONS_LABEL)} + '$', 'i');
+            const allBtns = Array.from(document.querySelectorAll('button,[role=button]'));
+            const lbl = b => (b.getAttribute('aria-label') || '').trim();
+            // Stop control is page-wide: streaming may not have painted a turn yet.
+            out.streaming = allBtns.some(b => isVisible(b) && stopRe.test(lbl(b)));
+            if (turn) {{
+                const btns = Array.from(turn.querySelectorAll('button,[role=button]'))
+                    .filter(isVisible).map(lbl);
+                out.menu = btns.some(l => menuRe.test(l));
+                out.thumbs = btns.some(l => thumbsRe.test(l));
+                // Legacy glyph fallback for the pre-Material-Symbols UI.
+                out.svg = !!turn.querySelector('button svg[viewBox="3 3 18 18"]');
+            }}
             const text = document.body?.innerText || '';
             out.len = text.length;
             const low = text.toLowerCase();
@@ -419,6 +507,9 @@ class GoogleAIClient:
             }}
             for (const i of {json.dumps(AI_COMPLETION_TEXT_INDICATORS)}) {{
                 if (text.includes(i)) {{ out.ai = true; break; }}
+            }}
+            for (const r of {json.dumps(GAI_READY_TEXT_INDICATORS)}) {{
+                if (low.includes(r)) {{ out.ready = true; break; }}
             }}
             return out;
         }}"""
@@ -434,15 +525,28 @@ class GoogleAIClient:
                 if snap.get("err"):
                     await p.terminate_execution()
                     return CompletionResult(False, "error-text")
-                if (snap.get("svg") and snap.get("aimc")) or snap.get("ai"):
-                    cur = snap.get("len", 0)
-                    if cur == prev_len:
-                        stable_count += 1
-                        if stable_count >= 6:
-                            return CompletionResult(True, "svg" if snap.get("svg") else "text")
-                    else:
-                        prev_len = cur
-                        stable_count = 0
+                cur = snap.get("len", 0)
+                if cur == prev_len:
+                    stable_count += 1
+                else:
+                    prev_len = cur
+                    stable_count = 0
+
+                if not snap.get("streaming"):
+                    if snap.get("aimc") and (
+                            snap.get("menu") or snap.get("thumbs")
+                            or snap.get("ready") or snap.get("svg")
+                            or snap.get("ai")):
+                        if stable_count >= GAI_STABLE_POLLS_MARKER:
+                            method = ("menu" if snap.get("menu") else
+                                      "thumbs" if snap.get("thumbs") else
+                                      "ready" if snap.get("ready") else
+                                      "svg" if snap.get("svg") else "text")
+                            return CompletionResult(True, method)
+                    elif (snap.get("aimc")
+                          and cur >= GAI_WATCHDOG_MIN_CHARS
+                          and stable_count >= GAI_STABLE_POLLS_WATCHDOG):
+                        return CompletionResult(True, "watchdog")
             await asyncio.sleep(0.5)
         await p.terminate_execution()
         return CompletionResult(False, "timeout")
