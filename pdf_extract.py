@@ -18,9 +18,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from config import get_http_client
-from security import safe_fetch, validate_url
+from security import safe_stream, validate_url
 
 __all__ = ["extract_pdf"]
+
+_PDF_MAX_BYTES = 50 * 1024 * 1024  # 50MB cap: unbounded r.content was a zip-bomb vector
 
 _OCR_PAGE_BUDGET = 300  # seconds for a whole docling run
 _OCR_INIT_BUDGET = 30  # seconds for docling init (import + converter build);
@@ -33,9 +35,8 @@ _EXT = {"markdown": "md", "json": "json", "html": "html"}
 
 async def _download_pdf(url: str, dst: Path) -> Path:
     c = get_http_client()
-    r = await safe_fetch(c, url, timeout=60)
-    r.raise_for_status()
-    dst.write_bytes(r.content)
+    body = await safe_stream(c, url, max_bytes=_PDF_MAX_BYTES, timeout=60)
+    dst.write_bytes(body)
     return dst
 
 

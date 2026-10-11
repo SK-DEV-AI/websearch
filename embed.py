@@ -27,6 +27,9 @@ async def _next_nv_key() -> str:
         return k
 
 
+_EMBED_BATCH = 50
+
+
 async def _embed(texts: list[str], input_type: str = "passage",
                  embed_model: str = "", encoding_format: str = "float") -> list[list[float]] | None:
     if not _NV_KEYS:
@@ -42,11 +45,15 @@ async def _embed(texts: list[str], input_type: str = "passage",
         else:
             uncached.append(t)
             uncached_idx.append(i)
-    if uncached:
+    # Chunk at ~50 texts/call: a whole uncached list in one NV POST can
+    # oversize the request on large enrich batches.
+    for start in range(0, len(uncached), _EMBED_BATCH):
+        batch = uncached[start:start + _EMBED_BATCH]
+        batch_idx = uncached_idx[start:start + _EMBED_BATCH]
         nv_key = await _next_nv_key()
         model = embed_model or NV_EMBED_MODEL
         body_payload: dict[str, Any] = {
-            "model": model, "input": uncached,
+            "model": model, "input": batch,
             "input_type": input_type, "encoding_format": encoding_format,
             "truncate": "END",
         }
@@ -56,15 +63,15 @@ async def _embed(texts: list[str], input_type: str = "passage",
                              headers={"Authorization": f"Bearer {nv_key}"}, timeout=30)
             if r.status_code == 200:
                 data = r.json()
-                for idx, row in zip(range(len(uncached)), data.get("data", [])):
+                for idx, row in zip(range(len(batch)), data.get("data", [])):
                     emb = row.get("embedding")
                     if emb:
                         if encoding_format == "base64" and isinstance(emb, str):
                             decoded = base64.b64decode(emb)
                             emb = list(map(float, struct.unpack(f'{len(decoded)//4}f', decoded)))
-                        orig_idx = uncached_idx[idx]
+                        orig_idx = batch_idx[idx]
                         results[orig_idx] = emb
-                        await _set_cache(f"emb:{input_type}:{encoding_format}:{hashlib.sha256(uncached[idx].encode()).hexdigest()}", emb)
+                        await _set_cache(f"emb:{input_type}:{encoding_format}:{hashlib.sha256(batch[idx].encode()).hexdigest()}", emb)
         except (httpx.HTTPError, ValueError, KeyError):
             pass
     return results

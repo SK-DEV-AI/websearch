@@ -22,6 +22,11 @@ _lock = asyncio.Lock()
 async def _fetch_robots(netloc: str) -> Protego | None:
     url = f"https://{netloc}/robots.txt"
     try:
+        from security import validate_url as _validate_url
+        url = await _validate_url(url)
+    except Exception:
+        return None
+    try:
         resp = await AsyncFetcher.get(url, timeout=8, headers={"User-Agent": UA})
     except Exception:
         return None

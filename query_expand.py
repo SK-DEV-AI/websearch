@@ -10,46 +10,31 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
+
+from config import _KeyRotator
 
 logger = logging.getLogger("query_expand")
 
-_GROQ_KEYS: list[str] = []
-_key_idx = 0
-_KEY_LOCK = asyncio.Lock()
+_groq_rotator = _KeyRotator("GROQ_API_KEYS")
+_next_key = _groq_rotator.next
 
 
-def _init():
-    global _GROQ_KEYS
-    raw = os.environ.get("GROQ_API_KEYS", "")
-    if raw:
-        _GROQ_KEYS[:] = [k.strip() for k in raw.split(",") if k.strip()]
-
-
-async def _next_key() -> str | None:
-    global _key_idx
-    async with _KEY_LOCK:
-        if not _GROQ_KEYS:
-            _init()
-        if not _GROQ_KEYS:
-            return None
-        key = _GROQ_KEYS[_key_idx % len(_GROQ_KEYS)]
-        _key_idx = (_key_idx + 1) % len(_GROQ_KEYS)
-        return key
-
-
-async def expand_query(query: str) -> list[str]:
+async def expand_query(query: str, model: str | None = None) -> list[str]:
     """Expand a short/vague query into diverse search variations.
 
     Returns [original, variation1, variation2, ...] up to 4 total.
     Only expands queries that are short (<5 words or <=80 chars).
+    model defaults to the cheap lane (llama-3.1-8b-instant).
     """
     if len(query.split()) >= 8 or len(query) > 80:
         return [query]
     key = await _next_key()
     if not key:
         return [query]
+    if model is None:
+        from config import GROQ_CHEAP_MODEL
+        model = GROQ_CHEAP_MODEL
 
     prompt = (
         "Output exactly 2 keyword-only search query variations. Each variation "
@@ -64,7 +49,7 @@ async def expand_query(query: str) -> list[str]:
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={
-                "model": "openai/gpt-oss-120b",
+                "model": model,
                 "messages": [
                     {"role": "system", "content": "Generate exactly 2 keyword-only search query variations. One query per line. No numbering. No prefixes. No explanations."},
                     {"role": "user", "content": prompt},

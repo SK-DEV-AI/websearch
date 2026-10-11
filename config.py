@@ -21,6 +21,7 @@ HELIUM_CDP = "http://127.0.0.1:9222"
 NV_KEY = os.environ.get("NV_KEY", "")
 NV_BASE = "https://integrate.api.nvidia.com/v1"
 NV_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2"
+NV_EMBED_DIMS = 2048  # llama-nemotron-embed-1b-v2 output dims (codesearch uses nv-embedcode-7b-v1/4096 — deliberate split, see impl-infra.md)
 
 
 class _KeyRotator:
@@ -64,6 +65,13 @@ def _next_tavily_key() -> str:
 TINYFISH_KEYS = [k.strip() for k in os.environ.get("TINYFISH_KEYS", "").split(",") if k.strip()]
 
 GROQ_API_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEYS", "").split(",") if k.strip()]
+
+# ── Groq model split (proposal 1): scarce gpt-oss quota (1k RPD) is for
+# synthesis/grounding/extract-llm; cheap high-volume ops (rewrite/classify/
+# expand/decompose) use llama-3.1-8b-instant (14.4k RPD). Plain constants —
+# env keys belong to the infra worker.
+GROQ_SMART_MODEL = "openai/gpt-oss-120b"
+GROQ_CHEAP_MODEL = "llama-3.1-8b-instant"
 RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "Alibaba-NLP/gte-reranker-modernbert-base")
 
 # ── steal-theme config (C2/E2/B1/A2/ghost-tier/C3) ─────────────

@@ -137,6 +137,30 @@ async def map_site(
     if rank and results:
         results = await _rank_urls(results, max_urls)
 
+    # Common Crawl domain-survey assist (proposal 8): when sitemap + links
+    # both came up thin (<10 URLs), ask the CC index for the domain's pages.
+    # Gated: same_domain on, depth 0 only (explicit survey calls), cap 200.
+    if len(results) < 10 and same_domain and max_depth == 0:
+        try:
+            from recovery_tiers import cc_lookup
+            cc_recs = await cc_lookup(parsed.netloc, limit=200)
+            seen_urls = {e["url"] for e in results}
+            for rec in cc_recs:
+                u = rec.get("url", "")
+                if not u or u in seen_urls:
+                    continue
+                if exclude and exclude.search(u):
+                    continue
+                if not u.startswith(base):
+                    continue
+                seen_urls.add(u)
+                results.append({"url": u, "source": "commoncrawl",
+                                "crawled": rec.get("timestamp", "")})
+                if len(results) >= max_urls:
+                    break
+        except Exception:
+            pass
+
     return {
         "success": True,
         "url": url,

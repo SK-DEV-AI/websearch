@@ -19,20 +19,21 @@ from crawl4ai.extraction_strategy import (
 )
 from crawl4ai import LLMConfig
 
+from config import _KeyRotator
+
+_groq_rotator = _KeyRotator("GROQ_API_KEYS")
+
 _DEFAULT_LLM = "groq/openai/gpt-oss-120b"
 
 
-def _groq_key() -> str:
-    raw = os.environ.get("GROQ_API_KEYS", "")
-    if raw:
-        return raw.split(",")[0].strip()
-    return ""
+async def _groq_key() -> str | None:
+    return await _groq_rotator.next()
 
 
 async def extract_content(
     url: str,
     instruction: str | None = None,
-    strategy: str = "llm",
+    strategy: str = "css",
     fields: list[str] | None = None,
     provider: str = _DEFAULT_LLM,
     chunk_threshold: int = 2000,
@@ -48,7 +49,7 @@ async def extract_content(
         extraction_strategy = None
 
         if strategy == "llm":
-            groq_key = _groq_key()
+            groq_key = await _groq_key()
             if not groq_key:
                 return {"success": False, "error": "No GROQ_API_KEYS configured for LLM extraction"}
             instruction_text = instruction or "Extract all important content from this page as structured JSON"

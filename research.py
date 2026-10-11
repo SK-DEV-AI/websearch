@@ -171,12 +171,20 @@ def _detect_tinyfish_type(query: str) -> str:
 
 
 async def _groq_text(sys_prompt: str, user_prompt: str,
-                     temperature: float = 0.2, max_tokens: int = 300) -> str | None:
-    """One Groq call returning trimmed text; None on any failure (caller falls back)."""
+                     temperature: float = 0.2, max_tokens: int = 300,
+                     model: str | None = None) -> str | None:
+    """One Groq call returning trimmed text; None on any failure (caller falls back).
+
+    model defaults to the cheap lane (llama-3.1-8b-instant); synthesis and
+    grounding use the smart model via explicit model= at their call sites.
+    """
     from query_expand import _next_key
     key = await _next_key()
     if not key:
         return None
+    if model is None:
+        from config import GROQ_CHEAP_MODEL
+        model = GROQ_CHEAP_MODEL
     try:
         from config import get_http_client
         c = get_http_client()
@@ -184,7 +192,7 @@ async def _groq_text(sys_prompt: str, user_prompt: str,
             r = await c.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"model": "openai/gpt-oss-120b",
+                json={"model": model,
                       "messages": [{"role": "system", "content": sys_prompt},
                                    {"role": "user", "content": user_prompt}],
                       "temperature": temperature, "max_tokens": max_tokens},
@@ -672,6 +680,37 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
         url = f.get("url") if isinstance(f, dict) else None
         orig = by_url.get(url)
         if not orig:
+            continue
+        # CDX-history recovery (proposal 4): before the 0.5x demote, try
+        # alternate Wayback snapshots via the CDX API (closest-only
+        # fallbacks in fetch already failed at this point). First good
+        # snapshot rejoins the kept pool with its snapshot timestamp.
+        recovered = None
+        if url and not (isinstance(f, dict) and
+                        f.get("verdict") in ("CHALLENGE", "TERMINAL")):
+            try:
+                from recovery_tiers import cdx_fetch_snapshot, cdx_history
+                for snap in await cdx_history(url, limit=3):
+                    got = await cdx_fetch_snapshot(snap["url"])
+                    if got and got.get("content"):
+                        recovered = {
+                            **orig,
+                            "content": got["content"],
+                            "title": got.get("title") or orig.get("title", ""),
+                            "url": url,
+                            "success": True,
+                            "cached_from": (
+                                "web.archive.org "
+                                f"({snap.get('timestamp', '')[:4]}-"
+                                f"{snap.get('timestamp', '')[4:6]}-"
+                                f"{snap.get('timestamp', '')[6:8]})"),
+                            "snapshot_url": snap["url"],
+                        }
+                        break
+            except Exception:
+                recovered = None
+        if recovered:
+            kept.append(recovered)
             continue
         entry = {
             **orig,

@@ -1,6 +1,6 @@
 # websearch MCP Server
 
-Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, Brave, Tavily, Wikipedia, arXiv, Google News RSS (plus opt-in Marginalia), Google AI Mode, and intent-gated vertical lanes (MDN, Stack Exchange, GitHub, HN, Semantic Scholar) — with consensus-merge dedup, a local cross-encoder reranker, and Groq synthesis with grounding checks.
+Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, Brave, Tavily, Wikipedia, arXiv, Google News RSS (+ best-effort Marginalia for independent-index recall), Google AI Mode, and intent-gated vertical lanes (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV vuln, grep.app/Sourcegraph code, GDELT news) — with consensus-merge dedup, a local cross-encoder reranker, and Groq synthesis with grounding checks.
 
 ## Tools (9)
 
@@ -47,3 +47,7 @@ Everything else (DDG, Brave scrape, Wikipedia, arXiv, RSS) is keyless.
 - **Helium CDP (optional):** bot-walled pages escalate to a Chrome DevTools browser at `127.0.0.1:9222` when available; without it those pages return a terminal verdict instead of hanging.
 - **Caching:** fetch results cache for 1h (`cache_ttl=0` forces fresh). No database, no state beyond the cache dir.
 - **Safety:** all user-URL fetches are SSRF-validated (private-IP blocking + redirect-hop revalidation + robots.txt gate).
+- **Groq model split:** synthesis + grounding + extract-llm use `openai/gpt-oss-120b`; rewrite/classify/expand/decompose use `llama-3.1-8b-instant` (14.4k RPD). Constants `GROQ_SMART_MODEL`/`GROQ_CHEAP_MODEL` in config.py.
+- **New lanes (all keyless, advisory-only):** OSV.dev vuln vertical + CVE fast path (NVD fallback); grep.app code vertical (Sourcegraph backup); GDELT news supplement; Jina Reader pre-CDP tier; Wayback CDX-history recovery in enrich(); Common Crawl domain-survey assist in map_site.
+- **Optional keys (graceful keyless fallback):** `SE_KEY`/`STACKEXCHANGE_KEY` (10k/day SE), `S2_KEY`/`S2_API_KEY` (dedicated S2 1 RPS).
+- **Marginalia:** best-effort lane only (shared public key pool, 503s under load); independent-index recall, no dedicated key wired (kontakt@marginalia.nu for one).

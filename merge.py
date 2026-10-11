@@ -34,7 +34,8 @@ MAX_PER_DOMAIN = 2
 VERTICAL_WEIGHT = 0.6
 BLEND_ALPHA = 0.6
 
-_VERTICALS = {"github", "hn", "wikipedia", "scholar", "news", "arxiv", "stackexchange", "mdn", "reddit"}
+_VERTICALS = {"github", "hn", "wikipedia", "scholar", "news", "arxiv", "stackexchange", "mdn", "reddit",
+              "vuln", "code", "gdelt"}
 
 
 def is_vertical(engine: str) -> bool:
@@ -284,6 +285,8 @@ _PAPER_SIGNALS = ["paper", "papers", "study", "studies", "research", "arxiv", "s
                   "thesis", "experiment", "dataset", "benchmark"]
 _NEWS_SIGNALS = ["news", "headlines", "breaking", "latest", "today", "update", "coverage",
                  "election", "market", "stock", "war", "crash", "report"]
+_VULN_SIGNALS = ["cve-", "ghsa-", "rustsec-", "vulnerability", "vulnerabilities",
+                 "security advisory", "exploit"]
 _ENTITY_SIGNALS = ["what is", "who is", "who was", "define", "meaning of"]
 _CONCEPT_SIGNALS = ["what is", "who is", "who was", "explained", "explain", "how does",
                     "how do ", "meaning", "concept", "theory", "mechanism", "history of",
@@ -301,13 +304,16 @@ def detect_intent(query: str) -> str:
     code = sum(1 for s in _CODE_STRONG if s in q) + (sum(1 for s in _CODE_TECH_GATED if s in q) + 1 if tech else 0)
     paper = sum(1 for s in _PAPER_SIGNALS if s in q)
     news = sum(1 for s in _NEWS_SIGNALS if s in q)
+    vuln = sum(2 for s in _VULN_SIGNALS if s in q)
     entity = sum(1 for s in _ENTITY_SIGNALS if s in q)
-    best = max(code, paper, news, entity)
+    best = max(code, paper, news, vuln, entity)
     if best == 0:
         words = query.split()
         if len(words) <= 3 and sum(1 for w in words if w[:1].isupper()) >= 2:
             return "entity"
         return "web"
+    if vuln == best:
+        return "vuln"
     if code == best:
         return "code"
     if news == best:
@@ -319,11 +325,13 @@ def detect_intent(query: str) -> str:
 
 def verticals_for(intent: str, query: str) -> list[str]:
     if intent == "code":
-        return ["stackexchange", "mdn", "github", "hn"]
+        return ["stackexchange", "mdn", "github", "hn", "code"]
     if intent == "paper":
         return ["scholar", "arxiv", "openalex", "crossref", "pubmed", "europepmc"]
     if intent == "news":
-        return ["news", "hn"]
+        return ["news", "hn", "gdelt"]
+    if intent == "vuln":
+        return ["vuln"]
     if intent == "entity":
         return ["wikipedia"]
     if intent == "web" and is_conceptual(query):
@@ -335,7 +343,8 @@ _DOMAIN_PRIOR = {
     "code": ["stackoverflow.com", "github.com", "docs.rs", "developer.mozilla.org",
              "learn.microsoft.com", "doc.rust-lang.org", "pkg.go.dev", "pypi.org",
              "crates.io", "npmjs.com", "readthedocs.io", "superuser.com",
-             "serverfault.com", "news.ycombinator.com", "git-scm.com"],
+             "serverfault.com", "news.ycombinator.com", "git-scm.com",
+             "sourcegraph.com", "grep.app"],
     "paper": ["arxiv.org", "semanticscholar.org", "scholar.google.com", "nature.com",
               "science.org", "acm.org", "ieee.org", "openreview.net",
               "pubmed.ncbi.nlm.nih.gov", "doi.org", "openalex.org",
@@ -344,6 +353,8 @@ _DOMAIN_PRIOR = {
              "theguardian.com", "arstechnica.com", "techcrunch.com",
              "news.ycombinator.com", "bloomberg.com", "wsj.com"],
     "entity": ["wikipedia.org", "britannica.com", "wikidata.org", "imdb.com"],
+    "vuln": ["osv.dev", "nvd.nist.gov", "github.com", "cve.mitre.org",
+             "cve.org", "cvedetails.com", "exploit-db.com"],
     "web": ["cloudflare.com", "developer.mozilla.org", "wikipedia.org",
             "learn.microsoft.com", "aws.amazon.com", "kubernetes.io", "ietf.org",
             "rfc-editor.org"],

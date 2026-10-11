@@ -7,6 +7,7 @@ a vertical failure returns [] and never fails the search.
 from __future__ import annotations
 
 import json
+import os
 import re
 from urllib.parse import quote
 
@@ -15,6 +16,19 @@ from search_academic import search_academic
 
 FETCH_TIMEOUT = 12.0
 MAX_PER_VERTICAL = 5
+
+
+def _se_key() -> str:
+    """Optional StackExchange key (10k req/day vs 300 keyless). Read at call
+    time so run-file exports land without reimport; empty = keyless."""
+    return (os.environ.get("SE_KEY", "") or
+            os.environ.get("STACKEXCHANGE_KEY", "")).strip()
+
+
+def _s2_key() -> str:
+    """Optional Semantic Scholar key (dedicated 1 RPS vs contended pool)."""
+    return (os.environ.get("S2_KEY", "") or
+            os.environ.get("S2_API_KEY", "")).strip()
 
 _ACADEMIC = {"openalex", "crossref", "pubmed", "europepmc"}
 
@@ -38,9 +52,13 @@ def endpoint(vertical: str, query: str) -> str | None:
         return (f"https://hn.algolia.com/api/v1/search?query={q}"
                 f"&hitsPerPage={MAX_PER_VERTICAL}")
     if vertical == "stackexchange":
-        return (f"https://api.stackexchange.com/2.3/search/advanced?"
+        base = (f"https://api.stackexchange.com/2.3/search/advanced?"
                 f"order=desc&sort=relevance&q={q}&site=stackoverflow"
                 f"&pagesize={MAX_PER_VERTICAL}")
+        key = _se_key()
+        if key:
+            base += f"&key={quote(key, safe='')}"
+        return base
     if vertical == "mdn":
         return f"https://developer.mozilla.org/api/v1/search?q={q}"
     if vertical == "github":
@@ -71,12 +89,46 @@ async def run(vertical: str, query: str) -> list[dict]:
     """Fetch one vertical, return hits in the standard {title,url,snippet} shape."""
     if vertical in _ACADEMIC:
         return await search_academic(query, MAX_PER_VERTICAL, source=vertical)
+    if vertical == "vuln":
+        try:
+            from osv_vertical import is_vuln_query, search_vuln
+        except ImportError:
+            return []
+        if not is_vuln_query(query):
+            return []
+        try:
+            return await search_vuln(query, MAX_PER_VERTICAL)
+        except Exception:
+            return []
+    if vertical == "code":
+        try:
+            from code_vertical import search_code
+        except ImportError:
+            return []
+        try:
+            return await search_code(query, MAX_PER_VERTICAL)
+        except Exception:
+            return []
+    if vertical == "gdelt":
+        try:
+            from gdelt_vertical import search_gdelt
+        except ImportError:
+            return []
+        try:
+            return await search_gdelt(query, MAX_PER_VERTICAL)
+        except Exception:
+            return []
     url = endpoint(vertical, query)
     if not url:
         return []
     c = get_http_client()
     try:
-        r = await c.get(url, timeout=FETCH_TIMEOUT)
+        headers = None
+        if vertical == "scholar":
+            s2 = _s2_key()
+            if s2:
+                headers = {"x-api-key": s2}
+        r = await c.get(url, timeout=FETCH_TIMEOUT, headers=headers)
         if r.status_code != 200:
             return []
         body = r.text

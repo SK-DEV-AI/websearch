@@ -17,6 +17,7 @@ import html as html_mod
 import json
 import re
 import time
+import urllib.parse
 from urllib.parse import urlparse
 
 from scrapling.fetchers import AsyncFetcher
@@ -619,12 +620,18 @@ async def _se_api(url: str) -> dict | None:
         return None
     host, qid = m.group(1), m.group(2)
     site = _se_site(host)
+    # Optional key passthrough (proposal 2): 10k/day vs 300 keyless.
+    # Read at call time; empty = keyless. Infra worker owns the run file key.
+    import os as _os
+    _se_key = (_os.environ.get("SE_KEY", "") or
+               _os.environ.get("STACKEXCHANGE_KEY", "")).strip()
+    _key_qs = f"&key={_se_key}" if _se_key else ""
     # Default filter (!nNPvSNPI7A) drops answer bodies; withbody keeps
     # bodies but drops score/accepted — so: question call + answers call.
     q_ep = (f"https://api.stackexchange.com/2.3/questions/{qid}"
-            f"?order=desc&sort=votes&site={site}&filter=withbody")
+            f"?order=desc&sort=votes&site={site}&filter=withbody{_key_qs}")
     a_ep = (f"https://api.stackexchange.com/2.3/questions/{qid}/answers"
-            f"?order=desc&sort=votes&site={site}&filter=withbody")
+            f"?order=desc&sort=votes&site={site}&filter=withbody{_key_qs}")
     try:
         q_r = await AsyncFetcher.get(q_ep, timeout=12, stealthy_headers=False)
         a_r = await AsyncFetcher.get(a_ep, timeout=12, stealthy_headers=False)
@@ -1029,6 +1036,63 @@ async def _gist_api(url: str) -> dict | None:
         return None
 
 
+# ── CVE / OSV.dev ───────────────────────────────────────────────────
+# CVE pages (nvd.nist.gov, cve.org, osv.dev) are advisory JSON shells;
+# OSV serves the exact vuln record keyless (GHSA+PyPA+RustSec+NVD rollup).
+# NVD per-ID REST is the fallback. Shape-gated: only explicit CVE/GHSA IDs.
+
+_CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.I)
+_GHSA_RE = re.compile(r"GHSA-[\w-]+", re.I)
+_CVE_URL_RE = re.compile(
+    r"^https?://(?:nvd\.nist\.gov/vuln/detail|(?:www\.)?cve\.org/CVERecord\?id=|"
+    r"osv\.dev/(?:vulnerability|list\?q=)|cve\.mitre\.org/cgi-bin/cvename\.cgi\?name=)"
+    r"/?(CVE-\d{4}-\d{4,7}|GHSA-[\w-]+)?", re.I)
+
+
+async def _cve_api(url: str) -> dict | None:
+    m = _CVE_URL_RE.search(url)
+    if not m:
+        idm = _CVE_RE.search(url) or _GHSA_RE.search(url)
+        if not idm:
+            return None
+        vid = idm.group(0).upper()
+    else:
+        tail = (m.group(1) or "").upper()
+        if tail:
+            vid = tail
+        else:
+            qm = re.search(r"[?&](?:q|cveId)=([^&#]+)", url)
+            if not qm:
+                return None
+            cand = urllib.parse.unquote(qm.group(1)).upper()
+            idm = _CVE_RE.search(cand) or _GHSA_RE.search(cand)
+            if not idm:
+                return None
+            vid = idm.group(0).upper()
+    try:
+        import osv_vertical as _osv
+    except ImportError:
+        return None
+    try:
+        v = await _osv._osv_vuln(vid)
+    except Exception:
+        v = None
+    if isinstance(v, dict) and v.get("id"):
+        shaped = _osv._shape_osv(0, v.get("id", vid), v)
+        return _resp(url, f"# {shaped['title']}\n\n{shaped['snippet']}",
+                      "osv-vuln", shaped["title"])
+    try:
+        items = await _osv._nvd({"cveId": vid})
+    except Exception:
+        items = []
+    if items:
+        shaped = _osv._shape_nvd(0, items[0])
+        if shaped:
+            return _resp(url, f"# {shaped['title']}\n\n{shaped['snippet']}",
+                          "nvd-vuln", shaped["title"])
+    return None
+
+
 # ── dispatch ──────────────────────────────────────────────────────────
 
 def _is_root_url(url: str) -> bool:
@@ -1062,6 +1126,8 @@ async def fast_path_fetch(url: str) -> dict | None:
         probes.append(_doi_api)
     if _GIST_RE.search(url):
         probes.append(_gist_api)
+    if _CVE_URL_RE.search(url) or _CVE_RE.search(url) or _GHSA_RE.search(url):
+        probes.append(_cve_api)
     # Last resort before the generic pipeline: docs sites honoring
     # Accept: text/markdown return clean markdown; others fall through.
     probes.append(_md_accept)

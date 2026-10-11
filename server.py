@@ -387,6 +387,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             # ── Escalation decision ─────────────────────────────────
             should_retry = False
             cf_hits = 0
+            _is_js_shell = False
             if r is None:
                 should_retry = True
             elif not r.get("success"):
@@ -413,6 +414,33 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                     # benefit from a browser re-render — skip the wasted CDP
                     # round-trip; big HTML with no text is a JS shell → retry
                     not r.get("raw_html_len") or r.get("raw_html_len", 0) > 5000)))
+
+            # ── Tier-1.5 Jina Reader (proposal 6): keyless r.jina.ai fallback
+            # after direct fetch fails, BEFORE the 12s CDP escalation. Cuts
+            # browser load on soft walls. Skipped for tiny-but-real pages
+            # (nothing to gain) and JS shells (Jina renders no JS either).
+            if (should_retry and r is not None and not r.get("success")
+                    and ghost.tier_allowed(host, "t2")):
+                _content_len = len((r.get("content", "") or "").strip())
+                _raw_len = r.get("raw_html_len") or 0
+                _tiny_real = 0 < _content_len < 100 and _raw_len <= 5000
+                if not _is_js_shell and not _tiny_real:
+                    try:
+                        from recovery_tiers import jina_fetch as _jina_fetch
+                        jina_r = await _jina_fetch(url)
+                    except Exception:
+                        jina_r = None
+                    if jina_r and jina_r.get("success"):
+                        ghost.record_fetch(host, CONTENT_OK)
+                        from fetch import _build_paginated_response as _paginate
+                        r = _paginate(
+                            url, jina_r.get("content", ""),
+                            jina_r.get("status", 200),
+                            jina_r.get("title", ""),
+                            jina_r.get("metadata") or {},
+                            jina_r.get("content_type", "text/plain"),
+                            offset, max_chars, method="jina-reader")
+                        should_retry = False
 
             # ── Tier-2 browser solve + solve-and-bounce handoff ─────
             if should_retry and ghost.tier_allowed(host, "t2"):

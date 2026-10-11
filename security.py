@@ -281,3 +281,32 @@ async def safe_fetch(client: Any, url: str, *, max_hops: int = 5,
         return resp
     raise SecurityError(f"Too many redirects (> {max_hops}): {url}")
 
+
+async def safe_stream(client: Any, url: str, *, max_bytes: int,
+                     max_hops: int = 5, allow_internal: bool = False,
+                     **kwargs) -> bytes:
+    """safe_fetch variant that streams and caps the body at max_bytes, keeping
+    per-hop SSRF validation. Returns the body bytes (truncated at max_bytes).
+    Raises OSError-adjacent httpx.HTTPStatusError on non-200 so callers can
+    distinguish an HTTP error from an empty body."""
+    from urllib.parse import urljoin
+    import httpx
+
+    current = url
+    for _ in range(max_hops + 1):
+        current = await validate_url(current, allow_internal=allow_internal)
+        async with client.stream("GET", current, follow_redirects=False, **kwargs) as resp:
+            if resp.is_redirect and resp.headers.get("location"):
+                current = urljoin(str(resp.url), resp.headers["location"])
+                continue
+            if resp.status_code != 200:
+                raise httpx.HTTPStatusError(
+                    f"HTTP {resp.status_code}", request=resp.request, response=resp)
+            body = b""
+            async for chunk in resp.aiter_bytes():
+                body += chunk
+                if len(body) > max_bytes:
+                    break
+            return body
+    raise SecurityError(f"Too many redirects (> {max_hops}): {url}")
+
