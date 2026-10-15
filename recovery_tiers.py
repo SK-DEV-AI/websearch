@@ -43,7 +43,7 @@ async def _spacing_guard() -> None:
 async def jina_fetch(url: str, timeout: float = _TIMEOUT) -> dict | None:
     """Fetch url via keyless Jina Reader. Returns fetch-like dict or None."""
     try:
-        from security import SecurityError, validate_url as _validate_url
+        from security import validate_url as _validate_url
         url = await _validate_url(url)
     except Exception:
         return None
@@ -164,7 +164,6 @@ async def cdx_fetch_snapshot(snapshot_url: str,
             return None
         try:
             from fetch import _archive_extract
-            import re as _re
             content, title = _archive_extract(body, snapshot_url)
         except Exception:
             return None

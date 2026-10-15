@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import urllib.parse
 
 logger = logging.getLogger("code_vertical")
 

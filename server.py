@@ -431,7 +431,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                     except Exception:
                         jina_r = None
                     if jina_r and jina_r.get("success"):
-                        ghost.record_fetch(host, CONTENT_OK)
+                        ghost.record_fetch(host, CONTENT_OK, tier="t1.5")
                         from fetch import _build_paginated_response as _paginate
                         r = _paginate(
                             url, jina_r.get("content", ""),
