@@ -20,8 +20,8 @@ HELIUM_CDP = "http://127.0.0.1:9222"
 
 NV_KEY = os.environ.get("NV_KEY", "")
 NV_BASE = "https://integrate.api.nvidia.com/v1"
-NV_EMBED_MODEL = "nvidia/llama-nemotron-embed-1b-v2"
-NV_EMBED_DIMS = 2048  # llama-nemotron-embed-1b-v2 output dims (codesearch uses nv-embedcode-7b-v1/4096 — deliberate split, see impl-infra.md)
+NV_EMBED_MODEL = "nvidia/nemotron-3-embed-1b"
+NV_EMBED_DIMS = 2048  # nemotron-3-embed-1b output dims (fixed 2048)
 
 
 class _KeyRotator:

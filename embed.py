@@ -37,8 +37,9 @@ async def _embed(texts: list[str], input_type: str = "passage",
     results: list[list[float] | None] = [None] * len(texts)
     uncached = []
     uncached_idx = []
+    _model = embed_model or NV_EMBED_MODEL
     for i, t in enumerate(texts):
-        k = f"emb:{input_type}:{encoding_format}:{hashlib.sha256(t.encode()).hexdigest()}"
+        k = f"emb:{_model}:{input_type}:{encoding_format}:{hashlib.sha256(t.encode()).hexdigest()}"
         entry = await _cached(k)
         if entry is not None:
             results[i] = entry
@@ -71,7 +72,7 @@ async def _embed(texts: list[str], input_type: str = "passage",
                             emb = list(map(float, struct.unpack(f'{len(decoded)//4}f', decoded)))
                         orig_idx = batch_idx[idx]
                         results[orig_idx] = emb
-                        await _set_cache(f"emb:{input_type}:{encoding_format}:{hashlib.sha256(batch[idx].encode()).hexdigest()}", emb)
+                        await _set_cache(f"emb:{model}:{input_type}:{encoding_format}:{hashlib.sha256(batch[idx].encode()).hexdigest()}", emb)
         except (httpx.HTTPError, ValueError, KeyError):
             pass
     return results
