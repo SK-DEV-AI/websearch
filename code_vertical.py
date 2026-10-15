@@ -56,6 +56,41 @@ def _shape_sg(rank: int, m: dict) -> dict | None:
 
 
 async def _grep_search(query: str, count: int) -> list[dict]:
+    """grep.app via MCP endpoint (mcp.grep.app searchGitHub).
+
+    The REST API (/api/search) 429-challenges this egress; the MCP
+    endpoint answers in <1s with no auth. Same index, different door.
+    """
+    try:
+        from grep_mcp import grep_mcp_search
+        r = await grep_mcp_search(query, timeout=30)
+        if not r.get("success"):
+            return []
+        out: list[dict] = []
+        for h in (r.get("hits") or [])[:count]:
+            shaped = _shape_grep_mcp(len(out), h)
+            if shaped:
+                out.append(shaped)
+        return out
+    except Exception as e:
+        logger.debug("grep MCP search failed: %s", e)
+        return []
+
+
+def _shape_grep_mcp(rank: int, h: dict) -> dict | None:
+    repo = h.get("repo", "") or ""
+    path = h.get("file", "") or ""
+    if not repo or not path:
+        return None
+    url = h.get("url", "") or f"https://github.com/{repo}/blob/HEAD/{path.lstrip('/')}"
+    snippet = "; ".join(m.get("preview", "") for m in h.get("matches", [])[:3])
+    return {"title": f"{repo}: {path}", "url": url,
+            "snippet": (snippet or "code match")[:400],
+            "published": None, "rank": rank}
+
+
+async def _grep_search_rest(query: str, count: int) -> list[dict]:
+    """Legacy REST path — kept as last resort (bot-walled, usually 429)."""
     try:
         from config import get_http_client
         c = get_http_client()
@@ -136,7 +171,7 @@ async def _sg_search(query: str, count: int) -> list[dict]:
 
 
 async def search_code(query: str, count: int = 5) -> list[dict]:
-    """grep.app primary, Sourcegraph backup on empty primary. Dedupe by URL."""
+    """grep.app MCP primary, Sourcegraph backup on short primary. Dedupe by URL."""
     primary = await _grep_search(query, count)
     out = list(primary)
     if len(out) < count:
