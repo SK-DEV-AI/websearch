@@ -16,3 +16,5 @@ lxml>=6.0.0
 extruct>=0.18.0
 tf-playwright-stealth>=1.2.0
 html-to-markdown>=3.0.0
+arxiv>=4.0.0
+httpcore>=1.0.0

@@ -461,8 +461,12 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                       if v not in ("wikipedia", "arxiv", "news")]
         if _verticals:
             try:
+                # Slow lanes (code/SG, gdelt spacing guard) need more than 5s.
+                _SLOW_VERTICALS = {"code": 35.0, "gdelt": 15.0, "vuln": 15.0}
                 v_results = await asyncio.gather(
-                    *[asyncio.wait_for(vertical_run(_v, effective_query), timeout=5) for _v in _verticals],
+                    *[asyncio.wait_for(vertical_run(_v, effective_query),
+                                       timeout=_SLOW_VERTICALS.get(_v, 5))
+                      for _v in _verticals],
                     return_exceptions=True,
                 )
             except BaseException:

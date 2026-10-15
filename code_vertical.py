@@ -16,6 +16,7 @@ logger = logging.getLogger("code_vertical")
 _GREP_API = "https://grep.app/api/search"
 _SG_GRAPHQL = "https://sourcegraph.com/.api/graphql"
 _TIMEOUT = 12.0
+_SG_TIMEOUT = 30.0
 _BACKOFF_S = (1.0, 3.0)
 
 
@@ -105,11 +106,11 @@ async def _sg_search(query: str, count: int) -> list[dict]:
     try:
         from config import get_http_client
         c = get_http_client()
-        q = f"context:global {query} select:file"
+        q = f"context:global count:{min(max(count, 1), 50)} {query} select:file"
         r = await c.post(
             _SG_GRAPHQL,
             json={"query": _SG_Q, "variables": {"q": q}},
-            timeout=_TIMEOUT,
+            timeout=_SG_TIMEOUT,
             headers={"User-Agent": "websearch-mcp/1.0",
                      "Content-Type": "application/json",
                      "Accept": "application/json"},
