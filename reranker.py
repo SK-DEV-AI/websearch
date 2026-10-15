@@ -1,4 +1,9 @@
-"""Shared reranker bridge — one subprocess via Unix socket, both MCP servers connect to it."""
+"""Shared reranker bridge — one worker subprocess via Unix socket, shared by
+both MCP servers.
+
+Single-worker rule: a flock-guarded spawn + ownership-scoped cleanup guarantee
+no double model-load and no mutual kills — whoever spawns owns _PROC; a
+borrower (connected to the sibling's worker) never kills or unlinks."""
 
 import asyncio
 import fcntl
@@ -32,7 +37,8 @@ _last_spawn_fail = 0.0
 
 
 async def _close_connection():
-    """Close the current connection and kill the stale worker process."""
+    """Close our connection; kill + unlink ONLY if we spawned the worker
+    (_PROC is not None). Borrowers never reach the kill branch."""
     global _READER, _WRITER, _PROC
     if _READER is not None:
         try:
