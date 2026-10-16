@@ -25,7 +25,7 @@ async def expand_query(query: str, model: str | None = None) -> list[str]:
 
     Returns [original, variation1, variation2, ...] up to 4 total.
     Only expands queries that are short (<5 words or <=80 chars).
-    model defaults to the cheap lane (llama-3.1-8b-instant).
+    model defaults to the cheap lane (openai/gpt-oss-20b).
     """
     if len(query.split()) >= 8 or len(query) > 80:
         return [query]

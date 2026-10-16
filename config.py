@@ -68,10 +68,10 @@ GROQ_API_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEYS", "").split(",
 
 # ── Groq model split (proposal 1): scarce gpt-oss quota (1k RPD) is for
 # synthesis/grounding/extract-llm; cheap high-volume ops (rewrite/classify/
-# expand/decompose) use llama-3.1-8b-instant (14.4k RPD). Plain constants —
+# expand/decompose) use openai/gpt-oss-20b (llama-3.1-8b retired 404). Plain constants —
 # env keys belong to the infra worker.
 GROQ_SMART_MODEL = "openai/gpt-oss-120b"
-GROQ_CHEAP_MODEL = "llama-3.1-8b-instant"
+GROQ_CHEAP_MODEL = "openai/gpt-oss-20b"
 RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "Alibaba-NLP/gte-reranker-modernbert-base")
 
 # ── steal-theme config (C2/E2/B1/A2/ghost-tier/C3) ─────────────

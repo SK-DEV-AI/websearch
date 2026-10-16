@@ -175,7 +175,7 @@ async def _groq_text(sys_prompt: str, user_prompt: str,
                      model: str | None = None) -> str | None:
     """One Groq call returning trimmed text; None on any failure (caller falls back).
 
-    model defaults to the cheap lane (llama-3.1-8b-instant); synthesis and
+    model defaults to the cheap lane (openai/gpt-oss-20b); synthesis and
     grounding use the smart model via explicit model= at their call sites.
     """
     from query_expand import _next_key

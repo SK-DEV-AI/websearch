@@ -13,6 +13,9 @@ import urllib.parse
 
 from config import get_http_client
 
+import os as _os
+_OPENALEX_KEY = _os.environ.get("OPENALEX_API_KEY", "").strip()
+
 TIMEOUT = 12.0
 _POOL_UA = "websearch-mcp/1.0 (academic-research; mailto:none)"
 
@@ -28,8 +31,10 @@ def _openalex_abstract(ainv: dict | None) -> str:
 
 
 async def search_openalex(query: str, count: int = 5) -> list[dict]:
-    url = ("https://api.openalex.org/works?"
-           + urllib.parse.urlencode({"search": query, "per-page": min(count, 25)}))
+    params: dict[str, object] = {"search": query, "per-page": min(count, 25)}
+    if _OPENALEX_KEY:
+        params["api_key"] = _OPENALEX_KEY
+    url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
     c = get_http_client()
     try:
         r = await c.get(url, timeout=TIMEOUT, headers={"User-Agent": _POOL_UA})
