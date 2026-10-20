@@ -34,6 +34,23 @@ MAX_PER_DOMAIN = 2
 VERTICAL_WEIGHT = 0.6
 BLEND_ALPHA = 0.6
 
+# Code-vertical carve-outs (measured 2026-10-20: the code lane was
+# invisible on general web queries for two independent reasons).
+#
+# 1. Every code hit lives on github.com, so the generic per-host cap
+#    (MAX_PER_DOMAIN) collapsed the whole lane into 2 slots and dropped
+#    the rest. Code hits are legitimately spread across MANY repos, so a
+#    per-host cap is the wrong tool for them: they are exempt, but bounded
+#    by their own (slightly larger) cap so the lane can never dominate the
+#    final cut.
+# 2. The generic vertical-only penalty (0.4) is meant for speculative
+#    verticals; a code hit is a precise literal match in a real file, so
+#    it gets a much smaller penalty. Other verticals keep 0.4 unchanged.
+CODE_VERTICAL = "code"
+CODE_MAX_PER_DOMAIN = 3
+CODE_VERTICAL_ONLY_PENALTY = 0.85
+VERTICAL_ONLY_PENALTY = 0.4
+
 _VERTICALS = {"github", "hn", "wikipedia", "scholar", "news", "arxiv", "stackexchange", "mdn", "reddit",
               "vuln", "code", "gdelt"}
 
@@ -193,10 +210,17 @@ def merge_base(per_engine: dict[str, list[dict]], query: str, intent: str) -> li
         prior = domain_prior(intent, host_of(r["url"]), query)
         r["score"] += PRIOR_WEIGHT * prior
 
-    # Vertical-only penalty: un-corroborated vertical hits are weak signals
+    # Vertical-only penalty: un-corroborated vertical hits are weak signals.
+    # The code vertical is exempt-ish: a code hit is a literal match inside a
+    # real file, not a speculative index result, so it takes a much smaller
+    # penalty than the generic 0.4.
     for r in results:
         if not any(not is_vertical(e) for e, _ in r["sources"]):
-            r["score"] *= 0.4
+            engines = {e for e, _ in r["sources"]}
+            if CODE_VERTICAL in engines:
+                r["score"] *= CODE_VERTICAL_ONLY_PENALTY
+            else:
+                r["score"] *= VERTICAL_ONLY_PENALTY
 
     return results
 
@@ -247,15 +271,28 @@ def finalize(results: list[dict], max_results: int) -> list[dict]:
         seen_titles.add(title_key)
         deduped.append(r)
     domain_count: dict[str, int] = {}
+    code_count: dict[str, int] = {}
     diverse, overflow = [], []
     for r in deduped:
         host = host_of(r["url"])
-        c = domain_count.get(host, 0)
-        if c < MAX_PER_DOMAIN:
-            domain_count[host] = c + 1
-            diverse.append(r)
+        is_code = any(e == CODE_VERTICAL for e, _ in r.get("sources", ()))
+        if is_code:
+            # Code hits are spread over many repos but share one host
+            # (github.com): exempt them from the generic per-host cap and
+            # give them their own, slightly larger, bounded cap.
+            cc = code_count.get(host, 0)
+            if cc < CODE_MAX_PER_DOMAIN:
+                code_count[host] = cc + 1
+                diverse.append(r)
+            else:
+                overflow.append(r)
         else:
-            overflow.append(r)
+            c = domain_count.get(host, 0)
+            if c < MAX_PER_DOMAIN:
+                domain_count[host] = c + 1
+                diverse.append(r)
+            else:
+                overflow.append(r)
         if len(diverse) >= max_results:
             break
     if len(diverse) < max_results:
