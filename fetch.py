@@ -25,7 +25,7 @@ import md_convert
 from search_gai import _get_optimized_page, _cleanup_orphan_tabs
 from cookies import CookieJar
 from revalidate import RevalidationCache
-from security import SecurityError, safe_fetch, validate_url as _validate_url
+from security import SecurityError, safe_fetch_capped, validate_url as _validate_url
 import cache as cache_mod
 import focus as focus_mod
 from config import QUALITY_FLOOR
@@ -251,10 +251,12 @@ async def _try_wayback(original_url: str) -> dict | None:
         if not snap_url.startswith("https://web.archive.org/"):
             return None
         raw_url = snap_url.replace(f"/web/{ts}/", f"/web/{ts}id_/")
-        wr = await safe_fetch(c, raw_url, timeout=15)
-        if wr.status_code != 200:
+        meta: dict[str, Any] = {}
+        body_bytes, _trunc = await safe_fetch_capped(c, raw_url, timeout=15,
+                                                      meta_out=meta)
+        if meta.get("status") != 200:
             return None
-        content = wr.text
+        content = body_bytes.decode("utf-8", errors="replace")
         if _bomb_capped(content):
             return None
         if not content or len(content.strip()) < 50:
@@ -286,12 +288,15 @@ async def _try_archive_today(original_url: str) -> dict | None:
     try:
         from config import get_http_client
         c = get_http_client()
-        r = await safe_fetch(c, f"https://archive.ph/newest/{original_url}", timeout=15)
+        meta: dict[str, Any] = {}
+        body_bytes, _trunc = await safe_fetch_capped(
+            c, f"https://archive.ph/newest/{original_url}", timeout=15,
+            meta_out=meta)
         # archive.today serves full snapshot bodies even under its
         # aggressive 429 rate-limiting — only hard-fail on real errors
-        if r.status_code not in (200, 429):
+        if meta.get("status") not in (200, 429):
             return None
-        content = r.text
+        content = body_bytes.decode("utf-8", errors="replace")
         if _bomb_capped(content):
             return None
         final_content, _title = _archive_extract(content, original_url)
@@ -300,7 +305,7 @@ async def _try_archive_today(original_url: str) -> dict | None:
         m = re.search(r"<title[^>]*>(.*?)</title>", content, re.S | re.I)
         title = m.group(1).strip()[:200] if m else ""
         # capture timestamp rides in the final redirect URL: .../YYYYMMDDHHMMSS/...
-        ts_m = re.search(r"/((?:19|20)\d{12})/", str(r.url))
+        ts_m = re.search(r"/((?:19|20)\d{12})/", str(meta.get("url", "")))
         date_str = (f"{ts_m.group(1)[:4]}-{ts_m.group(1)[4:6]}-{ts_m.group(1)[6:8]}"
                     if ts_m else "snapshot")
         return {
@@ -309,7 +314,7 @@ async def _try_archive_today(original_url: str) -> dict | None:
             "url": original_url,
             "status": 200,
             "cached_from": f"archive.today ({date_str})",
-            "snapshot_url": str(r.url),
+            "snapshot_url": str(meta.get("url", "")),
             "title": title,
             "method": "archive_today",
         }

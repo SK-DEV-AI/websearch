@@ -16,9 +16,14 @@ here — the caller (fetch_url/enrich) owns the politeness gate.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
+import time
 import urllib.parse
+
+from config import get_http_client
+from security import safe_fetch_capped, validate_url as _validate_url
 
 logger = logging.getLogger("recovery_tiers")
 
@@ -26,16 +31,21 @@ _TIMEOUT = 15.0
 _JINA_RPM_GUARD_S = 3.2  # keyless 20 RPM: local spacing, best-effort only
 _last_jina_ts = 0.0
 
+# Byte caps for the capped fetches below. HTML/markdown text gets the
+# 2 MiB default; small JSON APIs (CDX index, CC index list) get a tighter
+# 512 KiB because their payloads are bounded by the server already.
+_HTML_MAX_BYTES = 2_000_000
+_JSON_MAX_BYTES = 512 * 1024
+
 
 async def _spacing_guard() -> None:
     global _last_jina_ts
     try:
-        import time as _t
-        now = _t.monotonic()
+        now = time.monotonic()
         wait = _JINA_RPM_GUARD_S - (now - _last_jina_ts)
         if wait > 0:
             await asyncio.sleep(wait)
-        _last_jina_ts = _t.monotonic()
+        _last_jina_ts = time.monotonic()
     except Exception:
         pass
 
@@ -43,28 +53,28 @@ async def _spacing_guard() -> None:
 async def jina_fetch(url: str, timeout: float = _TIMEOUT) -> dict | None:
     """Fetch url via keyless Jina Reader. Returns fetch-like dict or None."""
     try:
-        from security import validate_url as _validate_url
         url = await _validate_url(url)
     except Exception:
         return None
     await _spacing_guard()
     try:
-        from security import safe_fetch
-        from config import get_http_client
         c = get_http_client()
-        r = await safe_fetch(c, "https://r.jina.ai/" + url, timeout=timeout,
-                             headers={"Accept": "text/plain",
-                                      "User-Agent": "websearch-mcp/1.0"})
-        if r.status_code != 200:
+        meta: dict = {}
+        body_bytes, _trunc = await safe_fetch_capped(
+            c, "https://r.jina.ai/" + url, timeout=timeout,
+            max_bytes=_HTML_MAX_BYTES,
+            headers={"Accept": "text/plain",
+                     "User-Agent": "websearch-mcp/1.0"},
+            meta_out=meta)
+        if meta.get("status") != 200:
             return None
-        final = getattr(r, "url", None)
+        final = meta.get("url")
         if final and final != "https://r.jina.ai/" + url:
             try:
-                from security import validate_url as _v2
-                await _v2(str(final))
+                await _validate_url(str(final))
             except Exception:
                 return None
-        body = r.text
+        body = body_bytes.decode("utf-8", errors="replace")
         if not body or len(body.strip()) < 50:
             return None
         title = ""
@@ -102,20 +112,25 @@ async def cdx_history(url: str, limit: int = 5,
                 q = host
         except Exception:
             pass
-        from security import safe_fetch
         from config import get_http_client
         c = get_http_client()
-        r = await safe_fetch(
+        meta: dict = {}
+        body_bytes, _trunc = await safe_fetch_capped(
             c,
             "https://web.archive.org/cdx/search/cdx",
             params={"url": q, "output": "json", "limit": limit,
                     "collapse": "digest", "filter": "statuscode:200"},
             timeout=timeout,
+            max_bytes=_JSON_MAX_BYTES,
             headers={"User-Agent": "websearch-mcp/1.0"},
+            meta_out=meta,
         )
-        if r.status_code != 200:
+        if meta.get("status") != 200:
             return []
-        rows = r.json()
+        try:
+            rows = json.loads(body_bytes.decode("utf-8", errors="replace"))
+        except ValueError:
+            return []
         out: list[dict] = []
         if not rows:
             return []
@@ -152,14 +167,16 @@ async def cdx_fetch_snapshot(snapshot_url: str,
                              timeout: float = _TIMEOUT) -> dict | None:
     """Fetch one CDX snapshot URL through trafilatura (shared tail shape)."""
     try:
-        from security import safe_fetch
-        from config import get_http_client
         c = get_http_client()
-        r = await safe_fetch(c, snapshot_url, timeout=timeout,
-                             headers={"User-Agent": "websearch-mcp/1.0"})
-        if r.status_code != 200:
+        meta: dict = {}
+        body_bytes, _trunc = await safe_fetch_capped(
+            c, snapshot_url, timeout=timeout,
+            max_bytes=_HTML_MAX_BYTES,
+            headers={"User-Agent": "websearch-mcp/1.0"},
+            meta_out=meta)
+        if meta.get("status") != 200:
             return None
-        body = r.text
+        body = body_bytes.decode("utf-8", errors="replace")
         if not body or len(body.strip()) < 50:
             return None
         try:
@@ -184,24 +201,27 @@ async def cc_latest_index() -> str | None:
     """Newest Common Crawl index id (e.g. CC-MAIN-2026-38). Cached 24h in-process."""
     global _cc_idx_cache
     try:
-        import time as _t
-        if _cc_idx_cache[1] and _t.monotonic() - _cc_idx_cache[0] < 86400:
+        if _cc_idx_cache[1] and time.monotonic() - _cc_idx_cache[0] < 86400:
             return _cc_idx_cache[1]
     except Exception:
         pass
     try:
-        from security import safe_fetch
-        from config import get_http_client
         c = get_http_client()
-        r = await safe_fetch(c, _CC_INDEX, timeout=_CC_TIMEOUT,
-                             headers={"User-Agent": "websearch-mcp/1.0"})
-        if r.status_code != 200:
+        meta: dict = {}
+        body_bytes, _trunc = await safe_fetch_capped(
+            c, _CC_INDEX, timeout=_CC_TIMEOUT,
+            max_bytes=_JSON_MAX_BYTES,
+            headers={"User-Agent": "websearch-mcp/1.0"},
+            meta_out=meta)
+        if meta.get("status") != 200:
             return None
-        idxs = r.json()
+        try:
+            idxs = json.loads(body_bytes.decode("utf-8", errors="replace"))
+        except ValueError:
+            return None
         name = (idxs[0].get("id") or "") if idxs else ""
         if name:
-            import time as _t
-            _cc_idx_cache = (_t.monotonic(), name)
+            _cc_idx_cache = (time.monotonic(), name)
         return name or None
     except Exception as e:
         logger.debug("cc collinfo failed: %s", e)
@@ -219,20 +239,21 @@ async def cc_lookup(url_or_domain: str, limit: int = 20,
     if not idx:
         return []
     try:
-        from security import safe_fetch
-        from config import get_http_client
         c = get_http_client()
-        r = await safe_fetch(
+        meta: dict = {}
+        body_bytes, _trunc = await safe_fetch_capped(
             c, f"https://index.commoncrawl.org/{idx}-index",
             params={"url": url_or_domain, "output": "json",
                     "limit": min(max(limit, 1), 200)},
             timeout=_CC_TIMEOUT,
+            max_bytes=_JSON_MAX_BYTES,
             headers={"User-Agent": "websearch-mcp/1.0"},
+            meta_out=meta,
         )
-        if r.status_code != 200:
+        if meta.get("status") != 200:
             return []
         out: list[dict] = []
-        for line in r.text.splitlines():
+        for line in body_bytes.decode("utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -266,27 +287,22 @@ async def cc_fetch_record(filename: str, offset: str, length: str,
     except (TypeError, ValueError):
         return None
     try:
-        from security import safe_fetch, validate_url as _validate_url
-        from config import get_http_client
         data_url = f"https://data.commoncrawl.org/{filename}"
-        try:
-            await _validate_url(data_url)
-        except Exception:
-            return None
         c = get_http_client()
-        r = await safe_fetch(
+        meta: dict = {}
+        raw, _trunc = await safe_fetch_capped(
             c, data_url, timeout=20,
+            max_bytes=ln,
             headers={"Range": f"bytes={off}-{off + ln - 1}",
-                     "User-Agent": "websearch-mcp/1.0"})
-        if r.status_code not in (200, 206):
+                     "User-Agent": "websearch-mcp/1.0"},
+            meta_out=meta)
+        if meta.get("status") not in (200, 206):
             return None
-        raw = r.content
         if not raw:
             return None
         try:
-            import gzip as _gz
             try:
-                raw = _gz.decompress(raw)
+                raw = gzip.decompress(raw)
             except Exception:
                 pass
             text = raw.decode("utf-8", errors="replace")

@@ -2,10 +2,11 @@
 
 import asyncio
 import httpcore
+import httpx
 import ipaddress
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 _MAX_URL_LENGTH = 8192
 
@@ -265,12 +266,52 @@ async def validate_url(url: str, allow_internal: bool = False) -> str:
     return url
 
 
+async def safe_fetch_capped(client: Any, url: str, *, max_bytes: int = 2_000_000,
+                            max_hops: int = 5, allow_internal: bool = False,
+                            meta_out: dict[str, Any] | None = None,
+                            **kwargs) -> tuple[bytes, bool]:
+    """safe_fetch variant: streams the body with a hard byte cap, keeping
+    per-hop SSRF validation. Returns (body_bytes, truncated).
+
+    The body is never buffered past max_bytes: the stream is aborted as soon
+    as the cap is reached and the connection is closed on exit.
+
+    Unlike safe_stream (which raises on non-200) the body is returned
+    whatever the status was. Callers that branch on the status code (or need
+    the final URL) pass ``meta_out`` — a dict that receives ``status``,
+    ``url`` and ``headers`` of the final hop.
+    """
+    current = url
+    for _ in range(max_hops + 1):
+        current = await validate_url(current, allow_internal=allow_internal)
+        async with client.stream("GET", current, follow_redirects=False, **kwargs) as resp:
+            if resp.is_redirect and resp.headers.get("location"):
+                current = urljoin(str(resp.url), resp.headers["location"])
+                continue
+            if meta_out is not None:
+                meta_out["status"] = resp.status_code
+                meta_out["url"] = str(resp.url)
+                meta_out["headers"] = dict(resp.headers)
+            body = b""
+            truncated = False
+            async for chunk in resp.aiter_bytes():
+                room = max_bytes - len(body)
+                if room <= 0:
+                    truncated = True
+                    break
+                if len(chunk) > room:
+                    body += chunk[:room]
+                    truncated = True
+                    break
+                body += chunk
+            return body, truncated
+    raise SecurityError(f"Too many redirects (> {max_hops}): {url}")
+
+
 async def safe_fetch(client: Any, url: str, *, max_hops: int = 5,
                     allow_internal: bool = False, **kwargs) -> Any:
     """GET with per-hop SSRF validation — follows redirects manually, validating
     each hop's URL before requesting it. Returns the final response."""
-    from urllib.parse import urljoin
-
     current = url
     for _ in range(max_hops + 1):
         current = await validate_url(current, allow_internal=allow_internal)
@@ -289,9 +330,6 @@ async def safe_stream(client: Any, url: str, *, max_bytes: int,
     per-hop SSRF validation. Returns the body bytes (truncated at max_bytes).
     Raises OSError-adjacent httpx.HTTPStatusError on non-200 so callers can
     distinguish an HTTP error from an empty body."""
-    from urllib.parse import urljoin
-    import httpx
-
     current = url
     for _ in range(max_hops + 1):
         current = await validate_url(current, allow_internal=allow_internal)
