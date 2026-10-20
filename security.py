@@ -5,6 +5,7 @@ import httpcore
 import httpx
 import ipaddress
 import re
+import time
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -59,10 +60,23 @@ class SecurityError(ValueError):
 _PIN_TTL = 60.0  # s — covers the validate→connect window
 _pinned: dict[str, tuple[float, list[str]]] = {}
 
+# Per-attempt connect budget for a pinned IP. This hotspot's IPv6 resolves but
+# never answers, so a pinned IPv6 used to burn the whole client timeout
+# (25-30 s) with no error and no fallback to a working IPv4.
+_PIN_ATTEMPT_TIMEOUT = 5.0
+
 
 def _pin_host(hostname: str, ips: list[str]) -> None:
-    import time as _t
-    _pinned[hostname] = (_t.monotonic(), list(ips))
+    _pinned[hostname] = (time.monotonic(), list(ips))
+
+
+def _ordered_pins(ips: list[str]) -> list[str]:
+    """IPv4 first. The pin set contains only VALIDATED public IPs, so
+    reordering does not weaken the DNS-rebinding protection — we still never
+    re-resolve the hostname."""
+    v4 = [ip for ip in ips if ":" not in ip]
+    v6 = [ip for ip in ips if ":" in ip]
+    return v4 + v6
 
 
 class PinningNetworkBackend(httpcore.AsyncNetworkBackend):
@@ -75,14 +89,36 @@ class PinningNetworkBackend(httpcore.AsyncNetworkBackend):
                           local_address=None, socket_options=None):
         entry = _pinned.get(host)
         if entry:
-            import time as _t
             stamp, ips = entry
-            if _t.monotonic() - stamp <= _PIN_TTL and ips:
-                idx = hash((host, port)) % len(ips) if len(ips) > 1 else 0
-                return await self._inner.connect_tcp(
-                    ips[idx], port, timeout=timeout,
-                    local_address=local_address,
-                    socket_options=socket_options)
+            if time.monotonic() - stamp <= _PIN_TTL and ips:
+                # Try the pinned IPs in order (IPv4 first) with a short
+                # per-attempt timeout, falling through to the next pinned IP
+                # on failure. ONLY pinned/validated IPs are used — the
+                # hostname is never re-resolved, so the DNS-rebinding
+                # TOCTOU hole stays closed.
+                total = 30.0
+                if timeout:
+                    try:
+                        total = float(timeout)
+                    except (TypeError, ValueError):
+                        total = 30.0
+                deadline = time.monotonic() + total
+                last_exc: Exception | None = None
+                for ip in _ordered_pins(ips):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    attempt = min(_PIN_ATTEMPT_TIMEOUT, remaining)
+                    try:
+                        return await self._inner.connect_tcp(
+                            ip, port, timeout=attempt,
+                            local_address=local_address,
+                            socket_options=socket_options)
+                    except Exception as e:
+                        last_exc = e
+                        continue
+                if last_exc is not None:
+                    raise last_exc
         return await self._inner.connect_tcp(
             host, port, timeout=timeout,
             local_address=local_address,

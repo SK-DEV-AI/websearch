@@ -11,6 +11,7 @@ from collections import Counter
 from config import cached
 from search_ddg import search_ddg, search_google_rss
 from search_brave import search_brave
+from search_bing_rss import search_bing_web
 from search_tavily import search_tavily
 from search_anysearch import search_anysearch
 from search_tinyfish import tinyfish_search
@@ -47,7 +48,7 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'+-]{2,}")
 
 # Engines expected in a non-GAI-only search (for engine_blocked reporting)
 _ALL_ENGINES = {"google-news-rss", "tavily", "reddit", "wikipedia", "arxiv",
-                "anysearch", "tinyfish", "duckduckgo", "brave"}
+                "anysearch", "tinyfish", "duckduckgo", "brave", "bingrss"}
 
 
 def _host_of(url: str) -> str:
@@ -444,13 +445,27 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 params=anysearch_params)),
             "tinyfish": asyncio.create_task(_multi_search(tinyfish_search, multi_variants,
                 count=min(count, 50), domain_type=_detect_tinyfish_type(query), goal=query)),
-            "brave": asyncio.create_task(_multi_search(search_brave, multi_variants[:1],
-                count=min(count, 10), timelimit=timelimit)),
+            "bingrss": asyncio.create_task(_multi_search(search_bing_web, multi_variants[:1],
+                count=min(count, 10))),
             **ddg_tasks,
         }
         done = await asyncio.wait_for(
             asyncio.gather(*tasks.values(), return_exceptions=True), timeout=90)
         done_map = dict(zip(tasks.keys(), done))
+        # Brave is 429-dead from this egress (measured 2026-10-20); Bing RSS is
+        # the keyless replacement and is tried FIRST. Brave stays in the fan-out
+        # as a last resort — a Brave request is only spent when Bing RSS came
+        # back empty.
+        _bing = done_map.get("bingrss")
+        _bing_hits = _bing.get("results", []) if isinstance(_bing, dict) else []
+        if not _bing_hits:
+            try:
+                done_map["brave"] = await asyncio.wait_for(
+                    _multi_search(search_brave, multi_variants[:1],
+                                  count=min(count, 10), timelimit=timelimit),
+                    timeout=20)
+            except Exception:
+                done_map["brave"] = []
         # D2 need-bias: academic need overrides the detected intent so the
         # scholarly vertical lanes fire; discussion keeps the detected intent
         # (reddit is always in the fan-out already).
@@ -459,10 +474,15 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             _intent = "paper"
         _verticals = [v for v in verticals_for(_intent, effective_query)
                       if v not in ("wikipedia", "arxiv", "news")]
+        # News intent: GDELT is 429-dead from this egress too, so add the
+        # keyless Bing News RSS leg to the news path.
+        if _intent == "news" and "bingnews" not in _verticals:
+            _verticals.append("bingnews")
         if _verticals:
             try:
                 # Slow lanes (code/SG, gdelt spacing guard) need more than 5s.
-                _SLOW_VERTICALS = {"code": 35.0, "gdelt": 15.0, "vuln": 15.0}
+                _SLOW_VERTICALS = {"code": 35.0, "gdelt": 15.0, "vuln": 15.0,
+                                   "bingnews": 10.0}
                 v_results = await asyncio.gather(
                     *[asyncio.wait_for(vertical_run(_v, effective_query),
                                        timeout=_SLOW_VERTICALS.get(_v, 5))
@@ -473,7 +493,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 v_results = [[] for _ in _verticals]
             for _v, r in zip(_verticals, v_results):
                 done_map[f"vert_{_v}"] = [] if isinstance(r, BaseException) else r
-        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "brave")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
+        for key in list(("rss", "tavily", "reddit", "wiki", "arxiv", "anysearch", "tinyfish", "bingrss", "brave")) + list(ddg_tasks.keys()) + [f"vert_{v}" for v in _verticals]:
             if key not in done_map:
                 continue
             val = done_map[key]
@@ -518,7 +538,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                         entry = dict(r)
                         entry["rank"] = len(per_engine.get(new_eng, []))
                         per_engine.setdefault(new_eng, []).append(entry)
-        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish", "brave": "brave"}
+        eng = {"rss": "google-news-rss", "tavily": "tavily", "reddit": "reddit", "wiki": "wikipedia", "arxiv": "arxiv", "anysearch": "anysearch", "tinyfish": "tinyfish", "bingrss": "bingrss", "brave": "brave"}
         for key, name in eng.items():
             val = done_map.get(key)
             if isinstance(val, dict):

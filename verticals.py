@@ -13,9 +13,16 @@ from urllib.parse import quote
 
 from config import get_http_client
 from search_academic import search_academic
+from search_bing_rss import search_bing_news
 
 FETCH_TIMEOUT = 12.0
 MAX_PER_VERTICAL = 5
+
+# Wikimedia (and several other APIs) reject requests without an identifying
+# User-Agent with HTTP 403 — the wikipedia vertical was 100% dead because
+# httpx's default "python-httpx/x.y.z" UA is blocked. Send a real UA on
+# every vertical.
+_VERTICAL_UA = "websearch-mcp/1.0"
 
 
 def _se_key() -> str:
@@ -118,16 +125,22 @@ async def run(vertical: str, query: str) -> list[dict]:
             return await search_gdelt(query, MAX_PER_VERTICAL)
         except Exception:
             return []
+    if vertical == "bingnews":
+        # Bing News RSS — keyless; GDELT is 429-dead from this egress.
+        try:
+            return await search_bing_news(query, MAX_PER_VERTICAL)
+        except Exception:
+            return []
     url = endpoint(vertical, query)
     if not url:
         return []
     c = get_http_client()
     try:
-        headers = None
+        headers = {"User-Agent": _VERTICAL_UA}
         if vertical == "scholar":
             s2 = _s2_key()
             if s2:
-                headers = {"x-api-key": s2}
+                headers["x-api-key"] = s2
         r = await c.get(url, timeout=FETCH_TIMEOUT, headers=headers)
         if r.status_code != 200:
             return []
