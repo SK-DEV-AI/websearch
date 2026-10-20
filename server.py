@@ -16,6 +16,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
 from config import MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client, _KeyRotator
+from cdp_actions import browser_action as _browser_action
 from errors import annotate as _err_annotate, classify_exception as _err_exc
 from ghost_state import CHALLENGE, CONTENT_OK, classify, ghost
 from fetch import fetch_url, scrapling_stealthy_fetch
@@ -44,6 +45,7 @@ Multi-engine search + content extraction.
 - **search** for finding information (9 engines, dedup+rerank+synthesis). **synthesize=false** when you only need raw results. Set `domain` for vertical search (code, academic, finance, health, travel, legal).
 - **fetch** to read a specific page (auto-CDP fallback on blocked pages. PDF/EPUB/DOCX support).
 - **screenshot** for LLM-readable page text (ARIA snapshot).
+- **browser_action** to DRIVE a real browser page (click, type, key press, JS eval, HTML, text, AX tree, PNG screenshot) — for pages that need interaction, not just reading.
 - **extract** for structured JSON: **strategy=css** fastest+free (simple fields), **strategy=llm** works on any content (costs quota).
 - **map_site** for sitemap discovery.
 - **pdf_extract** for PDFs (OCR+formulas+tables). **wikipedia/arxiv** for those dedicated sources.
@@ -127,6 +129,24 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "start_line": {"type": "integer", "description": "1-based start line for snapshot text range"},
                 "end_line": {"type": "integer", "description": "1-based end line (inclusive) for snapshot text range"}},
                 "required": ["url"]}),
+         Tool(name="browser_action",
+            description="Drive a real browser page (local Helium CDP): navigate, click, type, press a key, evaluate JS, read page HTML/text, get the accessibility tree, or capture a PNG. Use when a page needs interaction (login form, search box, 'load more' button) — for plain reading use fetch, for structure use screenshot. One call = one fresh tab, closed afterwards; pass steps[] to run a multi-step flow (focus -> type -> Enter -> read) in a single tab. URLs are SSRF-validated. e.g. browser_action(action='click', url='https://example.com', selector='#more')",
+            input_schema={"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["navigate","click","type","key","evaluate","html","text","aria","screenshot","wait"], "description": "navigate=go to url, click=mouse click on selector, type=insert text (focuses selector first if given), key=press a key (Enter/Escape/Tab), evaluate=run JS and return its value, html=page HTML, text=inner text of the page or of one selector, aria=accessibility tree, screenshot=PNG/JPEG written to a temp file, wait=wait for a load milestone"},
+                "url": {"type": "string", "description": "URL to act on (required for action=navigate; optional for other actions — the tab navigates there first). SSRF-validated."},
+                "selector": {"type": "string", "description": "CSS selector — required for action=click, optional focus target for action=type, element for action=text"},
+                "text": {"type": "string", "description": "Text to type (action=type)"},
+                "key": {"type": "string", "description": "DOM key value to press (action=key), e.g. Enter, Escape, Tab, ArrowDown"},
+                "expression": {"type": "string", "description": "JavaScript expression to evaluate in the page (action=evaluate). Arrow functions are auto-invoked."},
+                "wait_state": {"type": "string", "enum": ["domcontentloaded","load","networkidle"], "default": "domcontentloaded", "description": "Load milestone to wait for after navigating (and for action=wait)"},
+                "steps": {"type": "array", "items": {"type": "object"}, "description": "Ordered multi-step flow executed in ONE tab (max 25). Each step is an object with the same fields as the top-level params (action, url, selector, text, key, expression, wait_state). Use for flows like: type into a box, press Enter, then read the results."},
+                "timeout": {"type": "number", "default": 30, "description": "Per-step timeout in seconds (1-120)"},
+                "max_chars": {"type": "integer", "default": 20000, "description": "Max chars returned for html/text/aria (200-200000)"},
+                "full_page": {"type": "boolean", "default": True, "description": "action=screenshot: capture beyond the viewport"},
+                "image_type": {"type": "string", "enum": ["png","jpeg"], "default": "png", "description": "action=screenshot: image format"},
+                "quality": {"type": "integer", "description": "action=screenshot: JPEG quality 0-100"},
+                "depth": {"type": "integer", "default": 5, "description": "action=aria: accessibility tree depth (1-100)"}},
+                "required": []}),
          Tool(name="wikipedia",
             description="Full Wikipedia API client: articles, summaries, categories, links, pageviews, revisions, backlinks, geosearch, recent changes, random pages. Use for encyclopedic facts; for open research use search. e.g. wikipedia(query='Python', action='summary')",
             input_schema={"type": "object", "properties": {
@@ -549,6 +569,27 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                     else:
                         r[text_key] = "\n".join(all_lines[start_line - 1:])
                     r["returned_lines"] = r[text_key].count("\n") + 1
+            return _res(r)
+        elif name == "browser_action":
+            steps = arguments.get("steps")
+            if steps is not None and not isinstance(steps, list):
+                return _res({"success": False, "error": "steps must be a list of action objects"})
+            r = await _browser_action(
+                action=str(arguments.get("action", "") or ""),
+                url=str(arguments.get("url", "") or ""),
+                selector=str(arguments.get("selector", "") or ""),
+                text=str(arguments.get("text", "") or ""),
+                key=str(arguments.get("key", "") or ""),
+                expression=str(arguments.get("expression", "") or ""),
+                wait_state=str(arguments.get("wait_state", "domcontentloaded") or "domcontentloaded"),
+                steps=steps,
+                timeout=safe_float(arguments.get("timeout", 30.0), 30.0),
+                max_chars=safe_int(arguments.get("max_chars", 20000), 20000),
+                full_page=bool(arguments.get("full_page", True)),
+                image_type=str(arguments.get("image_type", "png") or "png"),
+                quality=arguments.get("quality"),
+                depth=safe_int(arguments.get("depth", 5), 5),
+            )
             return _res(r)
         elif name == "wikipedia":
             action = str(arguments.get("action", "search"))
