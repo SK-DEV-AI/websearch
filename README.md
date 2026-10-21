@@ -2,11 +2,12 @@
 
 Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, Brave, Tavily, Wikipedia, arXiv, Google News RSS (+ best-effort Marginalia for independent-index recall), Google AI Mode, and intent-gated vertical lanes (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV vuln, grep.app/Sourcegraph code, GDELT news) — with consensus-merge dedup, a local cross-encoder reranker, and Groq synthesis with grounding checks.
 
-## Tools (9)
+## Tools (10)
 
 - **search** — Open research questions. depth=1 snippets, depth≥2 full-page fetch + rerank. `synthesize` returns a Groq answer with [N] citations.
 - **fetch** — URL to markdown/text. Direct fetch with auto-fallback to the Helium CDP browser for blocked/JS pages. PDF/EPUB/DOCX supported. Paginated (`offset`). For structured JSON use `extract`.
 - **screenshot** — ARIA accessibility snapshot (LLM-readable page text and interactive structure).
+- **browser_action** — Drive a real browser page (navigate, click, type, press a key, evaluate JS, read HTML/text, ARIA tree, screenshot). Use when a page needs interaction; for plain reading use `fetch`.
 - **wikipedia** — Full Wikipedia API client: articles, summaries, categories, links, pageviews, revisions, backlinks, geosearch, recent changes, random pages.
 - **arxiv** — arXiv paper search with boolean/phrase/wildcard query syntax (single-source; multi-source paper search lives in codesearch `papers`).
 - **extract** — Structured JSON from a page via CSS (fast, free), LLM, or regex strategies. Repeat calls cached.
@@ -39,7 +40,7 @@ Point your MCP client at `run` (stdio):
 | `TAVILY_KEYS` | Tavily engine lane | Optional |
 | `NV_KEY` | NVIDIA embedding endpoint | Optional |
 
-Everything else (DDG, Brave scrape, Wikipedia, arXiv, RSS) is keyless.
+Everything else (DDG, Bing RSS, Wikipedia, arXiv, RSS) is keyless. Brave's HTML scrape is currently rate-limited from some networks, so Bing RSS is the primary general-web door and Brave is a last resort.
 
 ## Notes
 
@@ -47,7 +48,8 @@ Everything else (DDG, Brave scrape, Wikipedia, arXiv, RSS) is keyless.
 - **Helium CDP (optional):** bot-walled pages escalate to a Chrome DevTools browser at `127.0.0.1:9222` when available; without it those pages return a terminal verdict instead of hanging.
 - **Caching:** fetch results cache for 1h (`cache_ttl=0` forces fresh). No database, no state beyond the cache dir.
 - **Safety:** all user-URL fetches are SSRF-validated (private-IP blocking + redirect-hop revalidation + robots.txt gate).
-- **Groq model split:** synthesis + grounding + extract-llm use `openai/gpt-oss-120b`; rewrite/classify/expand/decompose use `llama-3.1-8b-instant` (14.4k RPD). Constants `GROQ_SMART_MODEL`/`GROQ_CHEAP_MODEL` in config.py.
-- **New lanes (all keyless, advisory-only):** OSV.dev vuln vertical + CVE fast path (NVD fallback); grep.app code vertical (Sourcegraph backup); GDELT news supplement; Jina Reader pre-CDP tier; Wayback CDX-history recovery in enrich(); Common Crawl domain-survey assist in map_site.
+- **Groq model split:** synthesis + grounding + extract-llm use `openai/gpt-oss-120b`; rewrite/classify/expand/decompose use `openai/gpt-oss-20b` (the previous `llama-3.1-8b-instant` was retired by Groq and now 404s). Constants `GROQ_SMART_MODEL`/`GROQ_CHEAP_MODEL` in config.py.
+- **Keyless lanes (all advisory-only):** OSV.dev vuln vertical + NVD CVE enrichment; grep.app MCP code search (Sourcegraph backup); Bing Web RSS + Bing News RSS (Brave's scrape is rate-limited, GDELT 429s from some networks); Wikipedia vertical; Jina Reader pre-CDP tier; Wayback CDX-history recovery in enrich(); Common Crawl domain-survey assist in map_site.
+- **Local reranker:** a `gte-reranker-modernbert-base` cross-encoder runs as one shared worker over a Unix socket; either server spawns it on demand and it unloads when idle. Optional — without it results are engine-ranked only.
 - **Optional keys (graceful keyless fallback):** `SE_KEY`/`STACKEXCHANGE_KEY` (10k/day SE), `S2_KEY`/`S2_API_KEY` (dedicated S2 1 RPS).
 - **Marginalia:** best-effort lane only (shared public key pool, 503s under load); independent-index recall, no dedicated key wired (kontakt@marginalia.nu for one).
