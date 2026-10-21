@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.SK-DEV-AI/websearch",
-  "description": "Multi-engine web search + fetch MCP server (10 tools): parallel fan-out across DuckDuckGo, Bing Web/News RSS, Tavily, Wikipedia, arXiv, Google News RSS, Google AI Mode, plus intent-gated verticals (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV/NVD vulns, grep.app + Sourcegraph code, GDELT news). Consensus-merge dedup, a local cross-encoder reranker, Groq synthesis with grounding checks, a real-browser browser_action tool, and SSRF-validated fetching with PDF/EPUB/DOCX support.",
+  "description": "Multi-engine web search, fetch, and a real-browser tool. 10 tools, keyless lanes.",
   "version": "1.0.0",
   "repository": {
     "url": "https://github.com/SK-DEV-AI/websearch",
@@ -11,7 +11,7 @@
   "packages": [
     {
       "registryType": "pypi",
-      "identifier": "sk-dev-ai-websearch",
+      "identifier": "websearch-mcp",
       "version": "1.0.0",
       "transport": {
         "type": "stdio"
