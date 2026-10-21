@@ -35,12 +35,16 @@ async def extract_content(
     instruction: str | None = None,
     strategy: str = "css",
     fields: list[str] | None = None,
-    provider: str = _DEFAULT_LLM,
+    provider: str | None = _DEFAULT_LLM,
     chunk_threshold: int = 2000,
     max_pages: int = 1,
     css_selector: str | None = None,
 ) -> dict:
     from security import SecurityError, validate_url as _validate_url
+    # A caller that omits `provider` sends None explicitly, which would
+    # override the default and reach crawl4ai as provider=None ->
+    # "'NoneType' object has no attribute 'startswith'". Fall back here.
+    provider = (provider or "").strip() or _DEFAULT_LLM
     try:
         url = await _validate_url(url)
     except SecurityError as e:
