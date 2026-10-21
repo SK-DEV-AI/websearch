@@ -1,6 +1,8 @@
 # websearch MCP Server
 
-Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, Brave, Tavily, Wikipedia, arXiv, Google News RSS (+ best-effort Marginalia for independent-index recall), Google AI Mode, and intent-gated vertical lanes (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV vuln, grep.app/Sourcegraph code, GDELT news) — with consensus-merge dedup, a local cross-encoder reranker, and Groq synthesis with grounding checks.
+[![skills.sh](https://skills.sh/b/SK-DEV-AI/skills)](https://skills.sh/SK-DEV-AI/skills) · `npx skills add SK-DEV-AI/skills`
+
+Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, Bing Web/News RSS, Tavily, Wikipedia, arXiv, Google News RSS, Brave (last resort — rate-limited from some networks), Google AI Mode, and intent-gated vertical lanes (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV vuln, grep.app/Sourcegraph code, GDELT news) — with consensus-merge dedup, a local cross-encoder reranker, and Groq synthesis with grounding checks.
 
 ## Tools (10)
 
@@ -53,3 +55,4 @@ Everything else (DDG, Bing RSS, Wikipedia, arXiv, RSS) is keyless. Brave's HTML 
 - **Local reranker:** a `gte-reranker-modernbert-base` cross-encoder runs as one shared worker over a Unix socket; either server spawns it on demand and it unloads when idle. Optional — without it results are engine-ranked only.
 - **Optional keys (graceful keyless fallback):** `SE_KEY`/`STACKEXCHANGE_KEY` (10k/day SE), `S2_KEY`/`S2_API_KEY` (dedicated S2 1 RPS).
 - **Marginalia:** best-effort lane only (shared public key pool, 503s under load); independent-index recall, no dedicated key wired (kontakt@marginalia.nu for one).
+
