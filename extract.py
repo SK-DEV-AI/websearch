@@ -12,12 +12,25 @@ from __future__ import annotations
 import json
 import os
 
-from crawl4ai.extraction_strategy import (
-    LLMExtractionStrategy,
-    JsonCssExtractionStrategy,
-    RegexExtractionStrategy,
-)
-from crawl4ai import LLMConfig
+# crawl4ai is an OPTIONAL dependency (pip install websearch-mcp[extract]); it
+# pulls a browser stack. Import it lazily so the server starts without it and
+# only the extraction strategies that need it fail with a clear message.
+def _crawl4ai() -> tuple:
+    """Import and return the crawl4ai strategy classes on first use."""
+    try:
+        from crawl4ai.extraction_strategy import (
+            LLMExtractionStrategy,
+            JsonCssExtractionStrategy,
+            RegexExtractionStrategy,
+        )
+        from crawl4ai import LLMConfig
+    except ImportError as e:  # pragma: no cover - depends on the install
+        raise ImportError(
+            "crawl4ai is not installed. It is an optional dependency of this "
+            "MCP server. Install it with:  pip install websearch-mcp[extract]  "
+            "(or websearch-mcp[all] for every extra)."
+        ) from e
+    return LLMExtractionStrategy, JsonCssExtractionStrategy, RegexExtractionStrategy, LLMConfig
 
 from config import _KeyRotator
 
@@ -51,6 +64,9 @@ async def extract_content(
         return {"success": False, "url": url, "error": str(e)}
     try:
         extraction_strategy = None
+
+        (LLMExtractionStrategy, JsonCssExtractionStrategy,
+         RegexExtractionStrategy, LLMConfig) = _crawl4ai()
 
         if strategy == "llm":
             groq_key = await _groq_key()

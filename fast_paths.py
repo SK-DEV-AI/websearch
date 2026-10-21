@@ -20,7 +20,7 @@ import time
 import urllib.parse
 from urllib.parse import urlparse
 
-from scrapling.fetchers import AsyncFetcher
+from scrapling_shim import AsyncFetcher
 
 from security import SecurityError, validate_url as _validate_url
 

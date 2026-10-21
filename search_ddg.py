@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from typing import Any
 
 from ddgs import DDGS
-from scrapling.fetchers import AsyncFetcher
+from scrapling_shim import AsyncFetcher
 
 from config import GNEWS_RSS
 

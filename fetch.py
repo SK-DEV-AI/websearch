@@ -11,7 +11,7 @@ from typing import Any
 
 import trafilatura
 
-from scrapling.fetchers import AsyncFetcher, AsyncStealthySession
+from scrapling_shim import AsyncFetcher, AsyncStealthySession
 
 from urllib.parse import urlparse
 
@@ -35,7 +35,19 @@ from fast_paths import fast_path_fetch
 
 logger = logging.getLogger("fetch")
 
-AsyncFetcher.configure(huge_tree=True)
+def _configure_scrapling() -> None:
+    """Apply scrapling's parser settings once, on first use.
+
+    The call is deferred because scrapling is an optional dependency: doing it
+    at import time would make the whole server unstartable without the extras.
+    """
+    try:
+        AsyncFetcher.configure(huge_tree=True)
+    except ImportError:
+        pass  # optional extra not installed; the scrapling lanes degrade
+
+
+_configure_scrapling()
 
 
 async def _revalidate_redirect(requested: str, resp) -> str | None:

@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from protego import Protego
 
-from scrapling.fetchers import AsyncFetcher
+from scrapling_shim import AsyncFetcher
 
 UA = "research-bot/1.0"
 

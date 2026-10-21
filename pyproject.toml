@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "websearch-mcp"
+version = "1.0.0"
+description = "Multi-engine web search + fetch MCP server for AI agents (10 tools)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "SK-DEV-AI" }]
+keywords = ["mcp", "mcp-server", "web-search", "search-engine", "scraping", "reranker", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+]
+dependencies = [
+    "httpx==0.28.1",
+    "mcp>=2.0.0",
+    "trafilatura>=2.3.1",
+    "markdownify>=1.0.0",
+    "protego>=0.7.0",
+    "aiosqlite>=0.20.0",
+    "pymupdf>=1.24.0",
+    "ebooklib>=0.18",
+    "python-docx>=1.0.0",
+    "lxml>=6.0.0",
+    "extruct>=0.18.0",
+    "html-to-markdown>=3.0.0",
+    "ddgs>=9.0.0",
+    "websockets>=14.0",
+]
+
+# The heavy optional tiers. Installing everything at once pulls a browser
+# stack and an OCR stack and is a multi-GB download, so they are opt-in:
+#   pip install websearch-mcp[scraping]   # stealth fetching (scrapling)
+#   pip install websearch-mcp[extract]    # LLM extraction (crawl4ai)
+#   pip install websearch-mcp[ocr]        # scanned-PDF OCR (docling)
+#   pip install websearch-mcp[all]        # everything
+[project.optional-dependencies]
+scraping = ["scrapling>=0.4.15"]
+extract = ["crawl4ai>=0.9.4"]
+ocr = ["docling==2.118.1"]
+all = ["scrapling>=0.4.15", "crawl4ai>=0.9.4", "docling==2.118.1"]
+
+[project.urls]
+Homepage = "https://github.com/SK-DEV-AI/websearch"
+Repository = "https://github.com/SK-DEV-AI/websearch"
+Issues = "https://github.com/SK-DEV-AI/websearch/issues"
+
+[project.scripts]
+websearch-mcp = "server:cli_main"
+
+[tool.setuptools]
+# Flat layout: the server is a set of top-level modules. setuptools' py_modules
+# handles this directly (hatchling's flat-layout support prefixes them with
+# "./" and drops them from the wheel).
+py-modules = ['__init__', 'arxiv', 'bench_prof', 'bot_detection', 'cache', 'cdp_actions', 'cdp_client', 'code_vertical', 'config', 'cookies', 'embed', 'errors', 'extract', 'fast_paths', 'feed_extract', 'fetch', 'fingerprint', 'focus', 'gdelt_vertical', 'ghost_state', 'grep_mcp', 'hn_extract', 'jsdata', 'mathml', 'md_convert', 'merge', 'mineru_extract', 'osv_vertical', 'pdf_extract', 'query_expand', 'recovery_tiers', 'reddit', 'reranker', 'research', 'revalidate', 'robots', 'scrapling_shim', 'screenshot', 'search_academic', 'search_anysearch', 'search_bing_rss', 'search_brave', 'search_ddg', 'search_gai', 'search_tavily', 'search_tinyfish', 'security', 'server', 'site_mapper', 'stealth_cdp', 'tier_stats', 'turnstile_solve', 'verticals', 'wikipedia']
+include-package-data = true
+
+[tool.setuptools.package-data]
+"*" = ["requirements.txt", "run.example", "server.json", "glama.json"]

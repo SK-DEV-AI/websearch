@@ -1,0 +1,53 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.SK-DEV-AI/websearch",
+  "description": "Multi-engine web search + fetch MCP server (10 tools): parallel fan-out across DuckDuckGo, Bing Web/News RSS, Tavily, Wikipedia, arXiv, Google News RSS, Google AI Mode, plus intent-gated verticals (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV/NVD vulns, grep.app + Sourcegraph code, GDELT news). Consensus-merge dedup, a local cross-encoder reranker, Groq synthesis with grounding checks, a real-browser browser_action tool, and SSRF-validated fetching with PDF/EPUB/DOCX support.",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/SK-DEV-AI/websearch",
+    "source": "github",
+    "id": "1278745840"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "sk-dev-ai-websearch",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "GROQ_API_KEYS",
+          "description": "Optional. Groq keys for synthesis and query rewriting.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "TAVILY_KEYS",
+          "description": "Optional. Tavily search lane.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "NV_KEY",
+          "description": "Optional. NVIDIA embeddings for ranking.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SE_KEY",
+          "description": "Optional. Stack Exchange key (10k/day instead of 300).",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "S2_KEY",
+          "description": "Optional. Semantic Scholar key (1 RPS).",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

@@ -14,7 +14,7 @@ variant fan-out). Time range and paging params follow searxng's brave.py.
 
 import urllib.parse
 
-from scrapling.fetchers import AsyncFetcher
+from scrapling_shim import AsyncFetcher
 
 BRAVE_URL = "https://search.brave.com/search"
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "

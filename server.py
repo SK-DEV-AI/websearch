@@ -750,3 +750,13 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+def cli_main():
+    """Console-script entry point (sync wrapper around the async main).
+
+    Used by the packaged distribution: `websearch-mcp` on PATH, and by MCP
+    clients that launch the module as a stdio server.
+    """
+    import asyncio
+    asyncio.run(main())
