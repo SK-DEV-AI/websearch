@@ -44,6 +44,29 @@ Point your MCP client at `run` (stdio):
 
 Everything else (DDG, Bing RSS, Wikipedia, arXiv, RSS) is keyless. Brave's HTML scrape is currently rate-limited from some networks, so Bing RSS is the primary general-web door and Brave is a last resort.
 
+## Install from PyPI
+
+```bash
+pip install skdev-websearch-mcp          # core install, small
+pip install skdev-websearch-mcp[all]     # + browser/OCR/extract extras (multi-GB)
+```
+
+The `websearch-mcp` console script speaks MCP over stdio:
+
+```json
+{ "websearch": { "command": "websearch-mcp" } }
+```
+
+## Docker
+
+```bash
+docker build -t websearch-mcp .
+docker run --rm -i websearch-mcp
+```
+
+Keys are passed at run time, never baked in: `-e GROQ_API_KEYS=...`.
+Heavy extras: `docker build --build-arg EXTRAS="[all]" -t websearch-mcp .`
+
 ## Notes
 
 - **Reranker (optional, local):** ranking uses a local `gte-reranker-modernbert-base` cross-encoder over a Unix socket (`RERANKER_MODEL` overrides the model). Without it, results return unranked with `relevance_score 0.0` — everything still works.
