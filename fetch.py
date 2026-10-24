@@ -1172,8 +1172,31 @@ async def scrapling_stealthy_fetch(
                         "verdict": verdict, "next_action": "none"}
             result["verdict"] = verdict
             return result
+    except ImportError as e:
+        # scrapling itself is missing -> an install problem, not a fetch failure.
+        return {"success": False, "url": url, "error": str(e),
+                "lane": "scrapling_stealth", "lane_status": "not_installed",
+                "fix": "pip install 'skdev-websearch-mcp[scraping]'"}
     except Exception as e:
-        return {"success": False, "url": url, "error": str(e)}
+        msg = str(e)
+        # The stealth tier needs its own browser binary (patchright/playwright
+        # download). That is an optional-dependency gap, NOT a bug in this
+        # server, and reporting it as a raw traceback made agents mark the whole
+        # tool as broken. Say what it is and how to fix it.
+        low = msg.lower()
+        if "executable doesn't exist" in low or "please run the following command" in low:
+            return {"success": False, "url": url, "error": msg.splitlines()[0],
+                    "lane": "scrapling_stealth", "lane_status": "browser_missing",
+                    "note": ("The optional stealth tier needs its own browser build; "
+                             "this is a setup gap, not a server error. Every other "
+                             "fetch tier still works."),
+                    "fix": "patchright install   # or: playwright install chromium"}
+        if "executable" in low and "not exist" in low:
+            return {"success": False, "url": url, "error": msg.splitlines()[0],
+                    "lane": "scrapling_stealth", "lane_status": "browser_missing",
+                    "fix": "patchright install"}
+        return {"success": False, "url": url, "error": msg,
+                "lane": "scrapling_stealth"}
 
 
 async def _cdp_wait_for_selector(page, css: str, timeout: float = 10):

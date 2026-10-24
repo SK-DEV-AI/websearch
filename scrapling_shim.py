@@ -37,11 +37,23 @@ class _LazyFetcher:
 
 
 class _LazyStealthySession:
-    """Proxy that resolves AsyncStealthySession on first use."""
+    """Proxy that resolves AsyncStealthySession on first use.
+
+    Both protocols matter, because callers use both:
+      AsyncStealthySession.get(...)      -> attribute access (__getattr__)
+      async with AsyncStealthySession()  -> construction   (__call__)
+    Without __call__ the construction form raises
+    "'_LazyStealthySession' object is not callable", which silently killed the
+    last-resort stealth tier for every fetch that reached it.
+    """
 
     def __getattr__(self, name: str) -> Any:
         _, AsyncStealthySession = _fetchers()
         return getattr(AsyncStealthySession, name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        _, AsyncStealthySession = _fetchers()
+        return AsyncStealthySession(*args, **kwargs)
 
 
 AsyncFetcher = _LazyFetcher()
