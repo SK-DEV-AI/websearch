@@ -16,7 +16,11 @@ CACHE_TTL = 120
 MAX_RESULTS = 20
 GOOGLE_AI_URL = "https://www.google.com/search"
 GNEWS_RSS = "https://news.google.com/rss/search"
-HELIUM_CDP = "http://127.0.0.1:9222"
+# CDP endpoint for the browser-dependent lanes (Google AI Mode, browser_action,
+# CDP fetch fallback). Point this at ANY Chromium-based browser started with
+# --remote-debugging-port. On a headless server the browser lanes simply stay
+# unavailable; everything else works over plain HTTP with no keys.
+HELIUM_CDP = os.environ.get("WEBSEARCH_CDP_URL", "http://127.0.0.1:9222").strip()
 
 NV_KEY = os.environ.get("NV_KEY", "")
 NV_BASE = "https://integrate.api.nvidia.com/v1"

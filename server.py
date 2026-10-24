@@ -40,6 +40,14 @@ INSTRUCTIONS = """# WebSearch MCP
 
 Multi-engine search + content extraction.
 
+## Start here
+
+Run **doctor()** first. It reports which lanes are usable right now and the exact
+command to enable the rest. Features that need optional setup: Google AI Mode
+(needs a signed-in Chromium browser over CDP), browser_action (same browser),
+the bot-wall CDP fallback, and cross-encoder reranking. Without those, the keyless
+HTTP lanes still work fully. Never assume a lane is broken before doctor() says so.
+
 ## When to use what
 
 - **search** for finding information (9 engines, dedup+rerank+synthesis). **synthesize=false** when you only need raw results. Set `domain` for vertical search (code, academic, finance, health, travel, legal).
@@ -68,6 +76,13 @@ depth≥2: fetches full pages for better scoring.
 
 async def handle_list_tools(ctx, params) -> ListToolsResult:
     return ListToolsResult(tools=[
+        Tool(name="doctor",
+            description="Preflight: report which lanes are usable RIGHT NOW and the exact command to enable the rest. Run this first, and whenever a feature returns empty results. Distinguishes 'broken' from 'needs optional setup' — the browser lanes (Google AI Mode, browser_action, bot-wall bypass) require a Chromium-based browser with --remote-debugging-port on the same host, so they are unavailable on headless servers; the keyless HTTP lanes work anywhere. Never prints key values, only which env var names are set. e.g. doctor()",
+            input_schema={"type": "object", "properties": {
+                "probe_network": {"type": "boolean", "default": True,
+                                  "description": "Run an outbound HTTPS check (adds ~1s)"},
+            }},
+        ),
         Tool(name="ping",
             description="Lightweight connectivity check — verifies internet and key search endpoints are reachable. Use before expensive calls when connectivity is uncertain. No params needed. e.g. ping()",
             input_schema={"type": "object", "properties": {}},
@@ -91,7 +106,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "anysearch_tag": {"type": "string", "description": "AnySearch precise sub-domain tag in {domain}.{sub_domain} format (e.g. code.doc, finance.us_stock). Overrides domain."},
                 "anysearch_zone": {"type": "string", "enum": ["", "cn", "intl"], "description": "AnySearch geo zone (cn or intl)"},
                 "anysearch_language": {"type": "string", "description": "AnySearch content language (e.g. en, zh-CN)"},
-                "google_ai_only": {"type": "boolean", "description": "Skip all other search engines, only use Google AI Mode for an AI-generated answer"},
+                "google_ai_only": {"type": "boolean", "description": "Skip all other search engines and answer only via Google AI Mode. Requires a signed-in Chromium session reachable over CDP (WEBSEARCH_CDP_URL); on a headless server or without a browser this returns an error, not results — call doctor() to check first"},
                 "history": {"type": "string", "description": "Conversation context for query rewriting (resolves pronouns like 'the second one')"}},
                 "required": ["query"]}),
          Tool(name="fetch",
@@ -130,7 +145,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "end_line": {"type": "integer", "description": "1-based end line (inclusive) for snapshot text range"}},
                 "required": ["url"]}),
          Tool(name="browser_action",
-            description="Drive a real browser page (local Helium CDP): navigate, click, type, press a key, evaluate JS, read page HTML/text, get the accessibility tree, or capture a PNG. Use when a page needs interaction (login form, search box, 'load more' button) — for plain reading use fetch, for structure use screenshot. One call = one fresh tab, closed afterwards; pass steps[] to run a multi-step flow (focus -> type -> Enter -> read) in a single tab. URLs are SSRF-validated. e.g. browser_action(action='click', url='https://example.com', selector='#more')",
+            description="Drive a real browser page (needs a Chromium-based browser with --remote-debugging-port on this host, e.g. chromium/google-chrome/brave/Helium, set via WEBSEARCH_CDP_URL; run doctor() to check): navigate, click, type, press a key, evaluate JS, read page HTML/text, get the accessibility tree, or capture a PNG. Use when a page needs interaction (login form, search box, 'load more' button) — for plain reading use fetch, for structure use screenshot. One call = one fresh tab, closed afterwards; pass steps[] to run a multi-step flow (focus -> type -> Enter -> read) in a single tab. URLs are SSRF-validated. e.g. browser_action(action='click', url='https://example.com', selector='#more')",
             input_schema={"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["navigate","click","type","key","evaluate","html","text","aria","screenshot","wait"], "description": "navigate=go to url, click=mouse click on selector, type=insert text (focuses selector first if given), key=press a key (Enter/Escape/Tab), evaluate=run JS and return its value, html=page HTML, text=inner text of the page or of one selector, aria=accessibility tree, screenshot=PNG/JPEG written to a temp file, wait=wait for a load milestone"},
                 "url": {"type": "string", "description": "URL to act on (required for action=navigate; optional for other actions — the tab navigates there first). SSRF-validated."},
@@ -274,6 +289,11 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(data, default=str))], is_error=not ok)
 
     try:
+        if name == "doctor":
+            from doctor import preflight
+            report = await preflight(probe_network=bool(arguments.get("probe_network", True)))
+            return _res({"success": True, **report})
+
         if name == "ping":
             c = get_http_client()
             results = {}

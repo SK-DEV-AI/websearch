@@ -6,10 +6,11 @@
 
 Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, Bing Web/News RSS, Tavily, Wikipedia, arXiv, Google News RSS, Brave (last resort — rate-limited from some networks), Google AI Mode, and intent-gated vertical lanes (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV vuln, grep.app/Sourcegraph code, GDELT news) — with consensus-merge dedup, a local cross-encoder reranker, and Groq synthesis with grounding checks.
 
-## Tools (10)
+## Tools (11)
 
+- **doctor** — **Run this first.** Reports which lanes are usable right now and the exact command to enable the rest. Distinguishes "broken" from "needs optional setup". Never prints key values.
 - **search** — Open research questions. depth=1 snippets, depth≥2 full-page fetch + rerank. `synthesize` returns a Groq answer with [N] citations.
-- **fetch** — URL to markdown/text. Direct fetch with auto-fallback to the Helium CDP browser for blocked/JS pages. PDF/EPUB/DOCX supported. Paginated (`offset`). For structured JSON use `extract`.
+- **fetch** — URL to markdown/text. Direct fetch with auto-fallback to a Chromium CDP browser for blocked/JS pages. PDF/EPUB/DOCX supported. Paginated (`offset`). For structured JSON use `extract`.
 - **screenshot** — ARIA accessibility snapshot (LLM-readable page text and interactive structure).
 - **browser_action** — Drive a real browser page (navigate, click, type, press a key, evaluate JS, read HTML/text, ARIA tree, screenshot). Use when a page needs interaction; for plain reading use `fetch`.
 - **wikipedia** — Full Wikipedia API client: articles, summaries, categories, links, pageviews, revisions, backlinks, geosearch, recent changes, random pages.
@@ -18,6 +19,36 @@ Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, 
 - **pdf_extract** — PDF to markdown/json/html. PyMuPDF fast path for text-layer PDFs, Docling+OCR fallback for scanned PDFs.
 - **map_site** — Survey a site's pages via sitemap XML (primary) + HTML link fallback, before fetching individually.
 - **ping** — Connectivity check for the internet and key search endpoints. Use before expensive calls when uncertain.
+
+## What works out of the box, and what is optional
+
+**Everything keyless works immediately** after `pip install`. No API keys, no browser, no GPU: search (DuckDuckGo, Bing RSS, Wikipedia, arXiv, Stack Exchange, GitHub, HN, grep.app, Google News RSS), fetch, map_site, pdf_extract, screenshot.
+
+Four lanes need optional setup. Run **`doctor()`** and it tells you which are live and prints the exact command for the rest:
+
+| Lane | Needs | On a headless server |
+|---|---|---|
+| **Google AI Mode** (`search(google_ai_only=True)`) | a Chromium-based browser with `--remote-debugging-port` **+ a signed-in Google account** in that profile | **unavailable** — no signed-in browser exists there |
+| **browser_action** | same browser, no Google login needed | **unavailable** |
+| **CDP fallback for bot-walled pages** | same browser | unavailable; those pages return a terminal verdict instead of hanging |
+| **Cross-encoder reranking** | an optional local worker (separate download, ~500MB model) | works if installed; otherwise scoring falls back to blended relevance |
+
+Enabling the browser lanes:
+
+```bash
+# any Chromium-family browser: chromium, google-chrome, brave, Helium, edge, vivaldi
+chromium --remote-debugging-port=9222 --user-data-dir="$HOME/.mcp-browser"
+```
+
+Then open google.com in that window and **sign in once** (needed only for Google AI Mode). Point elsewhere with `WEBSEARCH_CDP_URL=http://host:port`.
+
+```bash
+# confirm
+doctor()                          # per-lane report
+search(query="...", google_ai_only=True)   # explicit error + fix list if no browser
+```
+
+The browser lanes are **local-only by design**. On a server the HTTP lanes are unaffected, so the server is still fully useful — it just cannot query Google AI Mode. Without a browser, `google_ai_only=True` returns a structured error naming the cause and the fix, never an empty result set.
 
 ## Setup
 
@@ -71,8 +102,8 @@ Heavy extras: `docker build --build-arg EXTRAS="[all]" -t websearch-mcp .`
 
 ## Notes
 
-- **Reranker (optional, local):** ranking uses a local `gte-reranker-modernbert-base` cross-encoder over a Unix socket (`RERANKER_MODEL` overrides the model). Without it, results return unranked with `relevance_score 0.0` — everything still works.
-- **Helium CDP (optional):** bot-walled pages escalate to a Chrome DevTools browser at `127.0.0.1:9222` when available; without it those pages return a terminal verdict instead of hanging.
+- **Reranker (optional, local):** ranking uses a local `gte-reranker-modernbert-base` cross-encoder over a Unix socket (`RERANKER_MODEL` overrides the model). Not bundled with the pip package — set `RERANKER_WORKER=/path/to/worker.py` to use one. Without it, ranking falls back to blended relevance scores; everything still works. `doctor()` reports whichever is in effect.
+- **CDP browser (optional):** bot-walled pages escalate to a Chrome DevTools endpoint (`WEBSEARCH_CDP_URL`, default `127.0.0.1:9222`) when available; without it those pages return a terminal verdict instead of hanging.
 - **Caching:** fetch results cache for 1h (`cache_ttl=0` forces fresh). No database, no state beyond the cache dir.
 - **Safety:** all user-URL fetches are SSRF-validated (private-IP blocking + redirect-hop revalidation + robots.txt gate).
 - **Groq model split:** synthesis + grounding + extract-llm use `openai/gpt-oss-120b`; rewrite/classify/expand/decompose use `openai/gpt-oss-20b` (the previous `llama-3.1-8b-instant` was retired by Groq and now 404s). Constants `GROQ_SMART_MODEL`/`GROQ_CHEAP_MODEL` in config.py.

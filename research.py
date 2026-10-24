@@ -8,7 +8,7 @@ import time
 import urllib.parse
 from collections import Counter
 
-from config import cached
+from config import HELIUM_CDP, cached
 from search_ddg import search_ddg, search_google_rss
 from search_brave import search_brave
 from search_bing_rss import search_bing_web
@@ -299,6 +299,34 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     rewritten_query = ""
     search_need = "general"
     out_subqueries: list[dict] = []
+
+    if google_ai_only:
+        # Never fail silently. google_ai_only skips every HTTP engine, so if the
+        # CDP browser is missing the caller would otherwise get an empty result
+        # set and no idea why. Say exactly what is wrong and how to fix it.
+        _gai_client = await get_gai_client()
+        if _gai_client is None:
+            return {
+                "status": "error",
+                "error": (
+                    "google_ai_only needs Google AI Mode, which needs a Chromium-based "
+                    "browser with --remote-debugging-port on this host. None is "
+                    f"reachable at {HELIUM_CDP}."
+                ),
+                "fix": [
+                    "Start one, e.g. "
+                    'chromium --remote-debugging-port=9222 --user-data-dir="$HOME/.mcp-browser"',
+                    "Sign in to a Google account in that browser window (once).",
+                    "Set WEBSEARCH_CDP_URL if you used a different host/port.",
+                    "Or drop google_ai_only=True to use the keyless HTTP engines instead,",
+                    "which work with no browser and no API keys.",
+                ],
+                "where_am_i": "headless server or no browser — this lane is local-only",
+                "call": "doctor()",
+                "results": [],
+                "engines_used": [],
+                "engine_blocked": [],
+            }
     if not google_ai_only:
         # D2: one combined pass → standalone rewrite + search-need label.
         # Never suppresses search — the label only biases engine boosts below.

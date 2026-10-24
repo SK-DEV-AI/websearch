@@ -16,9 +16,15 @@ import subprocess
 logger = logging.getLogger(__name__)
 
 _SOCKET_PATH = "/tmp/reranker_worker.sock"
-_RERANKER_PYTHON = "/usr/bin/python3"
-_RERANKER_WORKER = os.path.expanduser("~/.local/share/reranker-rust/worker.py")
-_RERANKER_KILLSWITCH = os.path.expanduser("~/.local/share/reranker-rust/disabled")
+_RERANKER_PYTHON = os.environ.get("RERANKER_PYTHON", "/usr/bin/python3")
+_RERANKER_WORKER = os.environ.get(
+    "RERANKER_WORKER",
+    os.path.expanduser("~/.local/share/reranker-rust/worker.py"),
+)
+_RERANKER_KILLSWITCH = os.environ.get(
+    "RERANKER_KILLSWITCH",
+    os.path.expanduser("~/.local/share/reranker-rust/disabled"),
+)
 
 
 def killswitch_active() -> bool:
@@ -81,6 +87,12 @@ async def _ensure_worker():
     """
     global _PROC, _READER, _WRITER, _last_spawn_fail
     if killswitch_active():
+        return False
+    # A stranger's machine has no worker at this path (it is not part of the pip
+    # package). Bail out before touching the socket or taking the spawn lock, so
+    # every search does not pay a lock + spawn attempt for a model that will
+    # never load. Results fall back to score ordering; doctor() explains it.
+    if not os.path.isfile(_RERANKER_WORKER):
         return False
     import time
     if time.monotonic() - _last_spawn_fail < _SPAWN_COOLDOWN:
