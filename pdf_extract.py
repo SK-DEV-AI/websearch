@@ -255,18 +255,24 @@ async def extract_pdf(
                 return {"success": False, "error": f"OCR timed out after {_OCR_PAGE_BUDGET}s: {path.name}"}
             except Exception as e:
                 return {"success": False, "error": f"PDF extraction failed: {path.name}: {e}"}
+            truncated = False
             if isinstance(content, str):
                 if len(content) > 50000:
+                    truncated = True
                     content = content[:50000] + "\n\n[... truncated at 50000 chars ...]"
             else:
                 for f, c in content.items():
                     if len(c) > 50000:
+                        truncated = True
                         content[f] = c[:50000] + "\n\n[... truncated at 50000 chars ...]"
             results[path.name] = {
                 "content": content,
                 "method": method,
                 "pages": page_count,
                 "elapsed_s": round(time.monotonic() - t0, 1),
+                # Same rule as fetch: a partial extraction must say so in a field.
+                "truncated": truncated,
+                "truncated_at_chars": 50000 if truncated else 0,
             }
 
         if output_dir.strip():

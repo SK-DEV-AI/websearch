@@ -346,7 +346,8 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     author_blacklist: str = "", min_output_size: int = 0,
                     raw: bool = False, offset: int = 0, focus: str = "",
                     cache_ttl: int = 3600, cookies: dict | None = None,
-                    quality_floor: float = 0.0, mineru: bool = False) -> dict:
+                    quality_floor: float = 0.0, mineru: bool = False,
+                    cache_bust: bool = False) -> dict:
     """Fetch a URL with cache, focus filtering, and pagination via httpx + trafilatura.
 
     Cache keyed by URL+extraction_type (focus and offset are NOT part of the key).
@@ -362,18 +363,20 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         extraction_type = output_format  # Backward compat
 
         # ── Cache check ─────────────────────────────────────────────
-        if cache_ttl > 0:
+        if cache_ttl > 0 and not cache_bust:
             cached = await cache_mod.get_cached(
                 url, extraction_type=extraction_type, ttl=cache_ttl)
             if cached:
                 content = cached["content"]
                 if focus:
                     content = focus_mod.filter_by_relevance(content, focus)
-                return _build_paginated_response(url, content, cached.get("status", 200),
-                                                  cached.get("title", ""),
-                                                  cached.get("metadata", {}),
-                                                  cached.get("content_type", ""),
-                                                  offset, max_chars, method="cache")
+                result = _build_paginated_response(
+                    url, content, cached.get("status", 200),
+                    cached.get("title", ""), cached.get("metadata", {}),
+                    cached.get("content_type", ""),
+                    offset, max_chars, method="cache")
+                result["cache"] = _cache_state(cached, cache_ttl)
+                return result
 
         # ── Reddit pre-gate probe ───────────────────────────────────
         # Threads resolve inside the user's own Helium session
@@ -1481,6 +1484,25 @@ def _token_polish(md: str) -> str:
     return "\n".join(out)
 
 
+def _cache_state(cached: dict, cache_ttl: int) -> dict:
+    """Describe a cache hit in a way a caller can act on.
+
+    "cached: true" answers the wrong question. What a caller needs is how old
+    the content is and how long it stays valid, because those decide whether to
+    trust it or re-fetch with cache_bust.
+    """
+    fetched_at = float(cached.get("fetched_at") or 0)
+    age = max(0, int(time.time() - fetched_at)) if fetched_at else 0
+    ttl = int(cached.get("ttl") or cache_ttl or 0)
+    return {
+        "hit": True,
+        "age_s": age,
+        "ttl_s": ttl,
+        "ttl_remaining_s": max(0, min(ttl, int(cache_ttl)) - age),
+        "stale_risk": "high" if age > max(60, int(cache_ttl) * 0.75) else "low",
+    }
+
+
 def _build_paginated_response(url: str, content: str, status: int | str,
                               title: str, metadata: dict, content_type: str,
                               offset: int, max_chars: int,
@@ -1498,6 +1520,8 @@ def _build_paginated_response(url: str, content: str, status: int | str,
     return {
         "success": True, "url": url, "status": status,
         "title": title, "content": sliced,
+        # Default: this content was fetched now. A cache hit overrides it.
+        "cache": {"hit": False},
         "content_type": content_type, "metadata": metadata,
         "total_extracted_chars": total,
         "offset": offset,

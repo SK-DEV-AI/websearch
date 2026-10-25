@@ -137,6 +137,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "exclude_domains": {"type": "array", "items": {"type": "string"}, "description": "Tavily domain exclude filter"},
                 "synthesize": {"type": "boolean", "default": True, "description": "Synthesize a cited answer from the top results. The answer is deliberately short and says so when it is truncated."},
                 "synthesize_length": {"type": "string", "enum": ["short","long"], "default": "short", "description": "short = at most 6 sentences; long = up to 12, for genuinely multi-part questions"},
+                "follow_up": {"type": "boolean", "default": True, "description": "Allow ONE extra retrieval round when the first answer admits a gap (rests on a single source, a claim could not be tied to its source, or it says part of the question is unanswered). Adds 20-40s when it triggers; the response records it in follow_ups and marks synthesis.round=2."},
                 "domain": {"type": "string", "description": "AnySearch vertical: finance, code, academic, health, travel, legal, security. Guessed from query via simple heuristic — may be wrong, omit for general search."},
                 "anysearch_tag": {"type": "string", "description": "AnySearch precise sub-domain tag in {domain}.{sub_domain} format (e.g. code.doc, finance.us_stock). Overrides domain."},
                 "anysearch_zone": {"type": "string", "enum": ["", "cn", "intl"], "description": "AnySearch geo zone (cn or intl)"},
@@ -151,6 +152,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "offset": {"type": "integer", "default": 0, "description": "Char offset for paginated reads (0 = start). Response includes is_truncated, next_offset, total_extracted_chars (full page size)."},
                 "focus": {"type": "string", "description": "BM25 relevance filter — extract only content blocks relevant to this query. Use ONLY to pull specific sections from a large page (e.g. focus='pricing'). On crucial pages INSTEAD omit focus and fetch the whole content. Misses drop content the page's own Ctrl-F would find (focus is semantic, not literal) — never use focus when the full content is the deliverable."},
                 "cache_ttl": {"type": "integer", "default": 3600, "description": "Cache TTL in seconds (0 = force fresh fetch). Cache keyed by URL+extraction_type+css_selector, not focus/offset."},
+                "cache_bust": {"type": "boolean", "default": False, "description": "Ignore a fresh cache entry and re-fetch. The response carries `cache` with hit/age_s/ttl_remaining_s either way, so 'is this stale?' is answerable without guessing."},
                 "css_selector": {"type": "string", "description": "CSS selector — extract only the matching element's text (CDP tier only; ignored on the direct-fetch tier)"},
                 "extraction_type": {"type": "string", "enum": ["markdown","text","html"]},
                 "target_language": {"type": "string"},
@@ -731,6 +733,86 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
         logger.debug("synthesis cache write failed: %s", e)
     return result
 
+
+# ───────────────────── gap-driven second round ─────────────────────
+# The first pass retrieves one pool and answers from it. When the answer itself
+# says a part of the question is unanswered, the system was previously done -
+# even though the subqueries it generated are sitting right there in the
+# response, unused. One extra round on the subquery that covers the gap is the
+# cheapest real capability gain available: no new engine, no new key.
+
+FOLLOW_UP_TIME_BUDGET_MS = 75_000   # don't start a round a client will time out waiting for
+FOLLOW_UP_MAX_NEW_SOURCES = 6
+
+_GAP_PHRASES = ("unsupported", "not stated", "does not state", "do not state",
+                "cannot be determined", "no source", "without a source",
+                "insufficient evidence", "not specified in")
+
+
+def _gap_reason(synth: dict) -> str:
+    """Why a second round might help, or '' when the answer is self-sufficient.
+
+    Deliberately conservative: a follow-up costs 20-40s, so it only runs when
+    the first answer *itself* advertises a weakness, or when it rests on a single
+    citation while several were available.
+    """
+    if not synth or not synth.get("available"):
+        return ""
+    if synth.get("error"):
+        return "the first pass produced no answer"
+    cited = synth.get("citations_used") or 0
+    if cited <= 1:
+        return f"the answer rests on {cited} source(s)"
+    grounded = synth.get("grounded") or {}
+    if grounded.get("ok") is False and grounded.get("flagged"):
+        return "a claim could not be tied to the source that supposedly supports it"
+    text = (synth.get("answer") or "").lower()
+    for phrase in _GAP_PHRASES:
+        if phrase in text:
+            return f"the answer states part of the question is unanswered ({phrase!r})"
+    return ""
+
+
+def _follow_up_query(r: dict) -> tuple[str, str]:
+    """Pick the subquery most likely to fill the gap, and say why it was picked."""
+    subs = r.get("subqueries") or []
+    gap_words = ("limitation", "critic", "issue", "counter", "gap", "method",
+                 "evidence", "risk", "drawback", "alternativ")
+    for sub in subs:
+        goal = str(sub.get("researchGoal") or "").lower()
+        q = str(sub.get("query") or "").strip()
+        if q and any(w in goal for w in gap_words):
+            return q, f"subquery targeting {sub.get('researchGoal', '')[:80]}"
+    for sub in subs:
+        q = str(sub.get("query") or "").strip()
+        if q:
+            return q, "first unused subquery"
+    fu = str(r.get("follow_up") or "").strip()
+    if fu:
+        return fu, "engine follow_up suggestion"
+    rel = r.get("related_queries") or []
+    if rel:
+        return str(rel[0]).strip(), "engine related_queries"
+    return "", ""
+
+
+def _merge_round(base: dict, extra: dict) -> int:
+    """Merge a second round into the first, by URL. Returns how many were added."""
+    seen = {x.get("url") for x in (base.get("results") or []) if x.get("url")}
+    added = 0
+    for item in extra.get("results") or []:
+        u = item.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        base.setdefault("results", []).append(item)
+        added += 1
+    if extra.get("fetched_content"):
+        base["fetched_content"] = list(base.get("fetched_content") or []) + list(
+            extra["fetched_content"])
+    return added
+
+
 async def handle_call_tool(ctx, params) -> CallToolResult:
     name = params.name
     arguments = params.arguments or {}
@@ -875,6 +957,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             return _res({"success": True, "connectivity": results})
 
         if name == "search":
+            _t_search = time.perf_counter()
             query = str(arguments.get("query", "")).strip()
             if not query:
                 return _res({"success": False, "error": "query must not be empty"})
@@ -915,6 +998,19 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                         r["fetched_content"] = fetched["fetched_content"]
                 except Exception as e:
                     logger.warning("enrich failed: %s", e)
+
+            # Name the sources that produced no text, instead of leaving the
+            # caller to notice an empty `content` field halfway down a list.
+            # They are excluded from synthesis, so the answer is not built on
+            # them, but a caller reading the raw results deserves to know.
+            unreadable = [
+                {"url": x.get("url", ""), "title": x.get("title", ""),
+                 "reason": (x.get("error") or ("dead link" if x.get("dead")
+                            else "no text extracted"))[:120]}
+                for x in (r.get("fetched_content") or [])
+                if not (x.get("content") or "").strip()]
+            if unreadable:
+                r["unreadable"] = unreadable
             # Skip Groq synthesis when GAI already returned a full answer
             skip_synthesis = google_ai_only and r.get("ai_answer")
             if r.get("success") and bool(arguments.get("synthesize", True)) \
@@ -925,6 +1021,50 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                     length=str(arguments.get("synthesize_length", "short")))
                 if r["synthesis"].get("error"):
                     r["synthesis_error"] = r["synthesis"]["error"]
+
+                # ── one gap-driven round, if it is worth the wait ──────
+                # Only when the first answer admits a weakness, only when there
+                # is time left for a client to receive the result, and only once.
+                _elapsed_ms = int((time.perf_counter() - _t_search) * 1000)
+                if (bool(arguments.get("follow_up", True))
+                        and not r["synthesis"].get("cached")
+                        and _elapsed_ms < FOLLOW_UP_TIME_BUDGET_MS):
+                    why = _gap_reason(r["synthesis"])
+                    fq, picked = _follow_up_query(r) if why else ("", "")
+                    if fq:
+                        try:
+                            # Same engines, narrower count: this is a top-up, not
+                            # a second full search.
+                            extra = await search_multi(
+                                fq, count=min(count, 8), depth=depth,
+                                search_type=str(arguments.get("search_type", "auto")),
+                                timelimit=str(arguments.get("timelimit", "")),
+                                safesearch=str(arguments.get("safesearch", "moderate")),
+                                language=lang, cdp_url=HELIUM_CDP)
+                            if extra.get("success"):
+                                if depth >= 2 and extra.get("results"):
+                                    try:
+                                        got = await enrich(
+                                            extra["results"], fq, depth=depth,
+                                            cdp_url=HELIUM_CDP, count=8, language=lang)
+                                        if got.get("fetched_content"):
+                                            extra["fetched_content"] = got["fetched_content"]
+                                    except Exception as e:  # noqa: BLE001
+                                        logger.warning("follow-up enrich failed: %s", e)
+                                added = _merge_round(r, extra)
+                                r["follow_ups"] = [{
+                                    "query": fq, "why": why, "picked_by": picked,
+                                    "sources_added": added,
+                                }]
+                                if added:
+                                    r["synthesis"] = await _synthesize(
+                                        query, r, depth,
+                                        length=str(arguments.get("synthesize_length", "short")),
+                                        use_cache=False)
+                                    r["synthesis"]["round"] = 2
+                                    r["synthesis"]["rounds_reason"] = why
+                        except Exception as e:  # noqa: BLE001
+                            r["follow_up_error"] = f"{type(e).__name__}: {e}"
             elif r.get("success") and skip_synthesis:
                 r["synthesis"] = {"skipped": "google_ai_only returned its own "
                                              "answer; not synthesising over it"}
@@ -950,6 +1090,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                         offset=offset,
                         focus=str(arguments.get("focus", "")),
                         cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
+                        cache_bust=bool(arguments.get("cache_bust", False)),
                         target_language=str(arguments.get("target_language", "")),
                         fast=bool(arguments.get("fast", False)),
                         output_format=str(arguments.get("output_format", "markdown")),
@@ -1040,6 +1181,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                             offset=offset,
                             focus=str(arguments.get("focus", "")),
                             cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
+                            cache_bust=bool(arguments.get("cache_bust", False)),
                             target_language=str(arguments.get("target_language", "")),
                             fast=bool(arguments.get("fast", False)),
                             output_format=str(arguments.get("output_format", "markdown")),
@@ -1448,8 +1590,44 @@ async def _synthesis_selfcheck() -> None:
         globals()["_chat"] = ok_chat
         out = await _synthesize("selfcheck-q", {"results": []}, 2, use_cache=False)
         checks.append(("no results: skipped, no crash", bool(out.get("skipped"))))
+
     finally:
         globals().update(real)
+
+    # ── follow-up selection: pure functions, no model, no network ──
+    good = {"available": True, "citations_used": 4, "answer": "It is 3.4 [1].",
+            "grounded": {"ok": True, "flagged": []}}
+    weak = {"available": True, "citations_used": 1, "answer": "Something [1].",
+            "grounded": {"ok": True, "flagged": []}}
+    vague = {"available": True, "citations_used": 4,
+             "answer": "Part of this is unsupported by the sources [1][2].",
+             "grounded": {"ok": True, "flagged": []}}
+    flagged = {"available": True, "citations_used": 4, "answer": "X [1].",
+               "grounded": {"ok": False, "flagged": [{"sentence": "X"}]}}
+    checks.append(("a sufficient answer asks for no follow-up", _gap_reason(good) == ""))
+    checks.append(("a single-source answer asks for one", bool(_gap_reason(weak))))
+    checks.append(("an answer admitting a gap asks for one", bool(_gap_reason(vague))))
+    checks.append(("a flagged claim asks for one", bool(_gap_reason(flagged))))
+    checks.append(("no synthesis means no follow-up", _gap_reason({}) == ""))
+    checks.append(("an error asks for one", bool(_gap_reason({"available": True, "error": "x"}))))
+
+    subs = {"subqueries": [
+        {"query": "what is uv", "researchGoal": "establish background"},
+        {"query": "known limitations of uv", "researchGoal": "identify limitations"},
+    ]}
+    q, why = _follow_up_query(subs)
+    checks.append(("gap-targeting subquery preferred", "limitations" in q))
+    checks.append(("picking reason is stated", "limitation" in why.lower()))
+    checks.append(("falls back to engine follow_up",
+                   _follow_up_query({"follow_up": "next thing"})[0] == "next thing"))
+    checks.append(("no suggestion means no query", _follow_up_query({})[0] == ""))
+
+    base = {"results": [{"url": "a"}], "fetched_content": [{"url": "a", "content": "x"}]}
+    added = _merge_round(base, {"results": [{"url": "a"}, {"url": "b"}],
+                                "fetched_content": [{"url": "b", "content": "y"}]})
+    checks.append(("merge adds only new urls", added == 1))
+    checks.append(("merge keeps both result sets", len(base["results"]) == 2))
+    checks.append(("merge keeps both fetched sets", len(base["fetched_content"]) == 2))
 
     for name, ok in checks:
         print(f"{'OK' if ok else 'FAIL'}  {name}")

@@ -94,6 +94,10 @@ async def get_cached(url: str, extraction_type: str = "markdown",
             "metadata": json.loads(row["metadata"]),
             "total_chars": row["total_chars"],
             "cached": True,
+            # Age and remaining life, so a caller can tell "served from cache
+            # 4 minutes ago" from "this is a week old" instead of guessing.
+            "fetched_at": row["fetched_at"],
+            "ttl": row["ttl"],
         }
 
 

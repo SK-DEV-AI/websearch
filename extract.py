@@ -142,6 +142,12 @@ async def extract_content(
                 output["data"] = data
             except (json.JSONDecodeError, TypeError):
                 s = str(raw)
+                if len(s) > 10000:
+                    # A marker inside the string is easy to miss when the caller
+                    # parses the field; a flag is not.
+                    output["truncated"] = True
+                    output["truncated_fields"] = ["data"]
+                    output["truncated_at_chars"] = 10000
                 output["data"] = s[:10000] + ("\n\n[... truncated ...]" if len(s) > 10000 else "")
 
         # Include markdown if short (reuse the fetched HTML->text; no crawler)
@@ -151,6 +157,10 @@ async def extract_content(
                                          cache_ttl=3600)
             if text_fetch.get("success") and text_fetch.get("content"):
                 text = text_fetch["content"]
+                if len(text) > 5000:
+                    output["truncated"] = True
+                    output.setdefault("truncated_fields", []).append("markdown")
+                    output["truncated_at_chars"] = 5000
                 output["markdown"] = text[:5000] + ("\n\n[... truncated ...]" if len(text) > 5000 else "")
 
         return output
