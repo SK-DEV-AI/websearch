@@ -6,19 +6,101 @@ Companion agent skills: [`SK-DEV-AI/skills`](https://github.com/SK-DEV-AI/skills
 
 Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, Bing Web/News RSS, Tavily, Wikipedia, arXiv, Google News RSS, Brave (last resort — rate-limited from some networks), Google AI Mode, and intent-gated vertical lanes (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV vuln, grep.app/Sourcegraph code, GDELT news) — with consensus-merge dedup, a local cross-encoder reranker, and Groq synthesis with grounding checks.
 
-## Tools (11)
+## Tools (18)
 
 - **doctor** — **Run this first.** Reports which lanes are usable right now and the exact command to enable the rest. Distinguishes "broken" from "needs optional setup". Never prints key values.
 - **search** — Open research questions. depth=1 snippets, depth≥2 full-page fetch + rerank. `synthesize` returns a Groq answer with [N] citations.
-- **fetch** — URL to markdown/text. Direct fetch with auto-fallback to a Chromium CDP browser for blocked/JS pages. PDF/EPUB/DOCX supported. Paginated (`offset`). For structured JSON use `extract`.
+- **fetch** — URL to markdown/text. Direct fetch with auto-fallback to a Chromium CDP browser for blocked/JS pages. PDF/EPUB/DOCX supported. Paginated (`offset`). Optional `distill` (see below). For structured JSON use `extract`.
+- **fetch_many** — Fetch several URLs in one call. Dedups, caps concurrency, honours robots.txt, shares the cache, returns per-URL success/status/content plus counts. Use when you have 2+ URLs; use `fetch` for one.
+- **crawl** — Breadth-first site crawl with hard caps (per-page cap, depth cap, robots.txt, dedup, concurrency). Returns each page plus a `stop_reason` so you know whether the site was exhausted or a cap stopped it. Use for "read this whole docs site".
+- **extract_links** — Every link on a page with anchor text, title and rel. Resolves relative hrefs, drops `javascript:`/`mailto:`, dedups. Use before `crawl` or to find a "next" button.
+- **extract_table** — HTML tables to json, csv or markdown, by selector and index. Reports `tables_found` so you can pick one.
+- **download** — Save a URL to disk; returns the local path, byte count, sha256 and content type. Writes only inside `dest_dir` and refuses path traversal. Marks `truncated` if the byte cap stopped the transfer.
+- **diff_page** — Has this page changed since it was cached? Returns changed/old_hash/new_hash plus added and removed lines. First call for a URL returns `had_previous: false`.
 - **screenshot** — ARIA accessibility snapshot (LLM-readable page text and interactive structure).
-- **browser_action** — Drive a real browser page (navigate, click, type, press a key, evaluate JS, read HTML/text, ARIA tree, screenshot). Use when a page needs interaction; for plain reading use `fetch`.
+- **browser_action** — Drive a real browser page (navigate, click, type, press a key, evaluate JS, read HTML/text, ARIA tree, screenshot). Use when a page needs interaction; for plain reading use `fetch`. Pass `session_id` to reuse a persistent tab.
+- **browser_session** — Create, list, inspect or close a persistent browser tab. Without one, every `browser_action` call gets a fresh tab and closes it, so logins and cookies cannot survive. See below.
 - **wikipedia** — Full Wikipedia API client: articles, summaries, categories, links, pageviews, revisions, backlinks, geosearch, recent changes, random pages.
 - **arxiv** — arXiv paper search with boolean/phrase/wildcard query syntax (single-source; multi-source paper search lives in codesearch `papers`).
 - **extract** — Structured JSON from a page via CSS (fast, free), LLM, or regex strategies. Repeat calls cached.
 - **pdf_extract** — PDF to markdown/json/html. PyMuPDF fast path for text-layer PDFs, Docling+OCR fallback for scanned PDFs.
 - **map_site** — Survey a site's pages via sitemap XML (primary) + HTML link fallback, before fetching individually.
 - **ping** — Connectivity check for the internet and key search endpoints. Use before expensive calls when uncertain.
+
+## What replaced the throwaway scripts
+
+Every one of these exists because an agent otherwise writes a one-off script:
+
+| The task | The tool |
+|---|---|
+| Fetch 20 URLs | `fetch_many` |
+| Read a whole docs site | `crawl` |
+| Get every link on a page | `extract_links` |
+| Pull a pricing table into CSV | `extract_table` |
+| Save a PDF and get its path | `download` |
+| "Did this page change?" | `diff_page` |
+| Log in, then act across several calls | `browser_session` + `browser_action(session_id=...)` |
+
+## Persistent browser sessions
+
+`browser_action` opens one fresh tab per call and closes it afterwards. That is
+right for a single read, but it makes any interactive workflow impossible: no
+login, no cookies, no scroll position, no multi-step flow across calls.
+
+A session is a named, long-lived tab:
+
+```python
+browser_session(action="create", label="login", url="https://site.example/login")
+# -> {"session_id": "login-1a2b3c4d", ...}
+browser_action(action="type", selector="#email", text="me@example.com", session_id="login-1a2b3c4d")
+browser_action(action="click", selector="#submit", session_id="login-1a2b3c4d")
+browser_action(action="text", session_id="login-1a2b3c4d")   # same tab, still logged in
+browser_session(action="close", session_id="login-1a2b3c4d")
+```
+
+Sessions are opt-in: without `session_id`, behaviour is exactly as before. They
+are capped at 8 with least-recently-used eviction, tabs are always closed
+(including on eviction), and metadata is mirrored to
+`~/.cache/websearch/sessions.json` so `list` can explain what survived a
+restart. Sessions need a browser, so they are local-only.
+
+## In-tool distillation (optional, off by default)
+
+A fetched page can be 50k characters. The calling model pays for all of it even
+when it needed one fact. `fetch(distill=true)` runs a small model inside the
+tool first and returns a compressed result:
+
+```python
+fetch(url="https://example.com/long-report", distill=True,
+      distill_question="What are the pricing tiers?")
+```
+
+The result never pretends to be the page:
+
+| Field | Meaning |
+|---|---|
+| `distill.distilled` | whether a summary was produced |
+| `distill.raw_chars` | size of the original text |
+| `distill.grounded` | whether every number and quoted span was found in the source |
+| `distill.grounding.numbers_unverified` | figures in the summary that do not appear in the source |
+| `distill.grounding.quotes_unverified` | quoted spans that are not verbatim |
+| `distill.how_to_get_raw` | how to get the untouched text: `distill=false` |
+
+Below the size threshold (default 4000 chars) distillation is skipped and the
+raw text is returned, because a summary would cost more than it saves. On any
+failure the raw text is returned with `distill_skipped` explaining why - a
+broken summary is never returned in place of the page.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DISTILL_BASE_URL` | `http://127.0.0.1:11435/v1` | any OpenAI-compatible endpoint |
+| `DISTILL_MODEL` | `reflection/beam:free` | model id |
+| `DISTILL_API_KEY` | none | bearer token; without it the lane stays off |
+| `DISTILL_RETRIES` | `3` | attempts per call (1-10) |
+| `DISTILL_MAX_TOKENS` | `3000` | initial completion budget |
+| `DISTILL_MAX_TOKENS_CEILING` | `12000` | ceiling when escalating after empty content |
+| `DISTILL_TIMEOUT` | `90` | seconds per request |
+| `DISTILL_THRESHOLD_CHARS` | `4000` | below this, skip distillation |
 
 ## What works out of the box, and what is optional
 

@@ -47,13 +47,25 @@ Multi-engine search + content extraction.
 Run **doctor()** first. It reports which lanes are usable right now and the exact
 command to enable the rest. Features that need optional setup: Google AI Mode
 (needs a signed-in Chromium browser over CDP), browser_action (same browser),
-the bot-wall CDP fallback, and cross-encoder reranking. Without those, the keyless
+the bot-wall CDP fallback, in-tool distillation (needs a model endpoint), and
+cross-encoder reranking. Without those, the keyless
 HTTP lanes still work fully. Never assume a lane is broken before doctor() says so.
+
+## Sessions: when a task spans more than one call
+
+`browser_action` opens a fresh tab per call and closes it, so logins, cookies
+and scroll state do not survive. When a task needs state across calls (log in
+then act, fill a form over several steps, paginate), do this instead:
+1. `browser_session(action='create', label='login', url='https://site/login')`
+2. pass the returned `session_id` to every `browser_action` call
+3. `browser_session(action='close', session_id='...')` when done, so no tab leaks
+Sessions are local-only (they need CDP) and capped at 8.
 
 ## When to use what
 
 - **search** for finding information (9 engines, dedup+rerank+synthesis). **synthesize=false** when you only need raw results. Set `domain` for vertical search (code, academic, finance, health, travel, legal).
-- **fetch** to read a specific page (auto-CDP fallback on blocked pages. PDF/EPUB/DOCX support).
+- **fetch** to read a specific page (auto-CDP fallback on blocked pages. PDF/EPUB/DOCX support). Pass `distill=true` plus `distill_question` when the page is large and you only need facts from it: a local model compresses it first and the result says whether it was distilled, how big the raw text was, and how to get it back with `distill=false`.
+- **fetch_many** for 2+ known URLs in one call. **crawl** to walk a site with caps. **extract_links** for every link on a page. **extract_table** for tables as json/csv. **download** to save a file and get a path. **diff_page** to see whether a page changed since it was cached.
 - **screenshot** for LLM-readable page text (ARIA snapshot).
 - **browser_action** to DRIVE a real browser page (click, type, key press, JS eval, HTML, text, AX tree, PNG screenshot) — for pages that need interaction, not just reading.
 - **extract** for structured JSON: **strategy=css** fastest+free (simple fields), **strategy=llm** works on any content (costs quota).
