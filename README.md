@@ -6,7 +6,7 @@ Companion agent skills: [`SK-DEV-AI/skills`](https://github.com/SK-DEV-AI/skills
 
 Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, Bing Web/News RSS, Tavily, Wikipedia, arXiv, Google News RSS, Brave (last resort — rate-limited from some networks), Google AI Mode, and intent-gated vertical lanes (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV vuln, grep.app/Sourcegraph code, GDELT news) — with consensus-merge dedup, a local cross-encoder reranker, and Groq synthesis with grounding checks.
 
-## Tools (18)
+## Tools (20)
 
 - **doctor** — **Run this first.** Reports which lanes are usable right now and the exact command to enable the rest. Distinguishes "broken" from "needs optional setup". Never prints key values.
 - **search** — Open research questions. depth=1 snippets, depth≥2 full-page fetch + rerank. `synthesize` returns a Groq answer with [N] citations.
@@ -20,6 +20,8 @@ Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, 
 - **screenshot** — ARIA accessibility snapshot (LLM-readable page text and interactive structure).
 - **browser_action** — Drive a real browser page (navigate, click, type, press a key, evaluate JS, read HTML/text, ARIA tree, screenshot). Use when a page needs interaction; for plain reading use `fetch`. Pass `session_id` to reuse a persistent tab.
 - **browser_session** — Create, list, inspect or close a persistent browser tab. Without one, every `browser_action` call gets a fresh tab and closes it, so logins and cookies cannot survive. See below.
+- **form_fill_submit** — Fill many fields, submit, and read the result in one call. Verifies each element exists, reads back each typed value, and refuses to submit if a value did not stick. Reports `effect` (`navigated` / `content_changed` / `none`) so a submit that silently did nothing is visible rather than assumed.
+- **paginate** — Click a "next" control, collecting a value per page, up to a cap. Stops honestly when the control is missing or has no effect, and reports `stop_reason`.
 - **wikipedia** — Full Wikipedia API client: articles, summaries, categories, links, pageviews, revisions, backlinks, geosearch, recent changes, random pages.
 - **arxiv** — arXiv paper search with boolean/phrase/wildcard query syntax (single-source; multi-source paper search lives in codesearch `papers`).
 - **extract** — Structured JSON from a page via CSS (fast, free), LLM, or regex strategies. Repeat calls cached.
@@ -40,6 +42,8 @@ Every one of these exists because an agent otherwise writes a one-off script:
 | Save a PDF and get its path | `download` |
 | "Did this page change?" | `diff_page` |
 | Log in, then act across several calls | `browser_session` + `browser_action(session_id=...)` |
+| Fill and submit a form | `form_fill_submit` |
+| Walk "next" through pages | `paginate` |
 
 ## Persistent browser sessions
 

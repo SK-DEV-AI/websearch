@@ -35,6 +35,7 @@ from research import search_multi, enrich
 from extract import extract_content
 import webtools as _webtools
 import session as _session
+import browser_flows as _flows
 
 _groq_keys = _KeyRotator("GROQ_API_KEYS")
 
@@ -241,6 +242,30 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "url": {"type": "string"},
                 "extraction_type": {"type": "string", "default": "markdown"}},
                 "required": ["url"]}),
+         Tool(name="form_fill_submit",
+            description="Fill several form fields, click submit, and optionally read the result - in one call. Replaces a multi-step browser_action program full of fragile selectors. Works on a session so the submitted state is real; without session_id it creates a temporary session and closes it afterwards. fields[] is [{selector, value}] with optional action='type' (default) or 'click' for checkboxes. If a field fails the form is NOT submitted and the completed fields are reported, so a half-filled form is never mistaken for a sent one. Needs a Chromium with --remote-debugging-port.",
+            input_schema={"type": "object", "properties": {
+                "fields": {"type": "array", "items": {"type": "object"}, "description": "[{selector: '#email', value: 'a@b.c'}, {selector: '#tos', action: 'click'}]"},
+                "session_id": {"type": "string", "description": "Reuse a persistent tab; omit to use a temporary one"},
+                "url": {"type": "string", "description": "Page to open first"},
+                "submit_selector": {"type": "string", "description": "Submit button; omit to fill without submitting"},
+                "wait_state": {"type": "string", "enum": ["domcontentloaded", "load", "networkidle"], "default": "networkidle"},
+                "read_selector": {"type": "string", "description": "CSS selector to read after submitting; empty reads the whole page"},
+                "timeout": {"type": "number", "default": 20}},
+                "required": ["fields"]}),
+         Tool(name="paginate",
+            description="Click a 'next' control repeatedly and collect a value from each page. Replaces a pagination loop script. Stops at max_pages, when the next control is not clickable, or when the collected value stops changing (which usually means the last page). Always returns stop_reason and marks truncated, so partial coverage is visible. Works on a session, or a temporary one. Needs a Chromium with --remote-debugging-port.",
+            input_schema={"type": "object", "properties": {
+                "next_selector": {"type": "string", "description": "CSS selector for the next-page control"},
+                "session_id": {"type": "string"},
+                "url": {"type": "string", "description": "Page to open first"},
+                "max_pages": {"type": "integer", "default": 5, "description": "Hard page cap (1-25)"},
+                "read_selector": {"type": "string", "description": "What to collect from each page; empty reads the whole page"},
+                "wait_state": {"type": "string", "enum": ["domcontentloaded", "load", "networkidle"], "default": "networkidle"},
+                "wait_ms": {"type": "integer", "default": 600, "description": "Pause after each navigation"},
+                "stop_when_unchanged": {"type": "boolean", "default": True},
+                "timeout": {"type": "number", "default": 20}},
+                "required": ["next_selector"]}),
          Tool(name="wikipedia",
             description="Full Wikipedia API client: articles, summaries, categories, links, pageviews, revisions, backlinks, geosearch, recent changes, random pages. Use for encyclopedic facts; for open research use search. e.g. wikipedia(query='Python', action='summary')",
             input_schema={"type": "object", "properties": {
@@ -387,6 +412,28 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             if act == "close":
                 return _res(await _session.close(sid))
             return _res(await _session.list_all())
+
+        if name == "form_fill_submit":
+            return _res(await _flows.form_fill_submit(
+                fields=list(arguments.get("fields") or []),
+                session_id=str(arguments.get("session_id") or ""),
+                url=str(arguments.get("url") or ""),
+                submit_selector=str(arguments.get("submit_selector") or ""),
+                wait_state=str(arguments.get("wait_state") or "networkidle"),
+                read_selector=str(arguments.get("read_selector") or ""),
+                timeout=safe_float(arguments.get("timeout", 20.0), 20.0)))
+
+        if name == "paginate":
+            return _res(await _flows.paginate(
+                next_selector=str(arguments.get("next_selector") or ""),
+                session_id=str(arguments.get("session_id") or ""),
+                url=str(arguments.get("url") or ""),
+                max_pages=safe_int(arguments.get("max_pages", 5)),
+                read_selector=str(arguments.get("read_selector") or ""),
+                wait_state=str(arguments.get("wait_state") or "networkidle"),
+                wait_ms=safe_int(arguments.get("wait_ms", 600)),
+                stop_when_unchanged=bool(arguments.get("stop_when_unchanged", True)),
+                timeout=safe_float(arguments.get("timeout", 20.0), 20.0)))
 
         if name == "fetch_many":
             urls = arguments.get("urls") or []
