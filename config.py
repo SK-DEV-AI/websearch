@@ -91,6 +91,77 @@ FAST_PATHS_ENABLED = os.environ.get("FAST_PATHS_ENABLED", "true") == "true"
 ROBOTS_POLITENESS = os.environ.get("ROBOTS_POLITENESS", "true") == "true"
 EXTRACT_METADATA_ENABLED = os.environ.get("EXTRACT_METADATA_ENABLED", "true") == "true"
 
+# ── search effort defaults ───────────────────────────────────────
+# depth is how much work a search does: 1 = snippets only, 2+ = fetch the top
+# pages and score the full text. The right default depends on whether a model
+# is configured downstream, because fetching pages only pays off when something
+# reads them: with synthesis available, depth 2 measurably improves the answer;
+# without it the caller gets snippets and a longer wait for nothing.
+# Override with WEBSEARCH_DEFAULT_DEPTH for a fixed value.
+DEPTH_MIN = 1
+DEPTH_MAX = 5
+DEPTH_DEFAULT_PLAIN = 1
+DEPTH_DEFAULT_WITH_MODEL = 2
+
+
+def _clamp_int(raw: Any, lo: int, hi: int, default: int) -> int:
+    try:
+        return max(lo, min(hi, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def model_lanes_configured() -> bool:
+    """True when any lane that consumes a model has credentials.
+
+    Env-only and cheap on purpose: this runs on the search path, and reading a
+    config file per call would be a filesystem hit inside a tool. `doctor`
+    reports the authoritative answer (it calls distill.available(), which also
+    knows about ~/.jcode/config.toml); this is the fast approximation used to
+    pick a default.
+    """
+    return bool(
+        os.environ.get("GROQ_API_KEYS", "").strip()
+        or os.environ.get("DISTILL_API_KEY", "").strip()
+    )
+
+
+def default_depth(model_available: bool | None = None) -> int:
+    """Resolve the depth a call should use when the caller did not specify one.
+
+    WEBSEARCH_DEFAULT_DEPTH always wins when set, so behaviour is pinnable.
+    Otherwise: 2 when a model lane is available, 1 when not.
+    """
+    raw = os.environ.get("WEBSEARCH_DEFAULT_DEPTH", "").strip()
+    baseline = DEPTH_DEFAULT_WITH_MODEL if (
+        model_lanes_configured() if model_available is None else model_available
+    ) else DEPTH_DEFAULT_PLAIN
+    return _clamp_int(raw, DEPTH_MIN, DEPTH_MAX, baseline)
+
+
+def synthesis_settings() -> dict:
+    """Context-shaping knobs for the synthesis step.
+
+    Env                          default  meaning
+    WEBSEARCH_SYNTH_TOKENS           900  max_tokens for the answer
+    WEBSEARCH_DOMAIN_CAP               2  max sources from one registrable domain
+    WEBSEARCH_MIN_SOURCES              3  floor before the domain cap relaxes
+    WEBSEARCH_SYNTH_MAX_SOURCES        8  ceiling on sources in the context
+    WEBSEARCH_SYNTH_SNIPPET_CHARS   1500  chars of each source put in the context
+    """
+    return {
+        "max_tokens": _clamp_int(
+            os.environ.get("WEBSEARCH_SYNTH_TOKENS"), 200, 8000, 900),
+        "domain_cap": _clamp_int(
+            os.environ.get("WEBSEARCH_DOMAIN_CAP"), 1, 10, 2),
+        "min_sources": _clamp_int(
+            os.environ.get("WEBSEARCH_MIN_SOURCES"), 1, 10, 3),
+        "max_sources": _clamp_int(
+            os.environ.get("WEBSEARCH_SYNTH_MAX_SOURCES"), 1, 20, 8),
+        "snippet_chars": _clamp_int(
+            os.environ.get("WEBSEARCH_SYNTH_SNIPPET_CHARS"), 200, 8000, 1500),
+    }
+
 
 _cache: dict[str, tuple[float, Any]] = {}
 _MAX_CACHE = 500

@@ -788,6 +788,10 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             except Exception as e:
                 logger.warning(f"fetch: extruct pass failed: {e}")
 
+        # Resolve the title once, from the best available source.
+        _best = _best_title(meta.get("title", ""), meta_title, title,
+                            content=full_content)
+
         if focus:
             full_content = focus_mod.filter_by_relevance(full_content, focus)
         full_content = _strip_trackers_md(full_content)
@@ -813,7 +817,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
         if cache_ttl > 0:
             _cache_task = asyncio.ensure_future(cache_mod.set_cached(
                 url, full_content, extraction_type=extraction_type,
-                status=status_used, title=title or "",
+                status=status_used, title=_best,
                 metadata={k: v for k, v in meta.items() if v}, ttl=cache_ttl))
             def _cache_done(t, _url=url):
                 # A cancelled task raises CancelledError from .exception(), which
@@ -828,13 +832,13 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
             _cache_task.add_done_callback(_cache_done)
 
         result = _build_paginated_response(url, full_content, status_used,
-                                          title or meta_title or meta.get("title", ""),
+                                          _best,
                                           {k: v for k, v in meta.items() if v}, "",
                                           offset, max_chars, method="httpx")
         if changed_info:
             result["changed"] = changed_info
         result["raw_size"] = raw_len
-        q = _extraction_quality(full_content, title=title or meta_title or "",
+        q = _extraction_quality(full_content, title=_best,
                                 url=url, raw_html=(raw_html or "").encode("utf-8", errors="replace") if isinstance(raw_html, str) else (raw_html or b""))
         result["quality"] = q
         result["low_quality"] = q < QUALITY_FLOOR
@@ -854,7 +858,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     full_content = mr["content"].strip()
                     result = _build_paginated_response(
                         url, full_content, status_used,
-                        title or meta_title or meta.get("title", ""),
+                        _best,
                         {k: v for k, v in meta.items() if v}, "",
                         offset, max_chars, method="mineru_html")
                     result["raw_size"] = raw_len
@@ -897,6 +901,45 @@ async def _cdp_extract_content(page, css_selector: str | None, extraction_type: 
             content = _token_polish(content)
         return content or await page.inner_text()
     return await page.inner_text()
+
+
+# UI furniture that metadata extractors pick up as a page title on some sites.
+# mdbook (the Rust books) hands out "Keyboard shortcuts" from a hidden help
+# panel, which is how a search result ends up labelled that instead of the
+# chapter name - and a caller reading "Title: Keyboard shortcuts" learns nothing.
+_JUNK_TITLES = {
+    "keyboard shortcuts", "menu", "navigation", "home", "search", "untitled",
+    "index", "404", "page not found", "not found", "log in", "sign in",
+    "javascript is disabled", "loading", "untitled document", "document",
+}
+
+
+def _is_junk_title(t: str) -> bool:
+    t = (t or "").strip().lower()
+    return (not t) or len(t) < 3 or t in _JUNK_TITLES
+
+
+def _best_title(*candidates: str, content: str = "") -> str:
+    """First usable title, else the document's own first heading.
+
+    Order matters: a page-specific og:title beats a generic <title>, which beats
+    a heading, which beats nothing. Returning "" is correct when nothing is
+    usable - an invented label is worse than an empty one.
+    """
+    for c in candidates:
+        c = (c or "").strip()
+        # A candidate can arrive as a markdown heading; its markers are not
+        # part of the title.
+        c = re.sub(r"^#{1,6}\s*", "", c)
+        c = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", c).strip()
+        if not _is_junk_title(c):
+            return c[:200]
+    for m in re.finditer(r"^#{1,2}\s+(.+)$", content or "", re.M):
+        h = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", m.group(1)).strip()
+        if not _is_junk_title(h):
+            return h[:200]
+    return ""
+
 
 
 def _extraction_quality(content: str, *, title: str = "", url: str = "",

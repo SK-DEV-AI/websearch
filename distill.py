@@ -37,6 +37,7 @@ from typing import Any
 import httpx
 
 import cache as cache_mod
+import prompts
 
 logger = logging.getLogger(__name__)
 
@@ -96,48 +97,6 @@ def settings() -> dict:
         "retry_base_sleep": RETRY_BASE_SLEEP,
     }
 
-_SYSTEM = """You compress web content for another AI agent that will act on your output.
-
-Hard rules, in order of importance:
-
-1. Use ONLY facts present in the source text. Never add outside knowledge.
-2. If you are unsure whether something is in the source, leave it out rather
-   than paraphrasing it into existence.
-3. Never invent or round a number, date, name, URL, version or quote. Copy them
-   exactly as written.
-4. Keep every number, date, identifier and proper noun that appears in the part
-   you summarise. Dropping a figure is a failure; the caller may need it.
-5. Prefer the source's own words for anything that reads like a claim, a price,
-   a limit, or a specification.
-6. Do not editorialise. No "this is important", no recommendations, no summary
-   of significance. Report what the page says.
-
-Output exactly these sections and nothing else:
-
-## Summary
-Two to six sentences on what the page is and what it contains.
-
-## Key facts
-Bullets. Each bullet is one verifiable fact with its figure or name inline.
-Include as many as are needed to cover the substantive content.
-
-## Quoted
-Up to five short exact quotes that carry the most load, each attributed to the
-section it came from if that is visible.
-
-## Dropped
-One line naming what you did NOT include (navigation, boilerplate, comments,
-repeated tables, ads). If you dropped nothing substantive, write "nothing"."""
-
-_QUESTION_SUFFIX = """
-
-The caller is specifically looking for: {question}
-
-Put anything that answers that question first, in the Summary section, and keep
-it verbatim where possible. Still report every relevant figure - do not
-summarise away specifics just because they are not the primary question."""
-
-
 # ───────────────────────── configuration ─────────────────────────
 
 
@@ -191,6 +150,7 @@ def available() -> dict:
         "base_url": r["base_url"],
         "model": r["model"],
         "key_source": r["source"],
+        "prompt_version": prompts.DISTILL_VERSION,
         "threshold_chars": s["threshold_chars"],
         "retries": s["retries"],
         "max_tokens": s["max_tokens"],
@@ -267,7 +227,8 @@ def grounding_check(summary: str, source: str) -> dict:
 
 
 async def _ask(text: str, question: str, cfg: dict,
-               *, max_tokens: int | None = None) -> tuple[str, str, int]:
+               *, max_tokens: int | None = None,
+               part: int = 0, total: int = 0) -> tuple[str, str, int]:
     """One model call, with retries. Returns (summary, error, attempts).
 
     A free/cheap endpoint is flaky in three distinct ways and each needs its
@@ -287,7 +248,7 @@ async def _ask(text: str, question: str, cfg: dict,
     ceiling = s["max_tokens_ceiling"]
     base_sleep = s["retry_base_sleep"]
     max_tokens = int(max_tokens or s["max_tokens"])
-    system = _SYSTEM + (_QUESTION_SUFFIX.format(question=question) if question else "")
+    system = prompts.distill_system(question)
     headers = {"Authorization": f"Bearer {cfg['api_key']}",
                "Content-Type": "application/json"}
     last = "no attempt made"
@@ -298,7 +259,7 @@ async def _ask(text: str, question: str, cfg: dict,
             "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": text},
+                {"role": "user", "content": prompts.distill_user(text, part, total)},
             ],
         }
         try:
@@ -419,12 +380,11 @@ async def distill(
 
     parts: list[str] = []
     for idx, chunk in enumerate(chunks):
-        ask = question if question else ""
-        if len(chunks) > 1:
-            ask = (ask + "\n\n" if ask else "") + (
-                f"This is part {idx + 1} of {len(chunks)} of one page. "
-                "Summarise only this part.")
-        summary, err, _attempts = await _ask(chunk, ask, cfg)
+        # Part position goes into the user message, not the question: appending
+        # it to the question made the model read "part 2 of 3" as part of what
+        # the caller was asking for.
+        summary, err, _attempts = await _ask(chunk, question, cfg,
+                                             part=idx + 1, total=len(chunks))
         if err:
             return {**base, "success": True, "distilled": False,
                     "distill_skipped": f"model failed: {err}",
@@ -477,6 +437,7 @@ async def distill(
         "compression_ratio": round(len(merged) / max(1, chars), 4),
         "grounded": g["ok"],
         "grounding": g,
+        "prompt_version": prompts.DISTILL_VERSION,
         "content": merged,
         "note": note,
     }

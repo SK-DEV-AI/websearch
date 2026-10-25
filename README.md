@@ -9,7 +9,7 @@ Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, 
 ## Tools (20)
 
 - **doctor** — **Run this first.** Reports which lanes are usable right now and the exact command to enable the rest. Distinguishes "broken" from "needs optional setup". Never prints key values.
-- **search** — Open research questions. depth=1 snippets, depth≥2 full-page fetch + rerank. `synthesize` returns a Groq answer with [N] citations.
+- **search** — Open research questions. `depth` defaults to 2 when a model lane is configured (page fetch + rerank) and 1 otherwise. `synthesize` returns a short, cited answer that never invents: it says which source backs each claim, surfaces disagreement instead of averaging it, and marks itself `truncated` when it ran out of budget.
 - **fetch** — URL to markdown/text. Direct fetch with auto-fallback to a Chromium CDP browser for blocked/JS pages. PDF/EPUB/DOCX supported. Paginated (`offset`). Optional `distill` (see below). For structured JSON use `extract`.
 - **fetch_many** — Fetch several URLs in one call. Dedups, caps concurrency, honours robots.txt, shares the cache, returns per-URL success/status/content plus counts. Use when you have 2+ URLs; use `fetch` for one.
 - **crawl** — Breadth-first site crawl with hard caps (per-page cap, depth cap, robots.txt, dedup, concurrency). Returns each page plus a `stop_reason` so you know whether the site was exhausted or a cap stopped it. Use for "read this whole docs site".
@@ -105,6 +105,53 @@ broken summary is never returned in place of the page.
 | `DISTILL_MAX_TOKENS_CEILING` | `12000` | ceiling when escalating after empty content |
 | `DISTILL_TIMEOUT` | `90` | seconds per request |
 | `DISTILL_THRESHOLD_CHARS` | `4000` | below this, skip distillation |
+
+## The synthesis prompt (the answer you actually read)
+
+`search` does not just rank results; it writes the answer. That answer is
+generated from the retrieved text alone, under rules that exist to stop the
+three failure modes of a search summary:
+
+| Failure | What the prompt does |
+|---|---|
+| **Invention** | Nothing from the model's own knowledge. A claim with no citable source is deleted, not softened. If the results do not answer the question, saying so is the correct answer. |
+| **Bias** | Rank is not evidence. The prompt says so explicitly, caps how many sources can come from one domain, requires disagreement between sources to be reported rather than averaged into a number that appears in no source, corrects false premises in the question, and labels vendor claims as vendor claims. |
+| **Injection** | Results are wrapped in `<results>` and declared untrusted data. A page that says "ignore previous instructions" is data, not instruction; the model must exclude it and say it did. |
+
+Concision is structural, not a wish: a sentence ceiling, an answer-first rule,
+and a named ban on filler phrasing ("it is important to note", "overall", ...).
+
+Everything is verifiable rather than claimed:
+
+- the result carries `prompt_version`, so a quality change can be tied to a
+  revision instead of guessed at
+- `temperature` is 0, so the same sources give the same text
+- `finish_reason` and `truncated` are returned; a half sentence is labelled
+  instead of looking like a complete thought
+- `diversity` reports the source mix and whether the per-domain cap had to relax
+- a second model pass (`grounded`) re-reads the answer against the exact text
+  the first pass saw and flags sentences no cited source supports. It is marked
+  `advisory` because it is another model's opinion, not a proof
+
+### Which model writes the answer
+
+The in-tool model comes first by default, because it is free at the point of
+use. Groq is the fallback if it fails. Both are plain OpenAI-compatible chat
+endpoints, so one call path serves both.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `WEBSEARCH_SYNTH_PROVIDER` | `local` | `local` (in-tool model first), `groq` (Groq first), `auto` (either, in-tool preferred) |
+| `WEBSEARCH_DEFAULT_DEPTH` | auto | Pins the default `depth`. Auto = 2 when a model lane exists, else 1 |
+| `WEBSEARCH_SYNTH_TOKENS` | `900` | Answer budget. On `finish_reason=length` the result says `truncated` |
+| `WEBSEARCH_SYNTH_MAX_SOURCES` | `8` | Ceiling on sources in the context |
+| `WEBSEARCH_DOMAIN_CAP` | `2` | Max sources from one registrable domain |
+| `WEBSEARCH_MIN_SOURCES` | `3` | Floor before the domain cap relaxes |
+| `WEBSEARCH_SYNTH_SNIPPET_CHARS` | `1500` | Chars of each source given to the model |
+
+`doctor()` reports all of these resolved (`env.defaults`) plus the active prompt
+versions (`env.prompts`), and lists synthesis as its own lane, so "why is there
+no answer?" has an answer instead of a blank field.
 
 ## What works out of the box, and what is optional
 

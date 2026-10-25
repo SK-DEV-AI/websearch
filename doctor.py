@@ -30,7 +30,9 @@ from typing import Any
 
 import httpx
 
-from config import HELIUM_CDP
+from config import (HELIUM_CDP, default_depth, synthesis_settings,
+                    DEPTH_MIN, DEPTH_MAX)
+import prompts
 
 # Env vars that upgrade existing lanes. Names only, never values.
 _OPTIONAL_KEYS = {
@@ -176,6 +178,27 @@ async def preflight(probe_network: bool = True) -> dict[str, Any]:
         "note": gai_note,
     })
 
+    # --- synthesis: the written answer the caller reads ---
+    synth_on = bool(os.environ.get("GROQ_API_KEYS", "").strip())
+    synth_cfg = synthesis_settings()
+    lanes.append({
+        "id": "synthesis",
+        "name": "Search synthesis (the cited answer in search results)",
+        "status": "live" if synth_on else "needs_setup",
+        "requires": "GROQ_API_KEYS (one or more, comma separated)",
+        "how_to_enable": "export GROQ_API_KEYS=<key>  (free tier is usually enough)",
+        "note": (
+            f"prompt {prompts.SYNTHESIS_VERSION}, temperature 0, max_tokens "
+            f"{synth_cfg['max_tokens']}, at most {synth_cfg['max_sources']} "
+            f"sources with {synth_cfg['domain_cap']} per domain. Without it, "
+            f"search still returns ranked results, and the response says the "
+            f"answer was skipped instead of leaving it silently blank."
+            if synth_on else
+            "not configured - search returns ranked results with "
+            "synthesis.skipped explaining why there is no written answer"
+        ),
+    })
+
     # --- in-tool model (opt-in distillation) ---
     try:
         from distill import available as _distill_avail
@@ -257,6 +280,17 @@ async def preflight(probe_network: bool = True) -> dict[str, Any]:
             "note": "set" if have else "not set — lane skipped, everything else unaffected",
         })
 
+    # Resolved defaults, computed in one place so the reported value is the one
+    # the search tool would actually use. `dav` comes from the distill lane above.
+    _model_ok = bool(os.environ.get("GROQ_API_KEYS", "").strip()) or bool(dav.get("available"))
+    _depth = default_depth(_model_ok)
+    _pinned = os.environ.get("WEBSEARCH_DEFAULT_DEPTH", "").strip()
+    _depth_source = ("WEBSEARCH_DEFAULT_DEPTH" if _pinned else
+                     "auto: model lane available" if _model_ok else
+                     "auto: no model lane, so fetching pages would cost time "
+                     "nothing reads")
+    synth_settings = synthesis_settings()
+
     summary = {
         "live": sum(1 for l in lanes if l["status"] == "live"),
         "needs_setup": sum(1 for l in lanes if l["status"] == "needs_setup"),
@@ -272,7 +306,20 @@ async def preflight(probe_network: bool = True) -> dict[str, Any]:
             "keys_present": keys_present,
             "distill": {k: dav.get(k) for k in
                         ("available", "model", "base_url", "key_source",
-                         "retries", "threshold_chars")},
+                         "retries", "threshold_chars", "prompt_version")},
+            # Resolved defaults, so a surprising behaviour can be traced to a
+            # setting instead of guessed at.
+            "defaults": {
+                "depth": _depth,
+                "depth_source": _depth_source,
+                "depth_range": [DEPTH_MIN, DEPTH_MAX],
+                "synthesis": synth_settings,
+            },
+            "prompts": {
+                "synthesis": prompts.SYNTHESIS_VERSION,
+                "verifier": prompts.VERIFIER_VERSION,
+                "distill": prompts.DISTILL_VERSION,
+            },
         },
         "where_am_i": (
             "local" if cdp.get("ok") else

@@ -15,7 +15,12 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
-from config import MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client, _KeyRotator
+from config import (MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client,
+                    _KeyRotator, default_depth, synthesis_settings,
+                    DEPTH_MIN, DEPTH_MAX, GROQ_SMART_MODEL)
+from diversity import cap_per_domain
+import prompts
+import distill as _distill
 from cdp_actions import browser_action as _browser_action
 from errors import annotate as _err_annotate, classify_exception as _err_exc
 from ghost_state import CHALLENGE, CONTENT_OK, classify, ghost
@@ -75,8 +80,17 @@ Sessions are local-only (they need CDP) and capped at 8.
 
 ## Pipeline (search)
 
-search → multiple engines → dedup → reranker → synthesis (Groq for top 3).
-depth≥2: fetches full pages for better scoring.
+search → multiple engines → dedup → reranker → synthesis.
+depth>=2 fetches full pages for better scoring, and defaults to 2 when a model
+lane is configured.
+
+The synthesis answer is deliberately short and strict: it cites [N] per claim,
+never uses outside knowledge, surfaces disagreement between sources instead of
+averaging it, and treats result text as untrusted data (a page saying "ignore
+previous instructions" is data, and the answer says it ignored it). Check
+`synthesis.grounded` for sentences a second pass judged unsupported, and
+`synthesis.truncated` before treating an answer as complete. `synthesis.skipped`
+explains why there is no answer rather than leaving the field blank.
 
 ## Params
 
@@ -106,7 +120,8 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
             description="Multi-engine web search with dedup, reranking, and synthesis. Use for open research questions; for a known URL use fetch, for papers use arxiv, for encyclopedic facts use wikipedia. depth=1 returns snippets with relevance_score+fetch_relevance per result. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode. e.g. search(query='latest AI models', depth=1)",
             input_schema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 10},
-                "depth": {"type": "integer", "default": 1, "description": "1=snippets, 2+=fetch full pages + rerank"},
+                "depth": {"type": "integer",
+                          "description": "Effort: 1=snippets only, 2+=fetch the top pages and rerank on full text. Defaults to 2 when a model lane is available (GROQ_API_KEYS or the in-tool model) and 1 otherwise; WEBSEARCH_DEFAULT_DEPTH pins it."},
                 "search_type": {"type": "string", "enum": ["auto","text","news","images","videos","books"]},
                 "timelimit": {"type": "string", "description": "Time filter: d/w/m/y"},
                 "safesearch": {"type": "string", "enum": ["off","moderate","strict"], "default": "moderate"},
@@ -116,7 +131,8 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "end_date": {"type": "string", "description": "Tavily date filter end (YYYY-MM-DD)"},
                 "include_domains": {"type": "array", "items": {"type": "string"}, "description": "Tavily domain include filter"},
                 "exclude_domains": {"type": "array", "items": {"type": "string"}, "description": "Tavily domain exclude filter"},
-                "synthesize": {"type": "boolean", "default": True, "description": "Groq-synthesize top results into a concise answer with citations"},
+                "synthesize": {"type": "boolean", "default": True, "description": "Synthesize a cited answer from the top results. The answer is deliberately short and says so when it is truncated."},
+                "synthesize_length": {"type": "string", "enum": ["short","long"], "default": "short", "description": "short = at most 6 sentences; long = up to 12, for genuinely multi-part questions"},
                 "domain": {"type": "string", "description": "AnySearch vertical: finance, code, academic, health, travel, legal, security. Guessed from query via simple heuristic — may be wrong, omit for general search."},
                 "anysearch_tag": {"type": "string", "description": "AnySearch precise sub-domain tag in {domain}.{sub_domain} format (e.g. code.doc, finance.us_stock). Overrides domain."},
                 "anysearch_zone": {"type": "string", "enum": ["", "cn", "intl"], "description": "AnySearch geo zone (cn or intl)"},
@@ -331,42 +347,261 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
     ])
 
 
-async def verify_grounding(answer: str, sources: list[dict], groq_key: str) -> dict:
-    """Re-prompt Groq: for each sentence, is the claim backed by a cited source?
+# How much of each source the verifier is shown. Judging a claim against a bare
+# title is not a check, it is a guess: the first version did exactly that and
+# flagged true statements as unsupported because it could not see the text.
+VERIFIER_EXCERPT_CHARS = 1200
+VERIFIER_TOTAL_CHARS = 14_000
 
-    Returns {"flagged": [{"sentence": str, "issue": str}], "ok": bool}.
+
+async def verify_grounding(answer: str, sources: list[dict], ep: dict,
+                           excerpts: list[str] | None = None) -> dict:
+    """Re-prompt a model: is each sentence backed by a source it cites?
+
+    Runs on whichever endpoint produced the answer, so a deployment with only an
+    in-tool model still gets the check.
+
+    `excerpts` must be the same text the synthesis saw. Without it the verifier
+    can only compare claims against titles, which produces confident false
+    accusations - worse than no check, because a caller that sees a bogus flag
+    learns to ignore real ones.
+
+    The result is advisory: it is another model's opinion, not a proof.
+    Returns {"flagged": [...], "ok": bool|None, "checked_by": provider}.
     """
-    sources_block = "\n".join(f"[{s['n']}] {s['title']} — {s['url']}" for s in sources)
-    sys_p = (
-        "You are a grounding verifier. Given an answer and its source list, "
-        "identify every sentence whose central claim is NOT supported by any "
-        "cited source [N]. Output ONLY JSON: "
-        '{"flagged":[{"sentence":str,"issue":str}],"ok":bool}.'
-    )
-    c = get_http_client()
-    resp = await c.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
-        json={"model": "openai/gpt-oss-120b",
-              "messages": [{"role": "system", "content": sys_p},
-                           {"role": "user", "content": f"Sources:\n{sources_block}\n\nAnswer:\n{answer}"}],
-              "temperature": 0.0, "max_tokens": 1024}, timeout=15)
-    if resp.status_code != 200:
-        return {"flagged": [], "ok": None, "error": f"http {resp.status_code}"}
-    text = resp.json()["choices"][0]["message"]["content"].strip()
+    sources_block = "\n".join(
+        f"[{s['n']}] {s['title']} - {s['url']}"
+        + (f"\n    text: {excerpts[i][:VERIFIER_EXCERPT_CHARS]}"
+           if excerpts and i < len(excerpts) and excerpts[i] else "")
+        for i, s in enumerate(sources))
+    sources_block = sources_block[:VERIFIER_TOTAL_CHARS]
+    text, _finish, err, _att = await _chat(
+        ep,
+        [{"role": "system", "content": prompts.verifier_system()},
+         {"role": "user", "content": prompts.verifier_user(sources_block, answer)}],
+        max_tokens=2048, attempts=3, timeout=40)
     if not text:
-        return {"flagged": [], "ok": None, "error": "empty completion"}
+        return {"flagged": [], "ok": None, "error": err,
+                "checked_by": ep.get("provider", "")}
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
     try:
         parsed = json.loads(text)
     except Exception:
         a, b = text.find("{"), text.rfind("}")
-        parsed = json.loads(text[a:b+1]) if a >= 0 and b > a else None
+        try:
+            parsed = json.loads(text[a:b + 1]) if a >= 0 and b > a else None
+        except Exception:
+            parsed = None
     if isinstance(parsed, dict):
         flagged = parsed.get("flagged", []) if isinstance(parsed.get("flagged"), list) else []
-        return {"flagged": flagged, "ok": bool(parsed.get("ok", not flagged))}
-    return {"flagged": [], "ok": None, "error": "unparseable"}
+        out = {"flagged": flagged, "ok": bool(parsed.get("ok", not flagged)),
+               "checked_by": ep.get("provider", ""), "advisory": True}
+        if flagged:
+            out["note"] = ("Another model judged these sentences unsupported by "
+                           "the cited text. Verify before repeating them; the "
+                           "verifier can be wrong in both directions.")
+        return out
+    return {"flagged": [], "ok": None, "error": "unparseable",
+            "checked_by": ep.get("provider", "")}
 
+GROQ_URL = "https://api.groq.com/openai/v1"
+
+
+def _local_endpoint() -> dict:
+    """The in-tool model as an endpoint, or {} when it is not configured."""
+    try:
+        d = _distill.available()
+    except Exception:  # noqa: BLE001
+        d = {"available": False}
+    if not d.get("available"):
+        return {}
+    r = _distill.resolve()
+    return {"provider": "local", "base_url": r["base_url"],
+            "model": r["model"], "api_key": r["api_key"], "rotate": False}
+
+
+def _endpoints() -> list[dict]:
+    """Candidate endpoints, best first.
+
+    The configured in-tool model comes first by default: it is free at the point
+    of use, so a keyed cloud lane should not be spent on a task the local model
+    can do. Groq stays as the fallback for when the local endpoint is down, and
+    can be promoted with WEBSEARCH_SYNTH_PROVIDER.
+
+    WEBSEARCH_SYNTH_PROVIDER: local (default) | groq | auto
+      local - the in-tool model first, Groq only if it fails
+      groq  - Groq first, in-tool model only if it fails
+      auto  - whichever is actually configured, in-tool model preferred
+    """
+    prefer = (os.environ.get("WEBSEARCH_SYNTH_PROVIDER") or "local").strip().lower()
+    groq = ({"provider": "groq", "base_url": GROQ_URL,
+             "model": GROQ_SMART_MODEL, "api_key": "", "rotate": True}
+            if _groq_keys.has_keys else None)
+    local = _local_endpoint() or None
+
+    if prefer == "groq":
+        order = [groq, local]
+    else:
+        order = [local, groq]
+    return [e for e in order if e]
+
+
+def _endpoint() -> dict:
+    eps = _endpoints()
+    return eps[0] if eps else {}
+
+
+async def _chat(ep: dict, messages: list[dict], *, max_tokens: int,
+                attempts: int = 2, timeout: float = 25) -> tuple[str, str, str, int]:
+    """One OpenAI-compatible completion, with retries. Returns (text, finish, err, attempts).
+
+    Same failure taxonomy as the distiller: transport errors and 5xx/429 are
+    retried, a non-200 that is not transient is permanent, and a 200 with empty
+    content is reported rather than passed on as an empty answer.
+    """
+    if not ep:
+        return "", "", "no model endpoint configured", 0
+    url = ep["base_url"].rstrip("/") + "/chat/completions"
+    c = get_http_client()
+    last = "no attempt made"
+    # A reasoning model spends tokens on reasoning_content BEFORE emitting
+    # content, so a budget that is right for the answer alone comes back as a
+    # 200 with empty content and finish_reason=length. Escalate the budget when
+    # that happens instead of reporting a mystery failure.
+    budget = max_tokens
+    ceiling = min(max(max_tokens * 4, 8192), 32_000)
+    for attempt in range(1, max(1, attempts) + 1):
+        key = await _groq_keys.next() if ep.get("rotate") else ep.get("api_key", "")
+        try:
+            resp = await c.post(
+                url,
+                headers={"Authorization": f"Bearer {key}",
+                         "Content-Type": "application/json"},
+                json={"model": ep["model"], "messages": messages,
+                      # 0.0: same sources must yield the same text. Sampling
+                      # variance in a factual answer is invisible noise.
+                      "temperature": 0.0, "max_tokens": budget},
+                timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+            continue
+        if resp.status_code != 200:
+            last = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            if resp.status_code in (429, 500, 502, 503, 504):
+                continue
+            return "", "", last, attempt
+        try:
+            data = resp.json()
+            choice = (data.get("choices") or [{}])[0]
+            text = ((choice.get("message") or {}).get("content") or "").strip()
+            finish = choice.get("finish_reason") or ""
+        except Exception as e:  # noqa: BLE001
+            last = f"unparseable response: {type(e).__name__}: {e}"
+            continue
+        if text:
+            return text, finish, "", attempt
+        last = (f"empty content (finish_reason={finish}, max_tokens={budget})"
+                if finish else f"empty content (max_tokens={budget})")
+        if budget < ceiling:
+            budget = min(budget * 2, ceiling)
+            logger.info("synthesis: empty content, raising max_tokens to %d", budget)
+    return "", "", last, max(1, attempts)
+
+
+async def _synthesize(query: str, r: dict, depth: int, length: str = "short") -> dict:
+    """Produce the answer the caller actually reads.
+
+    The returned dict always says what happened. That is the design goal: a
+    synthesis that quietly did not run is indistinguishable from a bad answer,
+    so `skipped` and `error` are first-class outcomes, `truncated` marks an
+    answer the model ran out of budget for, and `diversity` reports the source
+    mix the answer was built from.
+    """
+    s = synthesis_settings()
+    pool = list(r.get("fetched_content") or r.get("results") or [])
+    limit = max(3, min(depth * 2, s["max_sources"]))
+    top, div = cap_per_domain(pool, limit=limit, per_domain=s["domain_cap"],
+                              min_sources=s["min_sources"])
+    if not top:
+        return {"available": True, "skipped": "no results to synthesise on",
+                "diversity": div}
+
+    ctx = "\n\n".join(
+        f"[{i + 1}]\nSource: {x.get('url', '')}\nTitle: {x.get('title', '')}\n"
+        f"Content: {(x.get('content') or x.get('snippet') or '')[:s['snippet_chars']]}"
+        for i, x in enumerate(top))
+
+    eps = _endpoints()
+    if not eps:
+        return {"available": False,
+                "skipped": "no model endpoint: set GROQ_API_KEYS for Groq, or "
+                           "DISTILL_API_KEY (with DISTILL_BASE_URL/DISTILL_MODEL) "
+                           "for any OpenAI-compatible endpoint",
+                "diversity": div}
+
+    system = prompts.synthesis_system(query, len(top), long=(length == "long"))
+    answer = finish = ""
+    err = "no attempt made"
+    attempts = 0
+    ep: dict = eps[0]
+    tried: list[dict] = []
+    for candidate in eps:
+        ep = candidate
+        answer, finish, perr, att = await _chat(
+            ep,
+            [{"role": "system", "content": system},
+             {"role": "user", "content": prompts.synthesis_user(query, ctx)}],
+            max_tokens=s["max_tokens"], attempts=2, timeout=30)
+        attempts += att
+        tried.append({"provider": ep["provider"], "model": ep["model"],
+                      "ok": bool(answer), "error": perr if not answer else ""})
+        if answer:
+            err = ""
+            break
+        err = perr
+
+    if not answer:
+        return {"available": True, "provider": ep["provider"],
+                "model": ep["model"], "error": err, "attempts": attempts,
+                "endpoints_tried": tried, "diversity": div,
+                "note": "Results are still returned below; only the written "
+                        "answer failed."}
+
+    sources = [{"n": i + 1, "title": x.get("title", ""), "url": x.get("url", "")}
+               for i, x in enumerate(top)]
+    truncated = finish == "length"
+    body = answer
+    if truncated:
+        # Say it in the text as well as the field: half a sentence otherwise
+        # reads like a complete thought.
+        body += (f"\n\n[truncated at {s['max_tokens']} tokens - raise "
+                 f"WEBSEARCH_SYNTH_TOKENS for a longer answer]")
+    body += "\n\n---\n\n## Sources\n\n" + "\n".join(
+        f"[{x['n']}] {x['title']} - {x['url']}" for x in sources)
+
+    excerpts = [(x.get("content") or x.get("snippet") or "") for x in top]
+    try:
+        grounded = await verify_grounding(answer, sources, ep, excerpts)
+    except Exception as e:  # noqa: BLE001
+        grounded = {"flagged": [], "ok": None, "error": str(e)}
+
+    return {
+        "available": True,
+        "answer": body,
+        "sources": sources,
+        "provider": ep["provider"],
+        "model": ep["model"],
+        "prompt_version": prompts.SYNTHESIS_VERSION,
+        "temperature": 0.0,
+        "max_tokens": s["max_tokens"],
+        "finish_reason": finish,
+        "truncated": truncated,
+        "sources_used": len(top),
+        "diversity": div,
+        "grounded": grounded,
+        "attempts": attempts,
+        "endpoints_tried": tried,
+    }
 
 async def handle_call_tool(ctx, params) -> CallToolResult:
     name = params.name
@@ -515,7 +750,14 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             query = str(arguments.get("query", "")).strip()
             if not query:
                 return _res({"success": False, "error": "query must not be empty"})
-            depth = safe_int(arguments.get("depth",1))
+            # Depth default follows whether a model lane exists: fetching full
+            # pages only pays off when something reads them. Explicit depth
+            # always wins, and WEBSEARCH_DEFAULT_DEPTH pins the default.
+            _model_ok = _groq_keys.has_keys or bool(_distill.available()["available"])
+            _depth_default = default_depth(_model_ok)
+            depth = max(DEPTH_MIN, min(DEPTH_MAX,
+                        safe_int(arguments.get("depth", _depth_default),
+                                 _depth_default)))
             count = min(max(safe_int(arguments.get("count",10)), depth * 3), MAX_RESULTS)
             lang = str(arguments.get("language","en"))
             google_ai_only = bool(arguments.get("google_ai_only", False))
@@ -547,43 +789,17 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                     logger.warning("enrich failed: %s", e)
             # Skip Groq synthesis when GAI already returned a full answer
             skip_synthesis = google_ai_only and r.get("ai_answer")
-            if r.get("success") and bool(arguments.get("synthesize", True)) and r.get("results") and not skip_synthesis:
-                try:
-                    top = (r.get("fetched_content") or r["results"])[:max(3, min(depth * 2, 8))]
-                    ctx = "\n\n".join(
-                        f"[{i+1}]\nSource: {x.get('url', '')}\nTitle: {x.get('title','')}\n"
-                        f"Content: {(x.get('content') or x.get('snippet') or '')[:1500]}"
-                        for i, x in enumerate(top))
-                    if _groq_keys.has_keys:
-                        groq_key = await _groq_keys.next()
-                        c = get_http_client()
-                        answer = ""
-                        for _ in range(2):
-                            resp = await c.post(
-                                "https://api.groq.com/openai/v1/chat/completions",
-                                headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
-                                json={"model": "openai/gpt-oss-120b",
-                                      "messages": [{"role": "system", "content": "Synthesize a comprehensive answer based ONLY on the provided search results. Cite your sources using numbers [1], [2], ... corresponding to the search results. If the results are insufficient, state that clearly."},
-                                                   {"role": "user", "content": f"Query: {query}\n\nResults:\n{ctx}"}],
-                                      "temperature": 0.3, "max_tokens": 512}, timeout=15)
-                            if resp.status_code == 200:
-                                answer = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-                                if answer:
-                                    break
-                        if answer:
-                            sources = [{"n": i + 1, "title": x.get("title", ""), "url": x.get("url", "")}
-                                       for i, x in enumerate(top)]
-                            answer += "\n\n---\n\n## Sources\n\n" + "\n".join(
-                                f"[{s['n']}] {s['title']} — {s['url']}" for s in sources)
-                            r["synthesis"] = {"answer": answer, "sources": sources}
-                            if len(answer) > 120:
-                                try:
-                                    r["synthesis"]["grounded"] = await verify_grounding(
-                                        answer, sources, groq_key)
-                                except Exception as e:
-                                    logger.warning("grounding check failed: %s", e)
-                except Exception as e:
-                    r["synthesis_error"] = str(e)
+            if r.get("success") and bool(arguments.get("synthesize", True)) \
+                    and (r.get("results") or r.get("fetched_content")) \
+                    and not skip_synthesis:
+                r["synthesis"] = await _synthesize(
+                    query, r, depth,
+                    length=str(arguments.get("synthesize_length", "short")))
+                if r["synthesis"].get("error"):
+                    r["synthesis_error"] = r["synthesis"]["error"]
+            elif r.get("success") and skip_synthesis:
+                r["synthesis"] = {"skipped": "google_ai_only returned its own "
+                                             "answer; not synthesising over it"}
             return _res(r)
         elif name == "fetch":
             url = arguments["url"]
@@ -982,6 +1198,84 @@ async def _parent_watchdog():
             import sys
             sys.exit(0)
 
+
+async def _synthesis_selfcheck() -> None:
+    """Prove the honesty fields, with the model replaced by stubs.
+
+    These are the properties that make the answer trustworthy, and every one of
+    them is something a refactor could quietly drop: no endpoint must say so
+    rather than answer, an empty completion must be an error rather than an
+    empty answer, and a cut-off answer must look cut off.
+    """
+    checks: list[tuple[str, bool]] = []
+    fake = {"results": [
+        {"url": "https://a.com/1", "title": "A1", "snippet": "alpha"},
+        {"url": "https://a.com/2", "title": "A2", "snippet": "alpha two"},
+        {"url": "https://a.com/3", "title": "A3", "snippet": "alpha three"},
+        {"url": "https://b.com/1", "title": "B1", "snippet": "beta"},
+        {"url": "https://b.com/2", "title": "B2", "snippet": "beta two"},
+    ]}
+
+    async def ok_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+        return "Answer [1].", "stop", "", 1
+
+    async def stub_verify(answer, sources, ep, excerpts=None):
+        return {"flagged": [], "ok": True, "checked_by": "stub", "advisory": True}
+
+    real = {"_endpoints": _endpoints, "_chat": _chat,
+            "verify_grounding": verify_grounding}
+    one = [{"provider": "stub", "base_url": "http://stub/v1", "model": "m",
+            "api_key": "k", "rotate": False}]
+    try:
+        globals()["_endpoints"] = lambda: []
+        out = await _synthesize("q", fake, 2)
+        checks.append(("no endpoint: says skipped", bool(out.get("skipped"))))
+        checks.append(("no endpoint: not marked available",
+                       out.get("available") is False))
+
+        globals()["_endpoints"] = lambda: one
+        globals()["_chat"] = ok_chat
+        globals()["verify_grounding"] = stub_verify
+        out = await _synthesize("q", fake, 2)
+        answer = out.get("answer", "")
+        checks.append(("answer has citations", "[1]" in answer))
+        checks.append(("answer has sources block", "## Sources" in answer))
+        checks.append(("prompt version attached",
+                       out.get("prompt_version") == prompts.SYNTHESIS_VERSION))
+        checks.append(("temperature pinned to 0", out.get("temperature") == 0.0))
+        checks.append(("domain cap applied",
+                       out["diversity"]["n_domains"] == 2 and
+                       all(n <= 2 for n in out["diversity"]["duplicate_domains"].values())))
+        checks.append(("not truncated when finish_reason=stop",
+                       out.get("truncated") is False))
+        checks.append(("grounding is advisory", out["grounded"].get("advisory") is True))
+
+        async def empty_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+            return "", "length", "empty content", 2
+        globals()["_chat"] = empty_chat
+        out = await _synthesize("q", fake, 2)
+        checks.append(("empty completion is an error", bool(out.get("error"))))
+        checks.append(("empty completion invents no answer",
+                       "answer" not in out or not out.get("answer")))
+
+        async def cut_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+            return "Half a sentence", "length", "", 1
+        globals()["_chat"] = cut_chat
+        out = await _synthesize("q", fake, 2)
+        checks.append(("truncated flag set", out.get("truncated") is True))
+        checks.append(("truncation visible in the text",
+                       "truncated at" in out.get("answer", "")))
+
+        out = await _synthesize("q", {"results": []}, 2)
+        checks.append(("no results: skipped, no crash", bool(out.get("skipped"))))
+    finally:
+        globals().update(real)
+
+    for name, ok in checks:
+        print(f"{'OK' if ok else 'FAIL'}  {name}")
+    print(f"server synthesis selfcheck: {sum(1 for _, v in checks if v)}/{len(checks)} OK")
+
+
 async def main():
     asyncio.create_task(_parent_watchdog())
     asyncio.create_task(_warmup_gai())
@@ -992,7 +1286,11 @@ async def main():
         await close_http_client()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    if "--selfcheck" in sys.argv:
+        asyncio.run(_synthesis_selfcheck())
+    else:
+        asyncio.run(main())
 
 
 def cli_main():
