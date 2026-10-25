@@ -2,7 +2,7 @@
 
 `mcp-name: io.github.SK-DEV-AI/websearch`
 
-[![skills.sh](https://skills.sh/b/SK-DEV-AI/skills)](https://skills.sh/SK-DEV-AI/skills) · `npx skills add SK-DEV-AI/skills`
+Companion agent skills: [`SK-DEV-AI/skills`](https://github.com/SK-DEV-AI/skills) · `npx skills add SK-DEV-AI/skills`
 
 Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, Bing Web/News RSS, Tavily, Wikipedia, arXiv, Google News RSS, Brave (last resort — rate-limited from some networks), Google AI Mode, and intent-gated vertical lanes (MDN, Stack Exchange, GitHub, HN, Semantic Scholar, OSV vuln, grep.app/Sourcegraph code, GDELT news) — with consensus-merge dedup, a local cross-encoder reranker, and Groq synthesis with grounding checks.
 
