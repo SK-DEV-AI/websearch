@@ -14,6 +14,8 @@ duplicates" is information the caller should get rather than a silent fallback.
 
 from __future__ import annotations
 
+import re
+from difflib import SequenceMatcher
 from urllib.parse import urlsplit
 
 # Best-effort public-suffix handling. A real PSL parser is a dependency and a
@@ -81,6 +83,60 @@ def domain_of(url: str) -> str:
         return registrable(urlsplit(url).hostname or "")
     except Exception:
         return ""
+
+
+def drop_near_duplicates(items: list[dict], threshold: float = 0.88,
+                         url_key: str = "url", title_key: str = "title",
+                         snippet_key: str = "snippet") -> tuple[list[dict], dict]:
+    """Remove syndicated copies of the same article.
+
+    A wire story published on five sites is still one source, and a synthesis
+    that cites all five looks corroborated while being a single origin. Titles
+    are compared because the same story keeps its headline across syndication
+    while the URL changes completely.
+
+    Only the *later* copy is dropped: the first appearance in rank order wins, so
+    ordering still means something. Different titles on the same topic are kept -
+    this catches duplication, not similarity of subject.
+    """
+    if not items:
+        return [], {"dropped": [], "removed": 0}
+
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    seen_keys: set[str] = set()
+    for it in items:
+        title = (it.get(title_key) or "").strip()
+        url = it.get(url_key) or ""
+
+        def norm(t: str) -> str:
+            return " ".join(re.sub(r"[^a-z0-9 ]+", " ", t.lower()).split())
+
+        nt = norm(title)
+        if not nt:
+            kept.append(it)
+            continue
+        # Cheap exact check first, then fuzzy against the kept titles.
+        if nt in seen_keys:
+            dropped.append({"url": url, "title": title, "reason": "same title"})
+            continue
+        dup_of = ""
+        for prev in kept:
+            pn = norm(prev.get(title_key) or "")
+            if not pn:
+                continue
+            ratio = SequenceMatcher(None, nt, pn).ratio()
+            if ratio >= threshold:
+                dup_of = prev.get(url_key, "")
+                break
+        if dup_of:
+            dropped.append({"url": url, "title": title,
+                            "reason": f"near-duplicate title of {dup_of}"})
+            continue
+        seen_keys.add(nt)
+        kept.append(it)
+
+    return kept, {"dropped": dropped[:10], "removed": len(dropped)}
 
 
 def cap_per_domain(items: list[dict], limit: int, per_domain: int = 2,
@@ -202,6 +258,22 @@ def _selfcheck() -> None:
                    cap_per_domain(items, limit=9, per_domain=2)[1]["returned"] == 4))
     checks.append(("a pool at the floor does not relax",
                    cap_per_domain(items, limit=4, per_domain=2)[1]["relaxed"] is False))
+
+    # Syndication: the same headline on five sites is one source.
+    synd = [
+        {"url": "https://a.com/x", "title": "Rust 1.90 released with new borrow checker"},
+        {"url": "https://b.com/y", "title": "Rust 1.90 released with new borrow checker"},
+        {"url": "https://c.com/z", "title": "Rust 1.90 Released With New Borrow Checker!"},
+        {"url": "https://d.com/q", "title": "Something else entirely about Go"},
+    ]
+    kept5, info5 = drop_near_duplicates(synd)
+    checks.append(("syndicated copies collapse", len(kept5) == 2))
+    checks.append(("first in rank order wins", kept5[0]["url"] == "https://a.com/x"))
+    checks.append(("duplicate removal is reported", info5["removed"] == 2))
+    checks.append(("different topics kept", any("Go" in i["title"] for i in kept5)))
+    kept6, _ = drop_near_duplicates([{"url": "u", "title": ""}, {"url": "v", "title": ""}])
+    checks.append(("untitled items are all kept", len(kept6) == 2))
+    checks.append(("empty input is safe", drop_near_duplicates([])[0] == []))
 
     for name, ok in checks:
         print(f"{'OK' if ok else 'FAIL'}  {name}")

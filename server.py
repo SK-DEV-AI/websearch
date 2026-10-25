@@ -18,9 +18,12 @@ from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 from config import (MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client,
                     _KeyRotator, default_depth, synthesis_settings,
                     DEPTH_MIN, DEPTH_MAX, GROQ_SMART_MODEL)
-from diversity import cap_per_domain
+from diversity import cap_per_domain, drop_near_duplicates
 import prompts
 import distill as _distill
+import cache as _cache_mod
+import hashlib
+import time
 from cdp_actions import browser_action as _browser_action
 from errors import annotate as _err_annotate, classify_exception as _err_exc
 from ghost_state import CHALLENGE, CONTENT_OK, classify, ghost
@@ -508,7 +511,8 @@ async def _chat(ep: dict, messages: list[dict], *, max_tokens: int,
     return "", "", last, max(1, attempts)
 
 
-async def _synthesize(query: str, r: dict, depth: int, length: str = "short") -> dict:
+async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
+                      use_cache: bool = True) -> dict:
     """Produce the answer the caller actually reads.
 
     The returned dict always says what happened. That is the design goal: a
@@ -519,17 +523,37 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short") ->
     """
     s = synthesis_settings()
     pool = list(r.get("fetched_content") or r.get("results") or [])
+    # Syndicated copies first: five sites running the same wire story is one
+    # source, and citing all five makes a single origin look corroborated.
+    pool, dedup = drop_near_duplicates(pool)
     limit = max(3, min(depth * 2, s["max_sources"]))
     top, div = cap_per_domain(pool, limit=limit, per_domain=s["domain_cap"],
                               min_sources=s["min_sources"])
     if not top:
         return {"available": True, "skipped": "no results to synthesise on",
-                "diversity": div}
+                "diversity": div, "duplicates_removed": dedup["removed"]}
 
     ctx = "\n\n".join(
         f"[{i + 1}]\nSource: {x.get('url', '')}\nTitle: {x.get('title', '')}\n"
         f"Content: {(x.get('content') or x.get('snippet') or '')[:s['snippet_chars']]}"
         for i, x in enumerate(top))
+
+    excerpts = [(x.get("content") or x.get("snippet") or "") for x in top]
+    # Key includes the source text itself, not just the URLs: an answer cached
+    # against an old revision of a page would otherwise be served as current.
+    _h = hashlib.sha256(
+        (prompts.SYNTHESIS_VERSION + "|" + query + "|" + length + "|"
+         + "|".join(excerpts)).encode()).hexdigest()[:20]
+    cache_key = "synthesis://" + _h
+    try:
+        hit = (await _cache_mod.get_cached(cache_key, extraction_type="synthesis",
+                                           ttl=3600)) if use_cache else None
+        if hit and hit.get("content"):
+            cached = json.loads(hit["content"])
+            cached["cached"] = True
+            return cached
+    except Exception as e:  # noqa: BLE001
+        logger.debug("synthesis cache read failed: %s", e)
 
     eps = _endpoints()
     if not eps:
@@ -539,6 +563,7 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short") ->
                            "for any OpenAI-compatible endpoint",
                 "diversity": div}
 
+    _t0 = time.perf_counter()
     system = prompts.synthesis_system(query, len(top), long=(length == "long"))
     answer = finish = ""
     err = "no attempt made"
@@ -570,22 +595,47 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short") ->
     sources = [{"n": i + 1, "title": x.get("title", ""), "url": x.get("url", "")}
                for i, x in enumerate(top)]
     truncated = finish == "length"
+    # Which sources the answer actually leans on. Available sources are not
+    # cited sources, and a single cited source is a single point of view even
+    # when eight were offered.
+    cited = sorted({int(m) for m in re.findall(r"\[(\d+)\]", answer)})
     body = answer
+    # Eight sources offered, one cited: the answer is a single point of view and
+    # the reader cannot tell that from the text alone.
+    if len(cited) == 1 and len(sources) > 1:
+        body += ("\n\n[This answer cites one source of the "
+                 f"{len(sources)} retrieved; treat it as a single point of view.]")
+
+    # Deterministic figure check: no model call, no opinion. A number in the
+    # answer that appears nowhere in the cited text was produced by the model,
+    # so it is either a recomputation or an invention - both worth surfacing.
+    unverified: list[str] = []
+    try:
+        # Strip citation markers first: "[3]" is a number that by definition
+        # does not appear in the source, and counting it would flag every
+        # correctly cited answer.
+        _body_only = re.sub(r"\[\d+\]", " ", answer)
+        _g = _distill.grounding_check(_body_only, "\n\n".join(excerpts))
+        unverified = _g.get("numbers_unverified", [])
+    except Exception as e:  # noqa: BLE001
+        logger.debug("number grounding failed: %s", e)
     if truncated:
         # Say it in the text as well as the field: half a sentence otherwise
         # reads like a complete thought.
         body += (f"\n\n[truncated at {s['max_tokens']} tokens - raise "
                  f"WEBSEARCH_SYNTH_TOKENS for a longer answer]")
+    if unverified:
+        body += (f"\n\n[{len(unverified)} figure(s) in this answer appear in no "
+                 f"cited source: {', '.join(unverified[:5])}]")
     body += "\n\n---\n\n## Sources\n\n" + "\n".join(
         f"[{x['n']}] {x['title']} - {x['url']}" for x in sources)
 
-    excerpts = [(x.get("content") or x.get("snippet") or "") for x in top]
     try:
         grounded = await verify_grounding(answer, sources, ep, excerpts)
     except Exception as e:  # noqa: BLE001
         grounded = {"flagged": [], "ok": None, "error": str(e)}
 
-    return {
+    result = {
         "available": True,
         "answer": body,
         "sources": sources,
@@ -597,11 +647,23 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short") ->
         "finish_reason": finish,
         "truncated": truncated,
         "sources_used": len(top),
+        "duplicates_removed": dedup["removed"],
+        "citations_used": len(cited),
+        "figures_unverified": unverified,
+        "duration_ms": int((time.perf_counter() - _t0) * 1000),
         "diversity": div,
         "grounded": grounded,
         "attempts": attempts,
         "endpoints_tried": tried,
     }
+    try:
+        if use_cache:
+            await _cache_mod.set_cached(cache_key, json.dumps(result),
+                                        extraction_type="synthesis",
+                                        title=query[:100], ttl=3600)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("synthesis cache write failed: %s", e)
+    return result
 
 async def handle_call_tool(ctx, params) -> CallToolResult:
     name = params.name
@@ -1228,7 +1290,7 @@ async def _synthesis_selfcheck() -> None:
             "api_key": "k", "rotate": False}]
     try:
         globals()["_endpoints"] = lambda: []
-        out = await _synthesize("q", fake, 2)
+        out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
         checks.append(("no endpoint: says skipped", bool(out.get("skipped"))))
         checks.append(("no endpoint: not marked available",
                        out.get("available") is False))
@@ -1236,7 +1298,7 @@ async def _synthesis_selfcheck() -> None:
         globals()["_endpoints"] = lambda: one
         globals()["_chat"] = ok_chat
         globals()["verify_grounding"] = stub_verify
-        out = await _synthesize("q", fake, 2)
+        out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
         answer = out.get("answer", "")
         checks.append(("answer has citations", "[1]" in answer))
         checks.append(("answer has sources block", "## Sources" in answer))
@@ -1253,7 +1315,7 @@ async def _synthesis_selfcheck() -> None:
         async def empty_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
             return "", "length", "empty content", 2
         globals()["_chat"] = empty_chat
-        out = await _synthesize("q", fake, 2)
+        out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
         checks.append(("empty completion is an error", bool(out.get("error"))))
         checks.append(("empty completion invents no answer",
                        "answer" not in out or not out.get("answer")))
@@ -1261,12 +1323,39 @@ async def _synthesis_selfcheck() -> None:
         async def cut_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
             return "Half a sentence", "length", "", 1
         globals()["_chat"] = cut_chat
-        out = await _synthesize("q", fake, 2)
+        out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
         checks.append(("truncated flag set", out.get("truncated") is True))
         checks.append(("truncation visible in the text",
                        "truncated at" in out.get("answer", "")))
 
-        out = await _synthesize("q", {"results": []}, 2)
+        async def money_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+            return "It costs $9999 [1].", "stop", "", 1
+        globals()["_chat"] = money_chat
+        out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
+        checks.append(("invented figure is detected", out.get("figures_unverified") == ["9999"]))
+        checks.append(("invented figure is visible in the text",
+                       "appear in no cited source" in out.get("answer", "")))
+        checks.append(("citation markers are not treated as figures",
+                       all(x not in ("1", "2") for x in out.get("figures_unverified", []))))
+
+        async def one_cite_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+            return "Only one view [1].", "stop", "", 1
+        globals()["_chat"] = one_cite_chat
+        out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
+        checks.append(("single cited source is flagged",
+                       "single point of view" in out.get("answer", "")))
+        checks.append(("citation count reported", out.get("citations_used") == 1))
+
+        globals()["_chat"] = ok_chat
+        synd = {"results": [
+            {"url": "https://a.com/x", "title": "Rust 1.90 released with new borrow checker", "snippet": "one"},
+            {"url": "https://b.com/y", "title": "Rust 1.90 released with new borrow checker", "snippet": "two"},
+            {"url": "https://c.com/z", "title": "A different story about Go", "snippet": "three"},
+        ]}
+        out = await _synthesize("selfcheck-q", synd, 2, use_cache=False)
+        checks.append(("syndicated copies are dropped", out.get("duplicates_removed") == 1))
+
+        out = await _synthesize("selfcheck-q", {"results": []}, 2, use_cache=False)
         checks.append(("no results: skipped, no crash", bool(out.get("skipped"))))
     finally:
         globals().update(real)
