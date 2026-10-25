@@ -545,7 +545,16 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
     """
     s = synthesis_settings()
     pool = list(r.get("fetched_content") or r.get("results") or [])
-    # Syndicated copies first: five sites running the same wire story is one
+    # A source the model cannot read is not a source. enrich() deliberately keeps
+    # dead links in the pool at a demoted score so the caller still sees them, but
+    # feeding one to the synthesis produced a citation [6] pointing at a page with
+    # no text - an unciteable claim dressed as a citation.
+    unreadable = [x for x in pool
+                  if (x.get("dead") or x.get("success") is False)
+                  and not (x.get("content") or x.get("snippet"))]
+    pool = [x for x in pool if not ((x.get("dead") or x.get("success") is False)
+                                    and not (x.get("content") or x.get("snippet")))]
+    # Syndicated copies next: five sites running the same wire story is one
     # source, and citing all five makes a single origin look corroborated.
     pool, dedup = drop_near_duplicates(pool)
     limit = max(3, min(depth * 2, s["max_sources"]))
@@ -553,7 +562,8 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
                               min_sources=s["min_sources"])
     if not top:
         return {"available": True, "skipped": "no results to synthesise on",
-                "diversity": div, "duplicates_removed": dedup["removed"]}
+                "diversity": div, "duplicates_removed": dedup["removed"],
+                "unreadable_sources": len(unreadable)}
 
     def _freshness(x: dict) -> str:
         """How old the source is, stated precisely.
@@ -701,6 +711,7 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
         "truncated": truncated,
         "sources_used": len(top),
         "duplicates_removed": dedup["removed"],
+        "unreadable_sources": len(unreadable),
         "citations_used": len(cited),
         "as_of": as_of,
         "as_of_kind": as_of_kind,
@@ -1402,6 +1413,16 @@ async def _synthesis_selfcheck() -> None:
         checks.append(("citation count reported", out.get("citations_used") == 1))
 
         globals()["_chat"] = ok_chat
+        with_dead = {"results": [
+            {"url": "https://a.com/1", "title": "A1", "snippet": "alpha"},
+            {"url": "https://b.com/x", "title": "Scholar stub", "snippet": "",
+             "dead": True, "success": False},
+        ]}
+        out = await _synthesize("selfcheck-q", with_dead, 2, use_cache=False)
+        checks.append(("unreadable sources are excluded", out.get("unreadable_sources") == 1))
+        checks.append(("unreadable source is not cited",
+                       "b.com/x" not in (out.get("answer") or "")))
+
         synd = {"results": [
             {"url": "https://a.com/x", "title": "Rust 1.90 released with new borrow checker", "snippet": "one"},
             {"url": "https://b.com/y", "title": "Rust 1.90 released with new borrow checker", "snippet": "two"},
