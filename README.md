@@ -9,7 +9,7 @@ Multi-engine web search + fetch MCP server. Parallel fan-out across DuckDuckGo, 
 ## Tools (20)
 
 - **doctor** — **Run this first.** Reports which lanes are usable right now and the exact command to enable the rest. Distinguishes "broken" from "needs optional setup". Never prints key values.
-- **search** — Open research questions. `depth` defaults to 2 when a model lane is configured (page fetch + rerank) and 1 otherwise. `synthesize` returns a short, cited answer that never invents: it says which source backs each claim, surfaces disagreement instead of averaging it, and marks itself `truncated` when it ran out of budget.
+- **search** — Open research questions. `depth` defaults to 3 when a model lane is configured (more independent sources; measured) and 1 otherwise. Depth also sets how many pages are fetched: `max(5, depth*2)`, ceiling 8. `synthesize` returns a short, cited answer that never invents: it says which source backs each claim, surfaces disagreement instead of averaging it, and marks itself `truncated` when it ran out of budget.
 - **fetch** — URL to markdown/text. Direct fetch with auto-fallback to a Chromium CDP browser for blocked/JS pages. PDF/EPUB/DOCX supported. Paginated (`offset`). Optional `distill` (see below). For structured JSON use `extract`.
 - **fetch_many** — Fetch several URLs in one call. Dedups, caps concurrency, honours robots.txt, shares the cache, returns per-URL success/status/content plus counts. Use when you have 2+ URLs; use `fetch` for one.
 - **crawl** — Breadth-first site crawl with hard caps (per-page cap, depth cap, robots.txt, dedup, concurrency). Returns each page plus a `stop_reason` so you know whether the site was exhausted or a cap stopped it. Use for "read this whole docs site".
@@ -129,9 +129,24 @@ Everything is verifiable rather than claimed:
 - `finish_reason` and `truncated` are returned; a half sentence is labelled
   instead of looking like a complete thought
 - `diversity` reports the source mix and whether the per-domain cap had to relax
+- `as_of` reports the newest publication date among the sources, and undated
+  sources are labelled "Published: not stated", so freshness is never implied
+- `duplicates_removed` counts syndicated copies collapsed before synthesis, and
+  `figures_unverified` lists numbers the answer contains that appear in no
+  cited source (deterministic, no model call)
 - a second model pass (`grounded`) re-reads the answer against the exact text
   the first pass saw and flags sentences no cited source supports. It is marked
   `advisory` because it is another model's opinion, not a proof
+
+### Why the answer is prose, not JSON
+
+The tool envelope is already structured: `answer`, `sources[]`, `citations_used`,
+`grounded`, `diversity`, `as_of`. Asking the model to also emit JSON moves
+structure from a place where it is generated deterministically into a place where
+it is asserted, and measured behaviour is worse: a required `key_facts` array
+gets padded with restatements of a single fact, which reads as corroboration.
+JSON parsed 3/3 in testing, so this is not a reliability argument - it is a
+content-quality and duplication argument. See `exec/websearch-format-test/`.
 
 ### Which model writes the answer
 
@@ -142,7 +157,8 @@ endpoints, so one call path serves both.
 | Env | Default | Meaning |
 |---|---|---|
 | `WEBSEARCH_SYNTH_PROVIDER` | `local` | `local` (in-tool model first), `groq` (Groq first), `auto` (either, in-tool preferred) |
-| `WEBSEARCH_DEFAULT_DEPTH` | auto | Pins the default `depth`. Auto = 2 when a model lane exists, else 1 |
+| `WEBSEARCH_DEFAULT_DEPTH` | auto | Pins the default `depth`. Auto = 3 when a model lane exists, else 1 |
+| `WEBSEARCH_ENRICH_MAX_PAGES` | `8` | Ceiling on page fetches per search. The count itself is `max(5, depth*2)` |
 | `WEBSEARCH_SYNTH_TOKENS` | `900` | Answer budget. On `finish_reason=length` the result says `truncated` |
 | `WEBSEARCH_SYNTH_MAX_SOURCES` | `8` | Ceiling on sources in the context |
 | `WEBSEARCH_DOMAIN_CAP` | `2` | Max sources from one registrable domain |

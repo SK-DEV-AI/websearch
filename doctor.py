@@ -92,6 +92,20 @@ def _killswitch() -> str:
     )
 
 
+
+def _synth_note(synth_on: bool, local_ok: bool, groq_ok: bool, cfg: dict) -> str:
+    """One readable sentence about who writes the answer, and the limits."""
+    if not synth_on:
+        return ("not configured - search returns ranked results, and the "
+                "response carries synthesis.skipped explaining why there is no "
+                "written answer")
+    writer = ("the in-tool model" + (" with Groq as fallback" if groq_ok else "")
+              if local_ok else "Groq")
+    return (f"writing with {writer}; prompt {prompts.SYNTHESIS_VERSION}, "
+            f"temperature 0, {cfg['max_tokens']} tokens, at most "
+            f"{cfg['max_sources']} sources with {cfg['domain_cap']} per domain")
+
+
 async def preflight(probe_network: bool = True) -> dict[str, Any]:
     """Build the lane report. `probe_network=False` skips outbound HTTP checks."""
     cdp = await _cdp_probe(HELIUM_CDP)
@@ -179,24 +193,28 @@ async def preflight(probe_network: bool = True) -> dict[str, Any]:
     })
 
     # --- synthesis: the written answer the caller reads ---
-    synth_on = bool(os.environ.get("GROQ_API_KEYS", "").strip())
+    # Either endpoint counts: the in-tool model is the default writer, Groq is
+    # the fallback, so reporting this lane as unavailable when only the local
+    # model is configured would be wrong.
+    try:
+        from distill import available as _dav
+        _local_ok = bool(_dav().get("available"))
+    except Exception:  # noqa: BLE001
+        _local_ok = False
+    _groq_ok = bool(os.environ.get("GROQ_API_KEYS", "").strip())
+    synth_on = _groq_ok or _local_ok
     synth_cfg = synthesis_settings()
     lanes.append({
         "id": "synthesis",
         "name": "Search synthesis (the cited answer in search results)",
         "status": "live" if synth_on else "needs_setup",
-        "requires": "GROQ_API_KEYS (one or more, comma separated)",
-        "how_to_enable": "export GROQ_API_KEYS=<key>  (free tier is usually enough)",
-        "note": (
-            f"prompt {prompts.SYNTHESIS_VERSION}, temperature 0, max_tokens "
-            f"{synth_cfg['max_tokens']}, at most {synth_cfg['max_sources']} "
-            f"sources with {synth_cfg['domain_cap']} per domain. Without it, "
-            f"search still returns ranked results, and the response says the "
-            f"answer was skipped instead of leaving it silently blank."
-            if synth_on else
-            "not configured - search returns ranked results with "
-            "synthesis.skipped explaining why there is no written answer"
-        ),
+        "requires": "a model endpoint: the in-tool model (DISTILL_API_KEY / "
+                    "DISTILL_BASE_URL / DISTILL_MODEL) or GROQ_API_KEYS. The "
+                    "in-tool model is tried first.",
+        "how_to_enable": "export DISTILL_API_KEY=<key> DISTILL_BASE_URL=<url> "
+                         "DISTILL_MODEL=<model> for any OpenAI-compatible "
+                         "endpoint, or export GROQ_API_KEYS=<key>",
+        "note": _synth_note(synth_on, _local_ok, _groq_ok, synth_cfg),
     })
 
     # --- in-tool model (opt-in distillation) ---

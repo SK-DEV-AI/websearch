@@ -914,9 +914,22 @@ _JUNK_TITLES = {
 }
 
 
+# A title that describes how the page was fetched is worse than no title: the
+# caller reads it as the page's subject. These are produced by our own
+# fast-path extractors, so they are detectable by shape rather than by site.
+_JUNK_TITLE_PATTERNS = (
+    re.compile(r"^markdown via\b", re.I),
+    re.compile(r"\bvia accept header\b", re.I),
+    re.compile(r"^(keyboard shortcuts|untitled|document|loading)\b", re.I),
+    re.compile(r"^\W*$"),
+)
+
+
 def _is_junk_title(t: str) -> bool:
     t = (t or "").strip().lower()
-    return (not t) or len(t) < 3 or t in _JUNK_TITLES
+    if not t or len(t) < 3 or t in _JUNK_TITLES:
+        return True
+    return any(p.search(t) for p in _JUNK_TITLE_PATTERNS)
 
 
 def _best_title(*candidates: str, content: str = "") -> str:

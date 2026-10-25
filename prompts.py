@@ -34,7 +34,7 @@ from __future__ import annotations
 # Bump when any prompt text changes in a way that alters output. Reported by
 # doctor() and attached to synthesis results, so a quality regression can be
 # tied to a prompt revision instead of guessed at.
-SYNTHESIS_VERSION = "2026-10-25.2"
+SYNTHESIS_VERSION = "2026-10-25.3"
 VERIFIER_VERSION = "2026-10-25.2"
 DISTILL_VERSION = "2026-10-25.2"
 
@@ -48,6 +48,8 @@ _SYNTHESIS = """You answer a question using ONLY the numbered search results sup
 2. Use nothing from your own knowledge. If the results do not answer the question, say so in one sentence and stop - that is a complete and correct answer.
 3. Copy numbers, dates, versions, names, prices and units exactly as the source writes them. Never round, convert, estimate or recompute. If sources disagree on a figure, give both values with their citations.
 4. Report the substance directly. Never narrate the search ("the first result says", "based on these results", "I found").
+4a. Never generalise across the sources. "Every source reports X" and "all results agree" are claims about the whole set, and they are false the moment one source is silent, off-topic or a forum post. Cite what specific sources say, with their numbers.
+4b. A source that discusses a question without giving a figure is not evidence for the figure. Do not let "another source explains why X is fast" become support for "X is 90x faster".
 
 ## Balance
 5. Rank is not evidence. A result is not more credible for appearing at [1]. Weigh a source by whether it shows evidence, not by position.
@@ -241,6 +243,8 @@ def _selfcheck() -> None:
         ("rank is not evidence", "Rank is not evidence"),
         ("disagreement surfaced", "When sources disagree, say so plainly"),
         ("no averaging", "Do not average contradictory figures"),
+        ("no universal quantifiers", "Never generalise across the sources"),
+        ("silence is not support", "is not evidence for the figure"),
         ("false premise handled", "false premise"),
         ("single source marked", "(single source)"),
         ("vendor claims labelled", "vendor and marketing claims"),

@@ -84,8 +84,9 @@ Sessions are local-only (they need CDP) and capped at 8.
 ## Pipeline (search)
 
 search → multiple engines → dedup → reranker → synthesis.
-depth>=2 fetches full pages for better scoring, and defaults to 2 when a model
-lane is configured.
+depth>=2 fetches full pages for better scoring and sizes the fetch
+(max(5, depth*2) pages), and defaults to 3 when a model lane is configured: with
+a reader available, more independent sources is the point.
 
 The synthesis answer is deliberately short and strict: it cites [N] per claim,
 never uses outside knowledge, surfaces disagreement between sources instead of
@@ -124,7 +125,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
             input_schema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 10},
                 "depth": {"type": "integer",
-                          "description": "Effort: 1=snippets only, 2+=fetch the top pages and rerank on full text. Defaults to 2 when a model lane is available (GROQ_API_KEYS or the in-tool model) and 1 otherwise; WEBSEARCH_DEFAULT_DEPTH pins it."},
+                          "description": "Effort: 1=snippets only, 2+=fetch the top pages and rerank on full text. Defaults to 3 when a model lane is available (GROQ_API_KEYS or the in-tool model) and 1 otherwise; WEBSEARCH_DEFAULT_DEPTH pins it."},
                 "search_type": {"type": "string", "enum": ["auto","text","news","images","videos","books"]},
                 "timelimit": {"type": "string", "description": "Time filter: d/w/m/y"},
                 "safesearch": {"type": "string", "enum": ["off","moderate","strict"], "default": "moderate"},
@@ -378,23 +379,44 @@ async def verify_grounding(answer: str, sources: list[dict], ep: dict,
            if excerpts and i < len(excerpts) and excerpts[i] else "")
         for i, s in enumerate(sources))
     sources_block = sources_block[:VERIFIER_TOTAL_CHARS]
-    text, _finish, err, _att = await _chat(
-        ep,
-        [{"role": "system", "content": prompts.verifier_system()},
-         {"role": "user", "content": prompts.verifier_user(sources_block, answer)}],
-        max_tokens=2048, attempts=3, timeout=40)
+    msgs = [{"role": "system", "content": prompts.verifier_system()},
+            {"role": "user", "content": prompts.verifier_user(sources_block, answer)}]
+    text, _finish, err, _att = await _chat(ep, msgs, max_tokens=2048,
+                                           attempts=3, timeout=40)
     if not text:
         return {"flagged": [], "ok": None, "error": err,
                 "checked_by": ep.get("provider", "")}
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        a, b = text.find("{"), text.rfind("}")
+
+    def _parse(t: str) -> dict | None:
         try:
-            parsed = json.loads(text[a:b + 1]) if a >= 0 and b > a else None
+            d = json.loads(t)
+            return d if isinstance(d, dict) else None
         except Exception:
-            parsed = None
+            a, b = t.find("{"), t.rfind("}")
+            if a >= 0 and b > a:
+                try:
+                    d = json.loads(t[a:b + 1])
+                    return d if isinstance(d, dict) else None
+                except Exception:
+                    return None
+            return None
+
+    if _parse(text) is None:
+        # Small models sometimes answer the question in prose instead of the
+        # requested object. One retry, with the failure quoted back, is cheaper
+        # than reporting "could not check" for an otherwise fine answer.
+        retry_msgs = msgs + [
+            {"role": "assistant", "content": text[:400]},
+            {"role": "user", "content":
+             "That was not the required JSON object. Reply with only the JSON "
+             'object: {"flagged":[...],"ok":true|false}'},
+        ]
+        text2, _f2, _e2, _a2 = await _chat(ep, retry_msgs, max_tokens=2048,
+                                           attempts=2, timeout=40)
+        if text2:
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text2.strip())
+    parsed = _parse(text)
     if isinstance(parsed, dict):
         flagged = parsed.get("flagged", []) if isinstance(parsed.get("flagged"), list) else []
         out = {"flagged": flagged, "ok": bool(parsed.get("ok", not flagged)),
@@ -1367,6 +1389,21 @@ async def _synthesis_selfcheck() -> None:
         out = await _synthesize("selfcheck-q", synd, 2, use_cache=False)
         checks.append(("syndicated copies are dropped", out.get("duplicates_removed") == 1))
 
+        # Verifier robustness: a model that answers in prose must not turn into a
+        # crash or a silent "ok".
+        async def prose_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+            return "Looks fine to me, no issues.", "stop", "", 1
+        globals()["_chat"] = prose_chat
+        # Call the captured original: the module global is stubbed above, so
+        # using the name here would test the stub against itself.
+        g = await real["verify_grounding"](
+            "Claim [1].", [{"n": 1, "title": "t", "url": "u"}], one[0], ["source text"])
+        checks.append(("prose verifier reply yields ok=None, not a crash",
+                       g.get("ok") is None))
+        checks.append(("prose verifier reply is reported as unparseable",
+                       bool(g.get("error"))))
+
+        globals()["_chat"] = ok_chat
         out = await _synthesize("selfcheck-q", {"results": []}, 2, use_cache=False)
         checks.append(("no results: skipped, no crash", bool(out.get("skipped"))))
     finally:
