@@ -327,6 +327,7 @@ async def browser_action(
     expression: str = "",
     wait_state: str = "domcontentloaded",
     steps: list | None = None,
+    session_id: str = "",
     timeout: float = DEFAULT_STEP_TIMEOUT,
     max_chars: int = DEFAULT_MAX_CHARS,
     full_page: bool = True,
@@ -387,16 +388,35 @@ async def browser_action(
                                                      DEFAULT_MAX_CHARS)))
 
     # ── Acquire the page (same path as the existing browser tools) ──
-    try:
-        page = await _get_optimized_page(block_resources=False)
-    except ConnectionError:
-        return {"success": False,
-                "error": f"Helium CDP connection failed at {HELIUM_CDP} — "
-                          f"is the browser running with --remote-debugging-port=9222?"}
-    except Exception as e:
-        return {"success": False,
-                "error": f"Helium CDP connection failed at {HELIUM_CDP}: "
-                          f"{type(e).__name__}: {e}"}
+    # A session_id reuses a persistent tab instead of opening a throwaway one.
+    # Without a session_id the behaviour is byte-for-byte what it was before:
+    # fresh tab, closed in the finally block below.
+    own_page = True
+    if str(session_id or "").strip():
+        import session as session_mod
+        page, _serr = await session_mod.get_page(str(session_id).strip())
+        if page is None:
+            return _serr or {"success": False,
+                             "error": f"session {session_id!r} is not usable"}
+        own_page = False
+        try:
+            await page.evaluate("1+1")
+        except Exception as e:  # noqa: BLE001
+            return {"success": False,
+                    "error": f"session {session_id!r} tab is not responding: "
+                             f"{type(e).__name__}: {e}",
+                    "fix": "Call browser_session(action='create') for a new session."}
+    else:
+        try:
+            page = await _get_optimized_page(block_resources=False)
+        except ConnectionError:
+            return {"success": False,
+                    "error": f"Helium CDP connection failed at {HELIUM_CDP} — "
+                              f"is the browser running with --remote-debugging-port=9222?"}
+        except Exception as e:
+            return {"success": False,
+                    "error": f"Helium CDP connection failed at {HELIUM_CDP}: "
+                              f"{type(e).__name__}: {e}"}
 
     results: list[dict] = []
     title = ""
@@ -422,12 +442,13 @@ async def browser_action(
     except Exception as e:
         error = {"success": False, "error": f"{type(e).__name__}: {e}"}
     finally:
-        # The tab is ALWAYS closed here — no leaks, ever.
-        try:
-            await page.close()
-        except Exception:
-            pass
-        asyncio.ensure_future(_cleanup_orphan_tabs())
+        # A session tab outlives the call on purpose; a throwaway tab never does.
+        if own_page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            asyncio.ensure_future(_cleanup_orphan_tabs())
 
     if error:
         return error

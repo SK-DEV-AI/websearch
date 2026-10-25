@@ -33,6 +33,8 @@ from arxiv import search_arxiv
 from site_mapper import map_site
 from research import search_multi, enrich
 from extract import extract_content
+import webtools as _webtools
+import session as _session
 
 _groq_keys = _KeyRotator("GROQ_API_KEYS")
 
@@ -155,6 +157,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "expression": {"type": "string", "description": "JavaScript expression to evaluate in the page (action=evaluate). Arrow functions are auto-invoked."},
                 "wait_state": {"type": "string", "enum": ["domcontentloaded","load","networkidle"], "default": "domcontentloaded", "description": "Load milestone to wait for after navigating (and for action=wait)"},
                 "steps": {"type": "array", "items": {"type": "object"}, "description": "Ordered multi-step flow executed in ONE tab (max 25). Each step is an object with the same fields as the top-level params (action, url, selector, text, key, expression, wait_state). Use for flows like: type into a box, press Enter, then read the results."},
+                "session_id": {"type": "string", "description": "Reuse a persistent tab from browser_session(action='create') instead of opening a throwaway one. Required for anything stateful across calls: logins, cookies, multi-page flows, forms. Without it, each call gets a fresh tab that is closed afterwards."},
                 "timeout": {"type": "number", "default": 30, "description": "Per-step timeout in seconds (1-120)"},
                 "max_chars": {"type": "integer", "default": 20000, "description": "Max chars returned for html/text/aria (200-200000)"},
                 "full_page": {"type": "boolean", "default": True, "description": "action=screenshot: capture beyond the viewport"},
@@ -162,6 +165,67 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "quality": {"type": "integer", "description": "action=screenshot: JPEG quality 0-100"},
                 "depth": {"type": "integer", "default": 5, "description": "action=aria: accessibility tree depth (1-100)"}},
                 "required": []}),
+         Tool(name="browser_session",
+            description="Persistent browser tab you can reuse across calls (needs a Chromium with --remote-debugging-port; run doctor()). Without a session every browser_action call gets a fresh tab that is closed immediately, so logins, cookies and multi-step flows cannot survive. Create a session, then pass session_id to browser_action. action=create|list|info|close. Sessions are capped (8) and the least recently used is evicted; close when done so no tab leaks. e.g. browser_session(action='create', label='login', url='https://example.com') -> then browser_action(action='click', selector='#x', session_id='...')",
+            input_schema={"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["create", "list", "info", "close"], "default": "list"},
+                "session_id": {"type": "string", "description": "Required for action=info/close; omitted from action=close closes every session"},
+                "label": {"type": "string", "description": "Human label folded into the generated id, e.g. 'login'"},
+                "url": {"type": "string", "description": "Optional page to open in the new session"}},
+                "required": []}),
+         Tool(name="fetch_many",
+            description="Fetch several URLs in one call. Replaces a loop of fetch calls or a throwaway requests script: dedups URLs, caps concurrency, honours robots.txt, shares the cache, and returns per-URL success/status/content plus counts. Reports `truncated` when the batch cap (50) is hit so you know to call again for the rest. Use when you have 2+ URLs; use fetch for a single known page.",
+            input_schema={"type": "object", "properties": {
+                "urls": {"type": "array", "items": {"type": "string"}},
+                "max_concurrent": {"type": "integer", "default": 3, "description": "Parallel fetches (1-8)"},
+                "max_chars": {"type": "integer", "default": 5000},
+                "focus": {"type": "string", "description": "Keep only content relevant to this query"},
+                "respect_robots": {"type": "boolean", "default": True}},
+                "required": ["urls"]}),
+         Tool(name="crawl",
+            description="Breadth-first crawl of a site with hard caps. Replaces a bespoke scraper and makes politeness non-optional: per-page cap, depth cap, robots.txt, dedup, concurrency limit. Returns each page's title and trimmed content plus a stop_reason so you know whether the site was exhausted or a cap stopped it. Use for 'read this whole docs site'; for a known list of URLs use fetch_many.",
+            input_schema={"type": "object", "properties": {
+                "start_url": {"type": "string"},
+                "max_depth": {"type": "integer", "default": 1, "description": "Link hops from start (0-5)"},
+                "max_urls": {"type": "integer", "default": 20, "description": "Hard page cap (1-100)"},
+                "same_domain": {"type": "boolean", "default": True},
+                "include_patterns": {"type": "array", "items": {"type": "string"}, "description": "Only URLs containing one of these substrings"},
+                "exclude_patterns": {"type": "array", "items": {"type": "string"}},
+                "concurrency": {"type": "integer", "default": 2},
+                "respect_robots": {"type": "boolean", "default": True},
+                "max_chars": {"type": "integer", "default": 4000, "description": "Content kept per page"}},
+                "required": ["start_url"]}),
+         Tool(name="extract_links",
+            description="Every link on a page with its anchor text, title and rel. Replaces hand-parsing HTML before crawling or finding a 'next' button. Resolves relative hrefs, drops javascript:/mailto:, dedups, and can stay on one domain. Use before crawl or to locate a specific navigation target.",
+            input_schema={"type": "object", "properties": {
+                "url": {"type": "string"},
+                "same_domain": {"type": "boolean", "default": True},
+                "max_links": {"type": "integer", "default": 500},
+                "include_text": {"type": "boolean", "default": True}},
+                "required": ["url"]}),
+         Tool(name="extract_table",
+            description="Pull HTML tables into json, csv or markdown. Replaces a pandas/lxml script every time a page has a pricing or stats table. Reports tables_found so you can pick one by index, and marks truncated when max_rows is hit. Use extract(css) for non-tabular structure instead.",
+            input_schema={"type": "object", "properties": {
+                "url": {"type": "string"},
+                "selector": {"type": "string", "description": "CSS selector to narrow which tables are considered"},
+                "fmt": {"type": "string", "enum": ["json", "csv", "markdown"], "default": "json"},
+                "index": {"type": "integer", "default": 0, "description": "0-based index among matched tables"},
+                "max_rows": {"type": "integer", "default": 5000}},
+                "required": ["url"]}),
+         Tool(name="download",
+            description="Save a URL to disk and return the local path, byte count, sha256 and content type. Replaces curl/requests plus a filename guess. Writes only inside dest_dir (default ~/.cache/websearch/downloads) and refuses path traversal. Marks truncated if the byte cap stopped the transfer, so you know the file is incomplete.",
+            input_schema={"type": "object", "properties": {
+                "url": {"type": "string"},
+                "dest_dir": {"type": "string"},
+                "filename": {"type": "string"},
+                "max_bytes": {"type": "integer", "default": 104857600}},
+                "required": ["url"]}),
+         Tool(name="diff_page",
+            description="Has this page changed since the last time it was fetched? Compares the live page against the cached snapshot and returns changed/old_hash/new_hash plus the added and removed lines. Replaces a hand-rolled polling and hashing script. Returns had_previous=false on the first call for a URL: fetch it, then diff later. Useful for tracking docs, pricing and changelogs.",
+            input_schema={"type": "object", "properties": {
+                "url": {"type": "string"},
+                "extraction_type": {"type": "string", "default": "markdown"}},
+                "required": ["url"]}),
          Tool(name="wikipedia",
             description="Full Wikipedia API client: articles, summaries, categories, links, pageviews, revisions, backlinks, geosearch, recent changes, random pages. Use for encyclopedic facts; for open research use search. e.g. wikipedia(query='Python', action='summary')",
             input_schema={"type": "object", "properties": {
@@ -293,6 +357,85 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             from doctor import preflight
             report = await preflight(probe_network=bool(arguments.get("probe_network", True)))
             return _res({"success": True, **report})
+
+        if name == "browser_session":
+            act = str(arguments.get("action") or "list").strip().lower()
+            sid = str(arguments.get("session_id") or "").strip()
+            if act == "create":
+                return _res(await _session.create(
+                    label=str(arguments.get("label") or ""),
+                    url=str(arguments.get("url") or "")))
+            if act == "info":
+                if not sid:
+                    return _res({"success": False, "error": "session_id is required for action=info"})
+                return _res(await _session.info(sid))
+            if act == "close":
+                return _res(await _session.close(sid))
+            return _res(await _session.list_all())
+
+        if name == "fetch_many":
+            urls = arguments.get("urls") or []
+            if isinstance(urls, str):
+                urls = [u.strip() for u in urls.replace("\n", ",").split(",") if u.strip()]
+            return _res(await _webtools.fetch_many(
+                list(urls),
+                max_concurrent=safe_int(arguments.get("max_concurrent", 3)),
+                max_chars=safe_int(arguments.get("max_chars", 5000)),
+                focus=str(arguments.get("focus") or ""),
+                respect_robots=bool(arguments.get("respect_robots", True))))
+
+        if name == "crawl":
+            start = str(arguments.get("start_url") or "").strip()
+            if not start:
+                return _res({"success": False, "error": "start_url is required"})
+            return _res(await _webtools.crawl(
+                start,
+                max_depth=safe_int(arguments.get("max_depth", 1)),
+                max_urls=safe_int(arguments.get("max_urls", 20)),
+                same_domain=bool(arguments.get("same_domain", True)),
+                include_patterns=list(arguments.get("include_patterns") or []),
+                exclude_patterns=list(arguments.get("exclude_patterns") or []),
+                concurrency=safe_int(arguments.get("concurrency", 2)),
+                respect_robots=bool(arguments.get("respect_robots", True)),
+                max_chars=safe_int(arguments.get("max_chars", 4000))))
+
+        if name == "extract_links":
+            u = str(arguments.get("url") or "").strip()
+            if not u:
+                return _res({"success": False, "error": "url is required"})
+            return _res(await _webtools.extract_links(
+                u,
+                same_domain=bool(arguments.get("same_domain", True)),
+                max_links=safe_int(arguments.get("max_links", 500)),
+                include_text=bool(arguments.get("include_text", True))))
+
+        if name == "extract_table":
+            u = str(arguments.get("url") or "").strip()
+            if not u:
+                return _res({"success": False, "error": "url is required"})
+            return _res(await _webtools.extract_table(
+                u,
+                selector=str(arguments.get("selector") or ""),
+                fmt=str(arguments.get("fmt") or "json"),
+                index=safe_int(arguments.get("index", 0)),
+                max_rows=safe_int(arguments.get("max_rows", 5000))))
+
+        if name == "download":
+            u = str(arguments.get("url") or "").strip()
+            if not u:
+                return _res({"success": False, "error": "url is required"})
+            return _res(await _webtools.download(
+                u,
+                dest_dir=str(arguments.get("dest_dir") or ""),
+                filename=str(arguments.get("filename") or ""),
+                max_bytes=safe_int(arguments.get("max_bytes", 104857600))))
+
+        if name == "diff_page":
+            u = str(arguments.get("url") or "").strip()
+            if not u:
+                return _res({"success": False, "error": "url is required"})
+            return _res(await _webtools.diff_page(
+                u, extraction_type=str(arguments.get("extraction_type") or "markdown")))
 
         if name == "ping":
             c = get_http_client()
@@ -603,6 +746,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 expression=str(arguments.get("expression", "") or ""),
                 wait_state=str(arguments.get("wait_state", "domcontentloaded") or "domcontentloaded"),
                 steps=steps,
+                session_id=str(arguments.get("session_id", "") or ""),
                 timeout=safe_float(arguments.get("timeout", 30.0), 30.0),
                 max_chars=safe_int(arguments.get("max_chars", 20000), 20000),
                 full_page=bool(arguments.get("full_page", True)),
