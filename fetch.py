@@ -815,9 +815,17 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 url, full_content, extraction_type=extraction_type,
                 status=status_used, title=title or "",
                 metadata={k: v for k, v in meta.items() if v}, ttl=cache_ttl))
-            _cache_task.add_done_callback(
-                lambda t: t.exception() and logger.warning(
-                    f"fetch: cache write failed for {url}: {t.exception()}"))
+            def _cache_done(t, _url=url):
+                # A cancelled task raises CancelledError from .exception(), which
+                # surfaced as a scary traceback on every clean shutdown. Check
+                # cancelled() first, and call exception() once, not twice.
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc:
+                    logger.warning("fetch: cache write failed for %s: %s", _url, exc)
+
+            _cache_task.add_done_callback(_cache_done)
 
         result = _build_paginated_response(url, full_content, status_used,
                                           title or meta_title or meta.get("title", ""),
