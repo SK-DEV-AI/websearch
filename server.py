@@ -193,6 +193,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "urls": {"type": "array", "items": {"type": "string"}},
                 "max_concurrent": {"type": "integer", "default": 3, "description": "Parallel fetches (1-8)"},
                 "max_chars": {"type": "integer", "default": 5000},
+                "cache_ttl": {"type": "integer", "default": 3600, "description": "Shared cache TTL in seconds; 0 forces a refetch of every URL."},
                 "focus": {"type": "string", "description": "Keep only content relevant to this query"},
                 "respect_robots": {"type": "boolean", "default": True}},
                 "required": ["urls"]}),
@@ -395,6 +396,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 list(urls),
                 max_concurrent=safe_int(arguments.get("max_concurrent", 3)),
                 max_chars=safe_int(arguments.get("max_chars", 5000)),
+                cache_ttl=safe_int(arguments.get("cache_ttl", 3600)),
                 focus=str(arguments.get("focus") or ""),
                 respect_robots=bool(arguments.get("respect_robots", True))))
 
