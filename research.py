@@ -8,7 +8,7 @@ import time
 import urllib.parse
 from collections import Counter
 
-from config import HELIUM_CDP, cached
+from config import HELIUM_CDP, cached, ENRICH_MAX_PAGES, ENRICH_MIN_PAGES
 from search_ddg import search_ddg, search_google_rss
 from search_brave import search_brave
 from search_bing_rss import search_bing_web
@@ -706,14 +706,26 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
 
 async def enrich(results: list[dict], query: str, depth: int = 3,
                  cdp_url: str | None = None,
-                 count: int = 10, language: str = "en") -> dict:
+                 count: int = 10, language: str = "en",
+                 max_pages: int = 0) -> dict:
     """Fetch full page content from top results, dedup, rerank.
 
     Takes snippet results (from search_multi), fetches their full content,
     deduplicates by embedding cosine similarity, and reranks by query relevance.
     Also enriches Wikipedia results with full summary extracts.
     """
-    urls = [r["url"] for r in (results or []) if r.get("url")][:5]  # ponytail: depth=2 enrich caps at 5 fetches — 8×32K + rerank + Groq blows past 60s and looks stuck; 5 is enough for synthesis
+    # How many pages to fetch. Depth is the caller's lever for "more evidence",
+    # and it has to change this number or depth does nothing but relabel the
+    # response: at depth 2 the synthesis sees the same five pages it would have
+    # seen at any depth above 1.
+    #
+    # The old hard cap of 5 existed because 8 x 32K plus reranking blew past
+    # 60s and looked hung. It stays as a ceiling, but the number now grows with
+    # depth, and the measured cost of each step is in the depth benchmark
+    # (exec/websearch-depth-bench/) so raising it is a decision with a number.
+    pages = int(max_pages or 0) or min(ENRICH_MAX_PAGES, max(ENRICH_MIN_PAGES, depth * 2))
+    pages = max(2, min(ENRICH_MAX_PAGES, pages))
+    urls = [r["url"] for r in (results or []) if r.get("url")][:pages]
     if not urls:
         return {"fetched_content": []}
     fetched = await asyncio.gather(
@@ -811,3 +823,31 @@ async def enrich(results: list[dict], query: str, depth: int = 3,
         result["reranker"] = "disabled — results are engine-ranked only (not reranked). " \
             "Enable with: rm ~/.local/share/reranker-rust/disabled"
     return result
+
+
+def _selfcheck() -> None:
+    """Page-count math for the enrichment step, with no network.
+
+    This exists because the alternative failed silently: a missing import made
+    every depth>=2 search raise NameError, and the first benchmark run recorded
+    four "no answer" rows before anyone noticed. A number-of-pages function that
+    cannot be called is worth one assertion.
+    """
+    import config
+    checks = [("max >= min", config.ENRICH_MAX_PAGES >= config.ENRICH_MIN_PAGES)]
+    for d in (2, 3, 4, 5):
+        pages = min(config.ENRICH_MAX_PAGES, max(config.ENRICH_MIN_PAGES, d * 2))
+        checks.append((f"depth {d} fetches >= {config.ENRICH_MIN_PAGES}",
+                       pages >= config.ENRICH_MIN_PAGES))
+        checks.append((f"depth {d} never exceeds the ceiling",
+                       pages <= config.ENRICH_MAX_PAGES))
+    checks.append(("higher depth never fetches fewer pages",
+                   min(config.ENRICH_MAX_PAGES, max(config.ENRICH_MIN_PAGES, 6))
+                   >= min(config.ENRICH_MAX_PAGES, max(config.ENRICH_MIN_PAGES, 4))))
+    for name, ok in checks:
+        print(f"{'OK' if ok else 'FAIL'}  {name}")
+    print(f"research selfcheck: {sum(1 for _, v in checks if v)}/{len(checks)} OK")
+
+
+if __name__ == "__main__":
+    _selfcheck()

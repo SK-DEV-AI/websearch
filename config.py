@@ -91,6 +91,13 @@ FAST_PATHS_ENABLED = os.environ.get("FAST_PATHS_ENABLED", "true") == "true"
 ROBOTS_POLITENESS = os.environ.get("ROBOTS_POLITENESS", "true") == "true"
 EXTRACT_METADATA_ENABLED = os.environ.get("EXTRACT_METADATA_ENABLED", "true") == "true"
 
+def _clamp_int(raw: Any, lo: int, hi: int, default: int) -> int:
+    try:
+        return max(lo, min(hi, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
 # ── search effort defaults ───────────────────────────────────────
 # depth is how much work a search does: 1 = snippets only, 2+ = fetch the top
 # pages and score the full text. The right default depends on whether a model
@@ -101,14 +108,16 @@ EXTRACT_METADATA_ENABLED = os.environ.get("EXTRACT_METADATA_ENABLED", "true") ==
 DEPTH_MIN = 1
 DEPTH_MAX = 5
 DEPTH_DEFAULT_PLAIN = 1
-DEPTH_DEFAULT_WITH_MODEL = 2
+# With a model available, fetching more pages is no longer wasted work: the
+# model reads all of them and can reconcile contradictions between them. The
+# value is set from measurement (exec/websearch-depth-bench), not taste.
+DEPTH_DEFAULT_WITH_MODEL = 3
 
-
-def _clamp_int(raw: Any, lo: int, hi: int, default: int) -> int:
-    try:
-        return max(lo, min(hi, int(raw)))
-    except (TypeError, ValueError):
-        return default
+# Page fetches in the depth>=2 enrichment step. At least ENRICH_MIN_PAGES so
+# depth 2 still gets a real pool; grows with depth up to the ceiling, which
+# exists because 8 x 32K plus reranking overran a 60s client timeout.
+ENRICH_MIN_PAGES = 5
+ENRICH_MAX_PAGES = _clamp_int(os.environ.get("WEBSEARCH_ENRICH_MAX_PAGES"), 3, 12, 8)
 
 
 def model_lanes_configured() -> bool:

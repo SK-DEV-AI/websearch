@@ -533,10 +533,21 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
         return {"available": True, "skipped": "no results to synthesise on",
                 "diversity": div, "duplicates_removed": dedup["removed"]}
 
-    ctx = "\n\n".join(
-        f"[{i + 1}]\nSource: {x.get('url', '')}\nTitle: {x.get('title', '')}\n"
-        f"Content: {(x.get('content') or x.get('snippet') or '')[:s['snippet_chars']]}"
-        for i, x in enumerate(top))
+    def _line(i: int, x: dict) -> str:
+        published = str(x.get("published") or "").strip()
+        head = (f"[{i + 1}]\nSource: {x.get('url', '')}\nTitle: {x.get('title', '')}"
+                + (f"\nPublished: {published}" if published else "\nPublished: not stated"))
+        body = (x.get("content") or x.get("snippet") or "")[:s["snippet_chars"]]
+        return f"{head}\nContent: {body}"
+
+    ctx = "\n\n".join(_line(i, x) for i, x in enumerate(top))
+
+    # The newest date among the sources. A caller asking "latest" needs to know
+    # whether the freshest evidence is from last week or from 2023, and that is
+    # not something the prose reliably states.
+    _dates = sorted({str(x.get("published")).strip() for x in top
+                     if str(x.get("published") or "").strip()})
+    as_of = _dates[-1] if _dates else ""
 
     excerpts = [(x.get("content") or x.get("snippet") or "") for x in top]
     # Key includes the source text itself, not just the URLs: an answer cached
@@ -649,6 +660,7 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
         "sources_used": len(top),
         "duplicates_removed": dedup["removed"],
         "citations_used": len(cited),
+        "as_of": as_of,
         "figures_unverified": unverified,
         "duration_ms": int((time.perf_counter() - _t0) * 1000),
         "diversity": div,

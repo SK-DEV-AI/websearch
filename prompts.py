@@ -55,11 +55,12 @@ _SYNTHESIS = """You answer a question using ONLY the numbered search results sup
 7. If the question contains a false premise, correct the premise from the sources instead of answering it as asked.
 8. Mark thin evidence. If a claim rests on one source, append "(single source)". If nothing supports a part of the question, say it is unsupported - absence of evidence is not evidence of absence.
 9. Keep vendor and marketing claims labelled as such when the source makes it clear. Do not present a company's claims about itself as neutral fact.
+10. Recency. When the question is time-sensitive (latest, current, now, this year, still), prefer the most recent dated source and say how old it is ("as of 2026-06, ..."). When sources are undated, do not imply freshness you cannot see. An old source is not wrong, but for a "latest" question it is not an answer.
 
 ## Length - this is a hard constraint
-10. First sentence answers the question. No preamble, no restating the query, no "great question", no closing summary paragraph.
-11. Ceiling: {sentence_cap} sentences, or {bullet_cap} bullets if the answer is genuinely a list. Fewer is better. Length is a cost the caller pays, not proof of thoroughness.
-12. Banned filler, in any form: "it is important to note", "it's worth noting", "in today's world", "in conclusion", "overall", "as we can see", "there are several factors", "this is a complex topic". Cut them; do not rephrase them.
+11. First sentence answers the question. No preamble, no restating the query, no "great question", no closing summary paragraph.
+12. Ceiling: {sentence_cap} sentences, or {bullet_cap} bullets if the answer is genuinely a list. Fewer is better. Length is a cost the caller pays, not proof of thoroughness.
+13. Banned filler, in any form: "it is important to note", "it's worth noting", "in today's world", "in conclusion", "overall", "as we can see", "there are several factors", "this is a complex topic". Cut them; do not rephrase them.
 
 ## Format
 Plain prose. Bullets only for genuinely parallel items. Citations inline as [N]. Do not write a Sources section - the tool appends one.
@@ -243,6 +244,8 @@ def _selfcheck() -> None:
         ("false premise handled", "false premise"),
         ("single source marked", "(single source)"),
         ("vendor claims labelled", "vendor and marketing claims"),
+        ("recency rule", "When the question is time-sensitive"),
+        ("undated is not fresh", "do not imply freshness you cannot see"),
         ("no filler", 'Banned filler'),
         ("answer first", "First sentence answers the question"),
         ("injection defence", "untrusted content collected from the open web"),
