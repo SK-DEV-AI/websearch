@@ -152,7 +152,8 @@ def synthesis_settings() -> dict:
     """Context-shaping knobs for the synthesis step.
 
     Env                          default  meaning
-    WEBSEARCH_SYNTH_TOKENS           900  max_tokens for the answer
+    WEBSEARCH_SYNTH_TOKENS          1200  max_tokens for the answer (a ceiling;
+                                          the sentence cap is the real control)
     WEBSEARCH_DOMAIN_CAP               2  max sources from one registrable domain
     WEBSEARCH_MIN_SOURCES              3  floor before the domain cap relaxes
     WEBSEARCH_SYNTH_MAX_SOURCES        8  ceiling on sources in the context
@@ -160,7 +161,7 @@ def synthesis_settings() -> dict:
     """
     return {
         "max_tokens": _clamp_int(
-            os.environ.get("WEBSEARCH_SYNTH_TOKENS"), 200, 8000, 900),
+            os.environ.get("WEBSEARCH_SYNTH_TOKENS"), 200, 8000, 1200),
         "domain_cap": _clamp_int(
             os.environ.get("WEBSEARCH_DOMAIN_CAP"), 1, 10, 2),
         "min_sources": _clamp_int(

@@ -28,7 +28,7 @@ import time
 from cdp_actions import browser_action as _browser_action
 from errors import annotate as _err_annotate, classify_exception as _err_exc
 from ghost_state import CHALLENGE, CONTENT_OK, classify, ghost
-from fetch import fetch_url, scrapling_stealthy_fetch
+from fetch import fetch_url, scrapling_stealthy_fetch, _is_junk_title
 from pdf_extract import extract_pdf
 from screenshot import cdpa11y_snapshot
 from wikipedia import (search_wikipedia, fetch_wikipedia_summary, fetch_wikipedia_summary_rest,
@@ -423,6 +423,25 @@ def _norm_words(text: str) -> list[str]:
     return _WORD.findall((text or "").lower())
 
 
+_ABSENCE_PHRASES = (
+    "unsupported", "no source supports", "do not provide", "does not provide", "did not provide", "do not state",
+    "does not state", "do not mention", "does not mention", "no source",
+    "not stated", "unanswered", "insufficient evidence", "cannot be determined",
+    "not enough evidence", "the sources do not",
+)
+
+
+def _is_absence_statement(sentence: str) -> bool:
+    """True when the sentence describes a gap rather than asserting a fact.
+
+    An answer that honestly says "the sources do not cover X" is doing exactly
+    what it was told to do. Flagging it as unsupported punishes the behaviour we
+    want, and a caller who sees that learns to ignore the check.
+    """
+    low = (sentence or "").lower()
+    return any(p in low for p in _ABSENCE_PHRASES)
+
+
 def _supported_by_shingle(sentence: str, full_text: str) -> bool:
     """True when a 5-word run of the sentence appears verbatim in the source.
 
@@ -541,7 +560,9 @@ async def verify_grounding(answer: str, sources: list[dict], ep: dict,
                     candidates = [full_texts[idx]]
                 else:
                     candidates = list(full_texts)
-            if sentence and any(_supported_by_shingle(sentence, t) for t in candidates if t):
+            if sentence and _is_absence_statement(sentence):
+                downgraded.append(item)
+            elif sentence and any(_supported_by_shingle(sentence, t) for t in candidates if t):
                 downgraded.append(item)
             else:
                 if isinstance(item, dict) and idx is not None and 0 <= idx < len(partial) \
@@ -685,6 +706,30 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
     # dead links in the pool at a demoted score so the caller still sees them, but
     # feeding one to the synthesis produced a citation [6] pointing at a page with
     # no text - an unciteable claim dressed as a citation.
+    # A 404 page, an error page or a nav-only stub is not evidence. These got
+    # through to synthesis on a live run: two 404s and a tag archive arrived as
+    # "sources", and the answer correctly said the results did not contain the
+    # information - which looked like a bad answer but was a bad source pool.
+    _ERROR_TITLES = ("404", "not found", "page not found", "403 forbidden",
+                     "access denied", "just a moment", "are you a robot")
+    MIN_SOURCE_CHARS = 400
+
+    def _unusable(x: dict) -> tuple[bool, str]:
+        status = x.get("status")
+        if isinstance(status, int) and status >= 400:
+            return True, f"HTTP {status}"
+        title = str(x.get("title") or "").strip().lower()
+        if title and any(t in title for t in _ERROR_TITLES):
+            return True, "error page title"
+        body = x.get("content") or ""
+        if body and len(body.strip()) < MIN_SOURCE_CHARS:
+            return True, f"only {len(body.strip())} chars of text"
+        return False, ""
+
+    thin = [{"url": x.get("url", ""), "title": x.get("title", ""), "reason": why}
+            for x in pool for bad, why in [_unusable(x)] if bad]
+    pool = [x for x in pool if not _unusable(x)[0]]
+
     unreadable = [x for x in pool
                   if (x.get("dead") or x.get("success") is False)
                   and not (x.get("content") or x.get("snippet"))]
@@ -699,7 +744,14 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
     if not top:
         return {"available": True, "skipped": "no results to synthesise on",
                 "diversity": div, "duplicates_removed": dedup["removed"],
-                "unreadable_sources": len(unreadable)}
+                "unreadable_sources": len(unreadable),
+                "unusable_sources": thin}
+
+    def _title(x: dict) -> str:
+        """A usable title, or none. A fake subject is worse than no subject: the
+        model would then cite "markdown via Accept header for x" as the page."""
+        t = str(x.get("title") or "").strip()
+        return "" if _is_junk_title(t) else t
 
     def _freshness(x: dict) -> str:
         """How old the source is, stated precisely.
@@ -720,7 +772,8 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
         return "not stated"
 
     def _line(i: int, x: dict) -> str:
-        head = (f"[{i + 1}]\nSource: {x.get('url', '')}\nTitle: {x.get('title', '')}"
+        title = _title(x) or "(no title given by the page)"
+        head = (f"[{i + 1}]\nSource: {x.get('url', '')}\nTitle: {title}"
                 f"\nPublished: {_freshness(x)}")
         body = (x.get("content") or x.get("snippet") or "")[:s["snippet_chars"]]
         return f"{head}\nContent: {body}"
@@ -791,7 +844,8 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
                 "note": "Results are still returned below; only the written "
                         "answer failed."}
 
-    sources = [{"n": i + 1, "title": x.get("title", ""), "url": x.get("url", "")}
+    sources = [{"n": i + 1, "title": _title(x) or x.get("url", ""),
+                "url": x.get("url", "")}
                for i, x in enumerate(top)]
     truncated = finish == "length"
     # Which sources the answer actually leans on. Available sources are not
@@ -848,6 +902,7 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
         "sources_used": len(top),
         "duplicates_removed": dedup["removed"],
         "unreadable_sources": len(unreadable),
+        "unusable_sources": thin,
         "citations_used": len(cited),
         "as_of": as_of,
         "as_of_kind": as_of_kind,
@@ -1770,6 +1825,35 @@ async def _synthesis_selfcheck() -> None:
                    and by["download"].destructive_hint is False))
     checks.append(("local-only tools are not open-world",
                    by["doctor"].open_world_hint is False))
+
+    checks.append(("an absence statement is not a claim",
+                   _is_absence_statement("The results do not state the price [1].")))
+    checks.append(("an 'unsupported' admission is not a claim",
+                   _is_absence_statement("Part of this is unsupported by the sources.")))
+    checks.append(("a factual claim is not an absence statement",
+                   not _is_absence_statement("uv is 10x faster than pip [2].")))
+
+    # A 404 and a nav-only stub must not become sources.
+    junk_pool = {"results": [
+        {"url": "https://a.com/good", "title": "Real page", "snippet": "x",
+         "content": "y" * 900, "status": 200},
+        {"url": "https://b.com/404", "title": "404 Page not found", "snippet": "x",
+         "content": "z" * 900, "status": 200},
+        {"url": "https://c.com/missing", "title": "Whatever", "snippet": "x",
+         "content": "w" * 900, "status": 404},
+        {"url": "https://d.com/stub", "title": "Tag archive", "snippet": "x",
+         "content": "short nav text", "status": 200},
+    ]}
+    globals()["_chat"] = ok_chat
+    out = await _synthesize("selfcheck-q", junk_pool, 2, use_cache=False)
+    reasons = {u["url"]: u["reason"] for u in out.get("unusable_sources", [])}
+    checks.append(("404 status is not a source",
+                   "https://c.com/missing" in reasons))
+    checks.append(("error-page title is not a source",
+                   "https://b.com/404" in reasons))
+    checks.append(("nav-only stub is not a source",
+                   "https://d.com/stub" in reasons))
+    checks.append(("good page is kept", "https://a.com/good" not in reasons))
 
     # ── follow-up selection: pure functions, no model, no network ──
     good = {"available": True, "citations_used": 4, "answer": "It is 3.4 [1].",
