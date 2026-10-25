@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import datetime
 import re
 import time
 import difflib
@@ -866,7 +867,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                     result["low_quality"] = result["quality"] < QUALITY_FLOOR
             except Exception as e:
                 logger.warning("mineru rescue failed for %s: %s", url, e)
-        return result
+        return _attach_published(result, meta)
     except Exception as e:
         return {"success": False, "url": url, "error": str(e)}
 
@@ -952,6 +953,99 @@ def _best_title(*candidates: str, content: str = "") -> str:
         if not _is_junk_title(h):
             return h[:200]
     return ""
+
+
+
+# Dates that a page states about itself. Search engines return `published` for
+# only some results, so before this the freshness of most sources was unknown -
+# `as_of` came back empty on a live run even though several pages carried a
+# date in their own structured data.
+_DATE_KEYS = (
+    "datePublished", "dateCreated", "uploadDate",
+    "article:published_time", "article:modified_time", "dateModified",
+    "published_time", "pubdate",
+)
+_PUBLISHED_KEYS = {"datepublished", "datecreated", "uploaddate",
+                   "article:published_time", "published_time", "pubdate"}
+
+
+def _norm_date(raw: str) -> str:
+    """Return YYYY-MM-DD for a parseable date, else ''.
+
+    Partial dates are rejected rather than guessed: a page that only says "2024"
+    must not become 2024-01-01, because a precise-looking date that nobody stated
+    is a fabricated fact.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", raw)
+    if m:
+        try:
+            dt = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return ""
+    else:
+        m2 = re.match(r"^(\d{4})/(\d{2})/(\d{2})$", raw)
+        if not m2:
+            return ""
+        try:
+            dt = datetime.date(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+        except ValueError:
+            return ""
+    # A date in the future is a parsing artefact (or a scheduled post), and
+    # treating it as evidence of freshness would be wrong.
+    if dt > datetime.date.today():
+        return ""
+    if dt.year < 1990:
+        return ""
+    return dt.isoformat()
+
+
+def _walk_for_dates(obj, found: dict) -> None:
+    """Collect date-ish keys from nested jsonld / microdata / rdfa structures."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if kl in {d.lower() for d in _DATE_KEYS} and isinstance(v, str):
+                found.setdefault(kl, v)
+            else:
+                _walk_for_dates(v, found)
+    elif isinstance(obj, list):
+        for it in obj[:20]:
+            _walk_for_dates(it, found)
+
+
+def _published_from_meta(meta: dict) -> tuple[str, str]:
+    """(published, modified) as ISO dates, either may be ''.
+
+    Both are returned because either alone misleads. A wiki reports its article
+    creation date as datePublished, so showing only that makes a page edited this
+    week look twenty years old; showing only "last modified" makes a typo fix
+    look like fresh reporting. The caller gets both and the prompt shows both.
+    """
+    found: dict = {}
+    _walk_for_dates((meta or {}).get("structured") or {}, found)
+    pub = ""
+    mod = ""
+    for key, raw in found.items():
+        iso = _norm_date(raw)
+        if not iso:
+            continue
+        if key in _PUBLISHED_KEYS and not pub:
+            pub = iso
+        elif key not in _PUBLISHED_KEYS and not mod:
+            mod = iso
+    return pub, mod
+
+
+def _attach_published(result: dict, meta: dict) -> dict:
+    pub, mod = _published_from_meta(meta)
+    if pub:
+        result["published"] = pub
+    if mod:
+        result["modified"] = mod
+    return result
 
 
 
@@ -1411,3 +1505,47 @@ def _build_paginated_response(url: str, content: str, status: int | str,
         "next_offset": next_off if is_truncated else 0,
         "method": method,
     }
+
+
+def _selfcheck() -> None:
+    """Date and title extraction, with no network.
+
+    Both functions shape what the synthesis model is told about a source, and
+    both have already been wrong once: a fetch label became a page title, and
+    publication dates were dropped entirely while sitting in the page's own
+    structured data.
+    """
+    checks: list[tuple[str, bool]] = []
+
+    checks.append(("iso date is kept", _norm_date("2026-10-15T02:20:26+00:00") == "2026-10-15"))
+    checks.append(("year-only date is refused, not guessed", _norm_date("2024") == ""))
+    checks.append(("future date is refused", _norm_date("2099-01-01") == ""))
+    checks.append(("pre-1990 date is refused", _norm_date("1970-01-01") == ""))
+    checks.append(("slash date is accepted", _norm_date("2024/03/25") == "2024-03-25"))
+    checks.append(("garbage is refused", _norm_date("last tuesday") == ""))
+    checks.append(("impossible date is refused", _norm_date("2024-02-31") == ""))
+
+    pub, mod = _published_from_meta({"structured": {"jsonld": [{
+        "datePublished": "2024-03-25T13:00:41+00:00", "dateModified": "2026-01-02"}]}})
+    checks.append(("both dates extracted", (pub, mod) == ("2024-03-25", "2026-01-02")))
+    checks.append(("published preferred as the publication date", pub == "2024-03-25"))
+
+    pub2, mod2 = _published_from_meta({"structured": {"jsonld": [{
+        "dateModified": "2026-10-23T21:58:19Z"}]}})
+    checks.append(("modified-only page has no published date", pub2 == "" and mod2 == "2026-10-23"))
+    checks.append(("empty metadata is safe", _published_from_meta({}) == ("", "")))
+
+    checks.append(("mdbook UI label rejected", _is_junk_title("Keyboard shortcuts")))
+    checks.append(("fetch label rejected", _is_junk_title("markdown via Accept header for x")))
+    checks.append(("real title kept", not _is_junk_title("Creatine - Wikipedia")))
+    checks.append(("heading is the fallback",
+                   _best_title("", "Keyboard shortcuts", content="# MIR borrow check\n\nx") == "MIR borrow check"))
+    checks.append(("no title beats a fake title", _best_title("", "", content="no heading") == ""))
+
+    for name, ok in checks:
+        print(f"{'OK' if ok else 'FAIL'}  {name}")
+    print(f"fetch selfcheck: {sum(1 for _, v in checks if v)}/{len(checks)} OK")
+
+
+if __name__ == "__main__":
+    _selfcheck()
