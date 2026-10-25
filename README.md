@@ -134,9 +134,26 @@ Everything is verifiable rather than claimed:
 - `duplicates_removed` counts syndicated copies collapsed before synthesis, and
   `figures_unverified` lists numbers the answer contains that appear in no
   cited source (deterministic, no model call)
+- `unusable_sources` names the results that could not become evidence - a 404, an
+  error page, or a page with under 400 chars of text - with the reason, and
+  `unreadable_sources` counts the ones with no text at all
+- **multi-hop**: when the first answer admits a weakness (single source, a claim
+  it could not tie to a source, or a stated gap), one extra round runs on the
+  subquery that targets the gap. The response records `follow_ups` and marks
+  `synthesis.round = 2`. Bounded: once per call, only under a 75s budget, and
+  `follow_up=false` disables it
 - a second model pass (`grounded`) re-reads the answer against the exact text
   the first pass saw and flags sentences no cited source supports. It is marked
   `advisory` because it is another model's opinion, not a proof
+
+### Tool annotations
+
+All 20 tools carry MCP annotations (`readOnlyHint`, `destructiveHint`,
+`idempotentHint`, `openWorldHint`) so a client can tell a read from an action:
+`search` and `fetch` are read-only, `download` writes a local file without being
+destructive, `browser_session` changes local browser state only, and
+`browser_action` / `form_fill_submit` are marked destructive because a click or a
+form submit can have an effect that cannot be undone from here.
 
 ### Why the answer is prose, not JSON
 
@@ -159,7 +176,7 @@ endpoints, so one call path serves both.
 | `WEBSEARCH_SYNTH_PROVIDER` | `local` | `local` (in-tool model first), `groq` (Groq first), `auto` (either, in-tool preferred) |
 | `WEBSEARCH_DEFAULT_DEPTH` | auto | Pins the default `depth`. Auto = 3 when a model lane exists, else 1 |
 | `WEBSEARCH_ENRICH_MAX_PAGES` | `8` | Ceiling on page fetches per search. The count itself is `max(5, depth*2)` |
-| `WEBSEARCH_SYNTH_TOKENS` | `900` | Answer budget. On `finish_reason=length` the result says `truncated` |
+| `WEBSEARCH_SYNTH_TOKENS` | `1200` | Answer budget. On `finish_reason=length` the result says `truncated` |
 | `WEBSEARCH_SYNTH_MAX_SOURCES` | `8` | Ceiling on sources in the context |
 | `WEBSEARCH_DOMAIN_CAP` | `2` | Max sources from one registrable domain |
 | `WEBSEARCH_MIN_SOURCES` | `3` | Floor before the domain cap relaxes |
