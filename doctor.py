@@ -176,6 +176,33 @@ async def preflight(probe_network: bool = True) -> dict[str, Any]:
         "note": gai_note,
     })
 
+    # --- in-tool model (opt-in distillation) ---
+    try:
+        from distill import available as _distill_avail
+        dav = _distill_avail()
+    except Exception as e:  # noqa: BLE001
+        dav = {"available": False, "error": f"{type(e).__name__}: {e}"}
+    lanes.append({
+        "id": "distill",
+        "name": "In-tool distillation (fetch(distill=true)) - cheaper context for the caller",
+        "status": "live" if dav.get("available") else "needs_setup",
+        "requires": (
+            "an OpenAI-compatible chat endpoint. Optional and OFF by default; "
+            "only used when a tool call asks for it."
+        ),
+        "how_to_enable": (
+            "export DISTILL_API_KEY=<key>  (optionally DISTILL_BASE_URL, "
+            "DISTILL_MODEL; tune with DISTILL_RETRIES, DISTILL_MAX_TOKENS, "
+            "DISTILL_TIMEOUT, DISTILL_THRESHOLD_CHARS)"
+        ),
+        "note": (
+            f"model={dav.get('model')} at {dav.get('base_url')}, key from "
+            f"{dav.get('key_source')}, threshold "
+            f"{dav.get('threshold_chars')} chars, {dav.get('retries')} retries"
+            if dav.get("available") else dav.get("error", "not configured")
+        ),
+    })
+
     # --- reranker ---
     if reranker_off:
         lanes.append({
@@ -243,6 +270,9 @@ async def preflight(probe_network: bool = True) -> dict[str, Any]:
             "chromium_on_path": chromium,
             "reranker_worker": worker,
             "keys_present": keys_present,
+            "distill": {k: dav.get(k) for k in
+                        ("available", "model", "base_url", "key_source",
+                         "retries", "threshold_chars")},
         },
         "where_am_i": (
             "local" if cdp.get("ok") else

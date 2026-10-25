@@ -134,6 +134,8 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                     "quality_floor": {"type": "number", "default": 0, "description": "Min acceptable extraction quality 0-1 (length+density+structure score); below it the result is flagged low_quality"},
                     "mineru": {"type": "boolean", "default": False, "description": "Opt-in MinerU-HTML SLM re-extraction for low-quality pages (heavy, CPU, seconds per page)"},
                     "cookies": {"type": "array", "items": {"type": "object"}, "description": "Optional cookies injected into the request: [{name, value, domain?, path?}] (e.g. session cookie for a page behind login)"},
+                    "distill": {"type": "boolean", "default": False, "description": "Opt-in: compress the page with a cheap local model before returning it, to save your context. Never on by default and never silent - the result carries distill.distilled, raw_chars and how_to_get_raw, and the untouched text is one call away with distill=false. Skipped automatically below the size threshold, where it would cost more than it saves."},
+                    "distill_question": {"type": "string", "description": "What you are actually looking for. Gives the distiller something to focus on, which reduces the chance it drops the detail you needed."},
                     },
                 "required": ["url"]}),
           Tool(name="screenshot",
@@ -705,6 +707,22 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 else:
                     r["content"] = "\n".join(all_lines[start_line - 1:])
                 r["returned_lines"] = r["content"].count("\n") + 1
+
+            # ── Optional in-tool distillation ────────────────────────
+            # Opt-in only. Never silently replaces content: the result
+            # advertises distilled=true, raw_chars, and how to get the raw
+            # text back, so the caller cannot mistake a summary for the page.
+            if bool(arguments.get("distill", False)) and r.get("success") and r.get("content"):
+                import distill as _distill_mod
+                dd = await _distill_mod.distill(
+                    r["content"],
+                    question=str(arguments.get("distill_question", "") or ""),
+                    url=url)
+                r["distill"] = {k: v for k, v in dd.items() if k != "content"}
+                if dd.get("distilled"):
+                    r["content"] = dd["content"]
+                else:
+                    r.setdefault("distill_skipped", dd.get("distill_skipped", ""))
             return _res(r)
         elif name == "screenshot":
             snap = await cdpa11y_snapshot(url=str(arguments["url"]),
