@@ -13,7 +13,8 @@ logger = logging.getLogger("websearch")
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
+from mcp.types import (CallToolResult, ListToolsResult, TextContent, Tool,
+                       ToolAnnotations)
 
 from config import (MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client,
                     _KeyRotator, default_depth, synthesis_settings,
@@ -107,8 +108,68 @@ explains why there is no answer rather than leaving the field blank.
 - `cache_ttl=0`: bypass cache
 """
 
+
+# ───────────────────── tool annotations ─────────────────────
+# The MCP spec has had these since 2025-06 and almost nobody sets them. They are
+# the difference between a client asking the user for approval on every call and
+# a client knowing that a read needs no approval at all, so they are worth the
+# twenty lines. Nothing here is destructive by default: the two exceptions are
+# named explicitly.
+
+def _ann(*, read_only: bool, destructive: bool = False,
+         idempotent: bool | None = None, open_world: bool = True) -> ToolAnnotations:
+    return ToolAnnotations(
+        read_only_hint=read_only,
+        destructive_hint=destructive,
+        idempotent_hint=read_only if idempotent is None else idempotent,
+        open_world_hint=open_world,
+    )
+
+
+_READ = _ann(read_only=True)
+_READ_LOCAL = _ann(read_only=True, open_world=False)
+# These can cause an external side effect that cannot be undone from here:
+# clicking a submit button, or filling and submitting a real form.
+_ACT = _ann(read_only=False, destructive=True, idempotent=False)
+# Writes a file to the local filesystem.
+_WRITE = _ann(read_only=False, destructive=False, idempotent=False, open_world=False)
+# Local browser state (tabs, sessions) changes, the web does not.
+_STATEFUL = _ann(read_only=False, destructive=False, idempotent=False, open_world=False)
+
+_ANNOTATIONS = {
+    "doctor": _READ_LOCAL,
+    "ping": _READ_LOCAL,
+    "search": _READ,
+    "fetch": _READ,
+    "fetch_many": _READ,
+    "crawl": _READ,
+    "extract_links": _READ,
+    "extract_table": _READ,
+    "diff_page": _READ,
+    "wikipedia": _READ,
+    "arxiv": _READ,
+    "map_site": _READ,
+    "extract": _READ,
+    "pdf_extract": _READ,
+    "screenshot": _READ,
+    "download": _WRITE,
+    "browser_session": _STATEFUL,
+    "browser_action": _ACT,
+    "form_fill_submit": _ACT,
+    "paginate": _ACT,
+}
+
+
+def _annotated(tools: list[Tool]) -> list[Tool]:
+    for t in tools:
+        ann = _ANNOTATIONS.get(t.name)
+        if ann is not None:
+            t.annotations = ann
+    return tools
+
+
 async def handle_list_tools(ctx, params) -> ListToolsResult:
-    return ListToolsResult(tools=[
+    return ListToolsResult(tools=_annotated([
         Tool(name="doctor",
             description="Preflight: report which lanes are usable RIGHT NOW and the exact command to enable the rest. Run this first, and whenever a feature returns empty results. Distinguishes 'broken' from 'needs optional setup' — the browser lanes (Google AI Mode, browser_action, bot-wall bypass) require a Chromium-based browser with --remote-debugging-port on the same host, so they are unavailable on headless servers; the keyless HTTP lanes work anywhere. Never prints key values, only which env var names are set. e.g. doctor()",
             input_schema={"type": "object", "properties": {
@@ -350,18 +411,52 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "force_ocr": {"type": "boolean", "default": False, "description": "Shortcut: force the Docling OCR fallback even when a text layer exists"},
             },
                 "required": ["input_path"]}),
-    ])
+    ]))
+
+
+
+_WORD = re.compile(r"[a-z0-9]+")
+_SHINGLE = 5
+
+
+def _norm_words(text: str) -> list[str]:
+    return _WORD.findall((text or "").lower())
+
+
+def _supported_by_shingle(sentence: str, full_text: str) -> bool:
+    """True when a 5-word run of the sentence appears verbatim in the source.
+
+    This exists because the verifier only sees a truncated excerpt of each
+    source - 1500 chars of a page that may be 20k - and it flagged true
+    statements as unsupported purely because the supporting text fell outside
+    the excerpt. A long verbatim run is proof the claim came from the source,
+    which is exactly the question being asked, so it overrides a model opinion.
+
+    It cannot prove a paraphrase; it only rescues the cases where the answer
+    copied the source, which is most of what a grounded answer does.
+    """
+    sent = _norm_words(sentence)
+    if len(sent) < _SHINGLE:
+        return False
+    src = " ".join(_norm_words(full_text))
+    if not src:
+        return False
+    for i in range(len(sent) - _SHINGLE + 1):
+        if " ".join(sent[i:i + _SHINGLE]) in src:
+            return True
+    return False
 
 
 # How much of each source the verifier is shown. Judging a claim against a bare
 # title is not a check, it is a guess: the first version did exactly that and
 # flagged true statements as unsupported because it could not see the text.
-VERIFIER_EXCERPT_CHARS = 1200
-VERIFIER_TOTAL_CHARS = 14_000
+VERIFIER_EXCERPT_CHARS = 2500
+VERIFIER_TOTAL_CHARS = 22_000
 
 
 async def verify_grounding(answer: str, sources: list[dict], ep: dict,
-                           excerpts: list[str] | None = None) -> dict:
+                           excerpts: list[str] | None = None,
+                           full_texts: list[str] | None = None) -> dict:
     """Re-prompt a model: is each sentence backed by a source it cites?
 
     Runs on whichever endpoint produced the answer, so a deployment with only an
@@ -375,9 +470,17 @@ async def verify_grounding(answer: str, sources: list[dict], ep: dict,
     The result is advisory: it is another model's opinion, not a proof.
     Returns {"flagged": [...], "ok": bool|None, "checked_by": provider}.
     """
+    # The excerpt is marked as partial when the source is longer than what is
+    # shown. Without that label the verifier reads "not in the text I was given"
+    # as "not in the source" and produces confident false accusations on any page
+    # longer than the excerpt - which is most of them.
+    partial = [bool(excerpts and i < len(excerpts)
+                    and len(excerpts[i]) > VERIFIER_EXCERPT_CHARS)
+               for i in range(len(sources))]
     sources_block = "\n".join(
         f"[{s['n']}] {s['title']} - {s['url']}"
-        + (f"\n    text: {excerpts[i][:VERIFIER_EXCERPT_CHARS]}"
+        + (f"\n    text{'(excerpt - source continues)' if partial[i] else ''}: "
+           f"{excerpts[i][:VERIFIER_EXCERPT_CHARS]}"
            if excerpts and i < len(excerpts) and excerpts[i] else "")
         for i, s in enumerate(sources))
     sources_block = sources_block[:VERIFIER_TOTAL_CHARS]
@@ -421,8 +524,39 @@ async def verify_grounding(answer: str, sources: list[dict], ep: dict,
     parsed = _parse(text)
     if isinstance(parsed, dict):
         flagged = parsed.get("flagged", []) if isinstance(parsed.get("flagged"), list) else []
-        out = {"flagged": flagged, "ok": bool(parsed.get("ok", not flagged)),
+        # Drop accusations that the source text itself disproves: the verifier
+        # only saw an excerpt, so "not in the provided text" is not the same as
+        # "not in the source".
+        kept, downgraded = [], []
+        for item in flagged:
+            sentence = str(item.get("sentence", "")) if isinstance(item, dict) else ""
+            src_no = str(item.get("source", "")) if isinstance(item, dict) else ""
+            idx = None
+            m = re.search(r"(\d+)", src_no)
+            if m:
+                idx = int(m.group(1)) - 1
+            candidates: list[str] = []
+            if full_texts:
+                if idx is not None and 0 <= idx < len(full_texts):
+                    candidates = [full_texts[idx]]
+                else:
+                    candidates = list(full_texts)
+            if sentence and any(_supported_by_shingle(sentence, t) for t in candidates if t):
+                downgraded.append(item)
+            else:
+                if isinstance(item, dict) and idx is not None and 0 <= idx < len(partial) \
+                        and partial[idx]:
+                    item = {**item, "excerpt_was_partial": True}
+                kept.append(item)
+        # ok reflects what stands after filtering: if every accusation was
+        # dismissed by the source text, the answer is supported as far as this
+        # check can tell, whatever the model originally said.
+        out = {"flagged": kept, "ok": not kept,
                "checked_by": ep.get("provider", ""), "advisory": True}
+        if downgraded:
+            out["downgraded"] = len(downgraded)
+            out["downgrade_reason"] = ("the claim appears verbatim in the source, "
+                                       "outside the excerpt shown to the verifier")
         if flagged:
             out["note"] = ("Another model judged these sentences unsupported by "
                            "the cited text. Verify before repeating them; the "
@@ -1587,12 +1721,55 @@ async def _synthesis_selfcheck() -> None:
         checks.append(("prose verifier reply is reported as unparseable",
                        bool(g.get("error"))))
 
+        # A flag the source text itself disproves must be dropped, not passed on.
+        async def flag_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+            return ('{"flagged":[{"sentence":"The tool returns a citation for every claim",'
+                    '"issue":"not in excerpt","source":"[1]"}],"ok":false}', "stop", "", 1)
+        globals()["_chat"] = flag_chat
+        g2 = await real["verify_grounding"](
+            "x", [{"n": 1, "title": "t", "url": "u"}], one[0], ["short excerpt"],
+            full_texts=["intro. The tool returns a citation for every claim it makes. end."])
+        checks.append(("a flag disproved by the source is dropped", g2.get("flagged") == []))
+        checks.append(("dropped flag is accounted for", g2.get("downgraded") == 1))
+        checks.append(("ok becomes true when nothing stands", g2.get("ok") is True))
+
+        # A flag on a source we truncated must say so, so the caller can discount it.
+        long_src = "x" * (VERIFIER_EXCERPT_CHARS + 500)
+        async def flag2_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+            return ('{"flagged":[{"sentence":"Something entirely absent here",'
+                    '"issue":"absent","source":"[1]"}],"ok":false}', "stop", "", 1)
+        globals()["_chat"] = flag2_chat
+        g3 = await real["verify_grounding"](
+            "x", [{"n": 1, "title": "t", "url": "u"}], one[0], [long_src],
+            full_texts=[long_src])
+        checks.append(("flags on a truncated excerpt are labelled",
+                       bool(g3.get("flagged")) and
+                       g3["flagged"][0].get("excerpt_was_partial") is True))
+
         globals()["_chat"] = ok_chat
         out = await _synthesize("selfcheck-q", {"results": []}, 2, use_cache=False)
         checks.append(("no results: skipped, no crash", bool(out.get("skipped"))))
 
     finally:
         globals().update(real)
+
+    # ── tool annotations: a client uses these to decide about approvals ──
+    listed = await handle_list_tools(None, None)
+    by = {t.name: t.annotations for t in listed.tools}
+    checks.append(("every tool carries annotations",
+                   all(a is not None for a in by.values())))
+    checks.append(("reads are marked read-only",
+                   by["search"].read_only_hint and by["fetch"].read_only_hint))
+    checks.append(("reads are not marked destructive",
+                   not by["search"].destructive_hint and not by["fetch"].destructive_hint))
+    checks.append(("browser interaction is marked destructive",
+                   by["browser_action"].destructive_hint
+                   and by["form_fill_submit"].destructive_hint))
+    checks.append(("download writes without being destructive",
+                   by["download"].read_only_hint is False
+                   and by["download"].destructive_hint is False))
+    checks.append(("local-only tools are not open-world",
+                   by["doctor"].open_world_hint is False))
 
     # ── follow-up selection: pure functions, no model, no network ──
     good = {"available": True, "citations_used": 4, "answer": "It is 3.4 [1].",

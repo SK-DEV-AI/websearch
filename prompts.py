@@ -150,6 +150,11 @@ Flag a sentence when any of these is true:
 
 Do not flag: brevity, tone, hedging, a missing citation on a sentence that is pure framing, or anything you merely find unhelpful.
 
+Some sources are marked "(excerpt - source continues)". For those, absence of a
+claim from the excerpt is NOT evidence that the source lacks it. Flag them only
+when the excerpt contradicts the claim, or when the claim is clearly absent from
+everything you were shown and unsupported by any other source either.
+
 Reply with ONLY this JSON object and nothing else:
 {"flagged":[{"sentence":"<verbatim sentence>","issue":"<why>","source":"[N] or none"}],"ok":true|false}
 
