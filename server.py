@@ -589,8 +589,6 @@ async def verify_grounding(answer: str, sources: list[dict], ep: dict,
     return {"flagged": [], "ok": None, "error": "unparseable",
             "checked_by": ep.get("provider", "")}
 
-GROQ_URL = "https://api.groq.com/openai/v1"
-
 
 def _local_endpoint() -> dict:
     """The in-tool model as an endpoint, or {} when it is not configured."""

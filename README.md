@@ -174,6 +174,7 @@ endpoints, so one call path serves both.
 | Env | Default | Meaning |
 |---|---|---|
 | `WEBSEARCH_SYNTH_PROVIDER` | `local` | `local` (in-tool model first), `groq` (Groq first), `auto` (either, in-tool preferred). Applies to every model call, not just synthesis |
+| `WEBSEARCH_MODEL_FALLBACK` | `on` | `off` = use only the preferred endpoint and report an error if it fails, instead of falling through to the other provider. Set it when the model choice is a requirement (cost, privacy, compliance), not a preference |
 | `WEBSEARCH_MIN_MODEL_TOKENS` | `512` | Floor on the token budget of any model request. Reasoning models spend budget on `reasoning_content` first, so a 64-token label request comes back empty; the floor is what makes small helper calls work |
 | `WEBSEARCH_DEFAULT_DEPTH` | auto | Pins the default `depth`. Auto = 3 when a model lane exists, else 1 |
 | `WEBSEARCH_ENRICH_MAX_PAGES` | `8` | Ceiling on page fetches per search. The count itself is `max(5, depth*2)` |

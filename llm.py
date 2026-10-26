@@ -95,6 +95,11 @@ def endpoints() -> list[dict]:
     the fallback for when the local endpoint is down or absent.
 
     WEBSEARCH_SYNTH_PROVIDER: local (default) | groq | auto
+    WEBSEARCH_MODEL_FALLBACK: on (default) | off
+      off - only the preferred endpoint is tried. "Use the in-tool model" then
+      means exactly that: a failing local endpoint reports an error instead of
+      silently spending a keyed cloud lane. Set this when the model choice is a
+      requirement (cost, privacy, compliance), not a preference.
     """
     prefer = (os.environ.get("WEBSEARCH_SYNTH_PROVIDER") or "local").strip().lower()
     keys = groq_keys()
@@ -104,7 +109,11 @@ def endpoints() -> list[dict]:
             if keys else None)
     local = local_endpoint() or None
     order = [groq, local] if prefer == "groq" else [local, groq]
-    return [e for e in order if e]
+    eps = [e for e in order if e]
+    strict = (os.environ.get("WEBSEARCH_MODEL_FALLBACK") or "on").strip().lower()
+    if strict in ("off", "none", "0", "false", "no"):
+        return eps[:1]
+    return eps
 
 
 def _next_groq_key(offset: int = 0) -> str:
@@ -220,7 +229,8 @@ def _selfcheck() -> None:
 
     # ── endpoint ordering ────────────────────────────────────────
     saved = {k: os.environ.get(k) for k in
-             ("WEBSEARCH_SYNTH_PROVIDER", "GROQ_API_KEYS", "DISTILL_API_KEY")}
+             ("WEBSEARCH_SYNTH_PROVIDER", "GROQ_API_KEYS", "DISTILL_API_KEY",
+              "WEBSEARCH_MODEL_FALLBACK")}
     orig_local = globals()["local_endpoint"]
     try:
         globals()["local_endpoint"] = lambda: {"provider": "local", "base_url": "x",
@@ -237,6 +247,25 @@ def _selfcheck() -> None:
         os.environ["WEBSEARCH_SYNTH_PROVIDER"] = "auto"
         eps = endpoints()
         check("auto without groq yields local only", [e["provider"] for e in eps] == ["local"])
+        # Strict mode is the difference between "prefers the in-tool model" and
+        # "uses only the in-tool model". Both must exist: preference is a good
+        # default, a guarantee is what a compliance question needs.
+        os.environ["GROQ_API_KEYS"] = "g1"
+        globals()["local_endpoint"] = lambda: {"provider": "local", "base_url": "x",
+                                               "model": "m", "api_key": "k",
+                                               "rotate": False}
+        os.environ["WEBSEARCH_MODEL_FALLBACK"] = "off"
+        check("strict mode drops the fallback",
+              [e["provider"] for e in endpoints()] == ["local"])
+        os.environ["WEBSEARCH_SYNTH_PROVIDER"] = "groq"
+        check("strict mode keeps only the preferred lane",
+              [e["provider"] for e in endpoints()] == ["groq"])
+        os.environ["WEBSEARCH_MODEL_FALLBACK"] = "on"
+        check("fallback returns when re-enabled",
+              len(endpoints()) == 2)
+        os.environ.pop("WEBSEARCH_MODEL_FALLBACK", None)
+
+        os.environ.pop("GROQ_API_KEYS", None)
         globals()["local_endpoint"] = lambda: {}
         check("no endpoint yields empty list", endpoints() == [])
 

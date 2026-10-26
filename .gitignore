@@ -3,6 +3,9 @@ __pycache__/
 venv/
 .env
 run
+run.bak*
+run.*.bak
+*.bak
 
 # Packaging build artifacts
 build/
