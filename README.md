@@ -173,7 +173,8 @@ endpoints, so one call path serves both.
 
 | Env | Default | Meaning |
 |---|---|---|
-| `WEBSEARCH_SYNTH_PROVIDER` | `local` | `local` (in-tool model first), `groq` (Groq first), `auto` (either, in-tool preferred) |
+| `WEBSEARCH_SYNTH_PROVIDER` | `local` | `local` (in-tool model first), `groq` (Groq first), `auto` (either, in-tool preferred). Applies to every model call, not just synthesis |
+| `WEBSEARCH_MIN_MODEL_TOKENS` | `512` | Floor on the token budget of any model request. Reasoning models spend budget on `reasoning_content` first, so a 64-token label request comes back empty; the floor is what makes small helper calls work |
 | `WEBSEARCH_DEFAULT_DEPTH` | auto | Pins the default `depth`. Auto = 3 when a model lane exists, else 1 |
 | `WEBSEARCH_ENRICH_MAX_PAGES` | `8` | Ceiling on page fetches per search. The count itself is `max(5, depth*2)` |
 | `WEBSEARCH_SYNTH_TOKENS` | `1200` | Answer budget. On `finish_reason=length` the result says `truncated` |
@@ -185,6 +186,40 @@ endpoints, so one call path serves both.
 `doctor()` reports all of these resolved (`env.defaults`) plus the active prompt
 versions (`env.prompts`), and lists synthesis as its own lane, so "why is there
 no answer?" has an answer instead of a blank field.
+
+### What a search costs in model calls
+
+Search is not a model-free operation, and pretending otherwise made it
+unpredictable. Every call that needs a model goes through `llm.py`, and every
+response says where the tokens went:
+
+```json
+"model_calls": {"rewrite": 1, "classify": 1, "decompose": 1, "synthesis": 1, "verify": 1}
+```
+
+| Call | When | Off switch |
+|---|---|---|
+| `rewrite` | the query depends on chat history (`history` argument) | no history, no call |
+| `classify` | always (biases engine selection, never suppresses search) | `google_ai_only` |
+| `expand` | short query, depth 1 | `query_expand=false` |
+| `decompose` | depth >= 2 | `query_expand=false` |
+| `synthesis` | results exist | `synthesize=false` |
+| `verify` | after synthesis | `synthesize=false` |
+
+Two consequences worth knowing:
+
+- **One endpoint preference, everywhere.** Before this was unified, synthesis
+  used the free in-tool model while rewrite/classify/decompose called Groq
+  directly and returned nothing without a Groq key. The result was a
+  model-written answer produced from an unplanned, literal query. Now the
+  in-tool model plans the search too, and Groq is only the fallback
+  (`WEBSEARCH_SYNTH_PROVIDER`).
+- **Small budgets are a trap.** A reasoning model spends tokens on
+  `reasoning_content` before it emits `content`, so a 64-token "output one
+  label" request returns 200 with an empty message. Callers saw their fallback
+  value and it looked like a real classification. Every request now gets at
+  least `WEBSEARCH_MIN_MODEL_TOKENS` (512), and an unfilled request is reported
+  and logged instead of being mistaken for an answer.
 
 ## What works out of the box, and what is optional
 
@@ -237,7 +272,7 @@ Point your MCP client at `run` (stdio):
 
 | Key | Used for | Required? |
 |---|---|---|
-| `GROQ_API_KEYS` | query rewrite, synthesis, grounding checks | Recommended (search works without, no synthesis) |
+| `GROQ_API_KEYS` | fallback for every model call: rewrite, classify, expand, decompose, synthesis, grounding checks | Optional with an in-tool model (it becomes the fallback); required for those steps if no in-tool model is configured |
 | `TAVILY_KEYS` | Tavily engine lane | Optional |
 | `NV_KEY` | NVIDIA embedding endpoint | Optional |
 
@@ -272,7 +307,8 @@ Heavy extras: `docker build --build-arg EXTRAS="[all]" -t websearch-mcp .`
 - **CDP browser (optional):** bot-walled pages escalate to a Chrome DevTools endpoint (`WEBSEARCH_CDP_URL`, default `127.0.0.1:9222`) when available; without it those pages return a terminal verdict instead of hanging.
 - **Caching:** fetch results cache for 1h (`cache_ttl=0` forces fresh). No database, no state beyond the cache dir.
 - **Safety:** all user-URL fetches are SSRF-validated (private-IP blocking + redirect-hop revalidation + robots.txt gate).
-- **Groq model split:** synthesis + grounding + extract-llm use `openai/gpt-oss-120b`; rewrite/classify/expand/decompose use `openai/gpt-oss-20b` (the previous `llama-3.1-8b-instant` was retired by Groq and now 404s). Constants `GROQ_SMART_MODEL`/`GROQ_CHEAP_MODEL` in config.py.
+- **One model call path (`llm.py`):** synthesis, verification, query rewrite, intent classification, subquery decomposition and query expansion all go through `llm.chat`, so the endpoint preference, retry policy, budget escalation and counting are the same everywhere. On Groq, synthesis + grounding + extract-llm use `openai/gpt-oss-120b` and rewrite/classify/expand/decompose use `openai/gpt-oss-20b` (the previous `llama-3.1-8b-instant` was retired by Groq and now 404s); constants `GROQ_SMART_MODEL`/`GROQ_CHEAP_MODEL` in config.py.
+- **Model calls are reported, not hidden:** every `search` returns `model_calls`, e.g. `{"rewrite":1,"classify":1,"decompose":1,"synthesis":1,"verify":1}`. Search is not free of model use: it plans the query, writes the answer and verifies the answer. `synthesize=false` removes the last two, `query_expand=false` and depth 1 remove decomposition.
 - **Keyless lanes (all advisory-only):** OSV.dev vuln vertical + NVD CVE enrichment; grep.app MCP code search (Sourcegraph backup); Bing Web RSS + Bing News RSS (Brave's scrape is rate-limited, GDELT 429s from some networks); Wikipedia vertical; Jina Reader pre-CDP tier; Wayback CDX-history recovery in enrich(); Common Crawl domain-survey assist in map_site.
 - **Local reranker:** a `gte-reranker-modernbert-base` cross-encoder runs as one shared worker over a Unix socket; either server spawns it on demand and it unloads when idle. Optional — without it results are engine-ranked only.
 - **Optional keys (graceful keyless fallback):** `SE_KEY`/`STACKEXCHANGE_KEY` (10k/day SE), `S2_KEY`/`S2_API_KEY` (dedicated S2 1 RPS).

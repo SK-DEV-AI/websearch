@@ -21,6 +21,7 @@ from config import (MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client,
                     DEPTH_MIN, DEPTH_MAX, GROQ_SMART_MODEL)
 from diversity import cap_per_domain, drop_near_duplicates
 import prompts
+import llm as _llm
 import distill as _distill
 import cache as _cache_mod
 import hashlib
@@ -506,7 +507,8 @@ async def verify_grounding(answer: str, sources: list[dict], ep: dict,
     msgs = [{"role": "system", "content": prompts.verifier_system()},
             {"role": "user", "content": prompts.verifier_user(sources_block, answer)}]
     text, _finish, err, _att = await _chat(ep, msgs, max_tokens=2048,
-                                           attempts=3, timeout=40)
+                                           attempts=3, timeout=40,
+                                           kind="verify")
     if not text:
         return {"flagged": [], "ok": None, "error": err,
                 "checked_by": ep.get("provider", "")}
@@ -537,6 +539,7 @@ async def verify_grounding(answer: str, sources: list[dict], ep: dict,
              'object: {"flagged":[...],"ok":true|false}'},
         ]
         text2, _f2, _e2, _a2 = await _chat(ep, retry_msgs, max_tokens=2048,
+                                           kind="verify",
                                            attempts=2, timeout=40)
         if text2:
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text2.strip())
@@ -591,41 +594,19 @@ GROQ_URL = "https://api.groq.com/openai/v1"
 
 def _local_endpoint() -> dict:
     """The in-tool model as an endpoint, or {} when it is not configured."""
-    try:
-        d = _distill.available()
-    except Exception:  # noqa: BLE001
-        d = {"available": False}
-    if not d.get("available"):
-        return {}
-    r = _distill.resolve()
-    return {"provider": "local", "base_url": r["base_url"],
-            "model": r["model"], "api_key": r["api_key"], "rotate": False}
+    return _llm.local_endpoint()
 
 
 def _endpoints() -> list[dict]:
-    """Candidate endpoints, best first.
+    """Candidate endpoints, best first (see llm.endpoints).
 
-    The configured in-tool model comes first by default: it is free at the point
-    of use, so a keyed cloud lane should not be spent on a task the local model
-    can do. Groq stays as the fallback for when the local endpoint is down, and
-    can be promoted with WEBSEARCH_SYNTH_PROVIDER.
-
-    WEBSEARCH_SYNTH_PROVIDER: local (default) | groq | auto
-      local - the in-tool model first, Groq only if it fails
-      groq  - Groq first, in-tool model only if it fails
-      auto  - whichever is actually configured, in-tool model preferred
+    One implementation now serves synthesis, verification, query decomposition
+    and the gap round. They used to disagree: synthesis preferred the free
+    in-tool model while decomposition used Groq directly and returned nothing at
+    all without a Groq key, so "free-first" was true for the answer and false for
+    what got searched.
     """
-    prefer = (os.environ.get("WEBSEARCH_SYNTH_PROVIDER") or "local").strip().lower()
-    groq = ({"provider": "groq", "base_url": GROQ_URL,
-             "model": GROQ_SMART_MODEL, "api_key": "", "rotate": True}
-            if _groq_keys.has_keys else None)
-    local = _local_endpoint() or None
-
-    if prefer == "groq":
-        order = [groq, local]
-    else:
-        order = [local, groq]
-    return [e for e in order if e]
+    return _llm.endpoints()
 
 
 def _endpoint() -> dict:
@@ -634,60 +615,23 @@ def _endpoint() -> dict:
 
 
 async def _chat(ep: dict, messages: list[dict], *, max_tokens: int,
-                attempts: int = 2, timeout: float = 25) -> tuple[str, str, str, int]:
-    """One OpenAI-compatible completion, with retries. Returns (text, finish, err, attempts).
+                attempts: int = 2, timeout: float = 25,
+                kind: str = "synthesis") -> tuple[str, str, str, int]:
+    """One OpenAI-compatible completion via the shared caller.
 
-    Same failure taxonomy as the distiller: transport errors and 5xx/429 are
-    retried, a non-200 that is not transient is permanent, and a 200 with empty
-    content is reported rather than passed on as an empty answer.
+    Kept as a name because the synthesis path and its selfchecks use it, and
+    because synthesis owns its own retry budget. The transport, fallback,
+    budget-escalation and counting logic lives in llm.py so that every caller
+    behaves the same way.
     """
     if not ep:
         return "", "", "no model endpoint configured", 0
-    url = ep["base_url"].rstrip("/") + "/chat/completions"
-    c = get_http_client()
-    last = "no attempt made"
-    # A reasoning model spends tokens on reasoning_content BEFORE emitting
-    # content, so a budget that is right for the answer alone comes back as a
-    # 200 with empty content and finish_reason=length. Escalate the budget when
-    # that happens instead of reporting a mystery failure.
-    budget = max_tokens
-    ceiling = min(max(max_tokens * 4, 8192), 32_000)
-    for attempt in range(1, max(1, attempts) + 1):
-        key = await _groq_keys.next() if ep.get("rotate") else ep.get("api_key", "")
-        try:
-            resp = await c.post(
-                url,
-                headers={"Authorization": f"Bearer {key}",
-                         "Content-Type": "application/json"},
-                json={"model": ep["model"], "messages": messages,
-                      # 0.0: same sources must yield the same text. Sampling
-                      # variance in a factual answer is invisible noise.
-                      "temperature": 0.0, "max_tokens": budget},
-                timeout=timeout)
-        except Exception as e:  # noqa: BLE001
-            last = f"{type(e).__name__}: {e}"
-            continue
-        if resp.status_code != 200:
-            last = f"HTTP {resp.status_code}: {resp.text[:200]}"
-            if resp.status_code in (429, 500, 502, 503, 504):
-                continue
-            return "", "", last, attempt
-        try:
-            data = resp.json()
-            choice = (data.get("choices") or [{}])[0]
-            text = ((choice.get("message") or {}).get("content") or "").strip()
-            finish = choice.get("finish_reason") or ""
-        except Exception as e:  # noqa: BLE001
-            last = f"unparseable response: {type(e).__name__}: {e}"
-            continue
-        if text:
-            return text, finish, "", attempt
-        last = (f"empty content (finish_reason={finish}, max_tokens={budget})"
-                if finish else f"empty content (max_tokens={budget})")
-        if budget < ceiling:
-            budget = min(budget * 2, ceiling)
-            logger.info("synthesis: empty content, raising max_tokens to %d", budget)
-    return "", "", last, max(1, attempts)
+    text, finish, err, att = await _llm._one(
+        ep, messages, max_tokens=max_tokens, attempts=attempts,
+        timeout=timeout, temperature=0.0, client=get_http_client())
+    if text:
+        _llm._bump(kind)
+    return text, finish, err, att
 
 
 async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
@@ -1147,6 +1091,9 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
 
         if name == "search":
             _t_search = time.perf_counter()
+            # Count the model calls this request makes, so the caller can see
+            # what a search actually cost instead of guessing.
+            _llm.begin()
             query = str(arguments.get("query", "")).strip()
             if not query:
                 return _res({"success": False, "error": "query must not be empty"})
@@ -1257,6 +1204,9 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
             elif r.get("success") and skip_synthesis:
                 r["synthesis"] = {"skipped": "google_ai_only returned its own "
                                              "answer; not synthesising over it"}
+            _calls = _llm.counts()
+            if _calls:
+                r["model_calls"] = _calls
             return _res(r)
         elif name == "fetch":
             url = arguments["url"]
@@ -1675,7 +1625,7 @@ async def _synthesis_selfcheck() -> None:
         {"url": "https://b.com/2", "title": "B2", "snippet": "beta two"},
     ]}
 
-    async def ok_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+    async def ok_chat(ep, messages, *, max_tokens, attempts=2, timeout=25, **kw):
         return "Answer [1].", "stop", "", 1
 
     async def stub_verify(answer, sources, ep, excerpts=None):
@@ -1709,7 +1659,7 @@ async def _synthesis_selfcheck() -> None:
                        out.get("truncated") is False))
         checks.append(("grounding is advisory", out["grounded"].get("advisory") is True))
 
-        async def empty_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+        async def empty_chat(ep, messages, *, max_tokens, attempts=2, timeout=25, **kw):
             return "", "length", "empty content", 2
         globals()["_chat"] = empty_chat
         out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
@@ -1717,7 +1667,7 @@ async def _synthesis_selfcheck() -> None:
         checks.append(("empty completion invents no answer",
                        "answer" not in out or not out.get("answer")))
 
-        async def cut_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+        async def cut_chat(ep, messages, *, max_tokens, attempts=2, timeout=25, **kw):
             return "Half a sentence", "length", "", 1
         globals()["_chat"] = cut_chat
         out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
@@ -1725,7 +1675,7 @@ async def _synthesis_selfcheck() -> None:
         checks.append(("truncation visible in the text",
                        "truncated at" in out.get("answer", "")))
 
-        async def money_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+        async def money_chat(ep, messages, *, max_tokens, attempts=2, timeout=25, **kw):
             return "It costs $9999 [1].", "stop", "", 1
         globals()["_chat"] = money_chat
         out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
@@ -1735,7 +1685,7 @@ async def _synthesis_selfcheck() -> None:
         checks.append(("citation markers are not treated as figures",
                        all(x not in ("1", "2") for x in out.get("figures_unverified", []))))
 
-        async def one_cite_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+        async def one_cite_chat(ep, messages, *, max_tokens, attempts=2, timeout=25, **kw):
             return "Only one view [1].", "stop", "", 1
         globals()["_chat"] = one_cite_chat
         out = await _synthesize("selfcheck-q", fake, 2, use_cache=False)
@@ -1764,7 +1714,7 @@ async def _synthesis_selfcheck() -> None:
 
         # Verifier robustness: a model that answers in prose must not turn into a
         # crash or a silent "ok".
-        async def prose_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+        async def prose_chat(ep, messages, *, max_tokens, attempts=2, timeout=25, **kw):
             return "Looks fine to me, no issues.", "stop", "", 1
         globals()["_chat"] = prose_chat
         # Call the captured original: the module global is stubbed above, so
@@ -1777,7 +1727,7 @@ async def _synthesis_selfcheck() -> None:
                        bool(g.get("error"))))
 
         # A flag the source text itself disproves must be dropped, not passed on.
-        async def flag_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+        async def flag_chat(ep, messages, *, max_tokens, attempts=2, timeout=25, **kw):
             return ('{"flagged":[{"sentence":"The tool returns a citation for every claim",'
                     '"issue":"not in excerpt","source":"[1]"}],"ok":false}', "stop", "", 1)
         globals()["_chat"] = flag_chat
@@ -1790,7 +1740,7 @@ async def _synthesis_selfcheck() -> None:
 
         # A flag on a source we truncated must say so, so the caller can discount it.
         long_src = "x" * (VERIFIER_EXCERPT_CHARS + 500)
-        async def flag2_chat(ep, messages, *, max_tokens, attempts=2, timeout=25):
+        async def flag2_chat(ep, messages, *, max_tokens, attempts=2, timeout=25, **kw):
             return ('{"flagged":[{"sentence":"Something entirely absent here",'
                     '"issue":"absent","source":"[1]"}],"ok":false}', "stop", "", 1)
         globals()["_chat"] = flag2_chat

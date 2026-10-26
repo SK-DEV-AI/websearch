@@ -217,6 +217,26 @@ async def preflight(probe_network: bool = True) -> dict[str, Any]:
         "note": _synth_note(synth_on, _local_ok, _groq_ok, synth_cfg),
     })
 
+    # Query planning used to be Groq-only, which meant a user with only the
+    # in-tool model got no rewriting, no classification and no decomposition --
+    # the server searched the literal query while claiming to be model-backed.
+    # It is now the same lane as synthesis, so report it: a silently degraded
+    # planner looks exactly like a bad search.
+    lanes.append({
+        "id": "query_planning",
+        "name": "Query rewriting, intent classification and decomposition (what gets searched)",
+        "status": "live" if synth_on else "needs_setup",
+        "requires": "the same endpoint as synthesis; used for `rewrite_query`, "
+                    "`classify_need`, `decompose_query` and `expand_query`",
+        "how_to_enable": "any endpoint that enables synthesis also enables query "
+                         "planning; no separate key",
+        "note": ("planned by a model: query is rewritten, classified, and "
+                 "decomposed into subqueries at depth>=2"
+                 if synth_on else
+                 "no endpoint, so the literal query is searched unchanged and "
+                 "depth>=2 falls back to results without subqueries"),
+    })
+
     # --- in-tool model (opt-in distillation) ---
     try:
         from distill import available as _distill_avail

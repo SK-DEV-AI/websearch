@@ -173,39 +173,29 @@ def _detect_tinyfish_type(query: str) -> str:
 
 async def _groq_text(sys_prompt: str, user_prompt: str,
                      temperature: float = 0.2, max_tokens: int = 300,
-                     model: str | None = None) -> str | None:
-    """One Groq call returning trimmed text; None on any failure (caller falls back).
+                     model: str | None = None, kind: str = "helper") -> str | None:
+    """One helper completion returning trimmed text; None on failure.
 
-    model defaults to the cheap lane (openai/gpt-oss-20b); synthesis and
-    grounding use the smart model via explicit model= at their call sites.
+    Routed through llm.chat, so the in-tool model answers first and a keyed lane
+    is only a fallback. These helpers used to talk to Groq directly, which meant
+    that without a Groq key the query was neither rewritten nor decomposed --
+    the free model was used for the answer but never for deciding what to search.
+
+    `model` is accepted for call-site compatibility and only overrides the model
+    name on a cloud endpoint; forcing a Groq model name onto the local endpoint
+    would make every helper call fail.
     """
-    from query_expand import _next_key
-    key = await _next_key()
-    if not key:
+    from llm import chat
+    text, _finish, err, _att = await chat(
+        [{"role": "system", "content": sys_prompt},
+         {"role": "user", "content": user_prompt}],
+        max_tokens=max_tokens, attempts=2, timeout=15,
+        kind=kind, temperature=temperature, model=model)
+    if not text:
+        if err:
+            logging.getLogger("research").debug("helper %s failed: %s", kind, err)
         return None
-    if model is None:
-        from config import GROQ_CHEAP_MODEL
-        model = GROQ_CHEAP_MODEL
-    try:
-        from config import get_http_client
-        c = get_http_client()
-        for attempt in range(3):
-            r = await c.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"model": model,
-                      "messages": [{"role": "system", "content": sys_prompt},
-                                   {"role": "user", "content": user_prompt}],
-                      "temperature": temperature, "max_tokens": max_tokens},
-                timeout=15,
-            )
-            if r.status_code == 200:
-                content = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
-                if content:
-                    return content
-    except Exception as e:
-        logging.getLogger("research").warning(f"_groq_text failed: {type(e).__name__}: {e}")
-    return None
+    return text
 
 
 async def decompose_query(query: str, num_queries: int = 4,
@@ -225,7 +215,8 @@ async def decompose_query(query: str, num_queries: int = 4,
         "Return ONLY a JSON array of objects: [{\"query\": \"...\", \"researchGoal\": \"...\"}].\n"
         "researchGoal = what this query should establish and how it advances the overall answer. No prose, no markdown fences."
     )
-    text = await _groq_text(sys_p, f"Task: {query}", temperature=0.3, max_tokens=512)
+    text = await _groq_text(sys_p, f"Task: {query}", temperature=0.3, max_tokens=512,
+                            kind="decompose")
     if not text:
         return [{"query": query, "researchGoal": ""}]
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
@@ -248,7 +239,8 @@ async def rewrite_query(query: str, history: str = "") -> str:
         "Expand pronouns and references (\"it\", \"the second one\", \"they\") using any supplied context.\n"
         "Output ONLY the rewritten query string, no labels, no quotes, no explanation."
     )
-    text = await _groq_text(sys_p, f"Context: {history}\nQuery: {query}", temperature=0.2, max_tokens=200)
+    text = await _groq_text(sys_p, f"Context: {history}\nQuery: {query}", temperature=0.2,
+                            max_tokens=200, kind="rewrite")
     if text and len(text) <= 400 and not text.lower().startswith(("query:", "here")):
         return text
     return query
@@ -264,7 +256,8 @@ async def classify_need(query: str) -> str:
         '- "general": everything else\n'
         "Output ONLY the label word. Web search is ALWAYS required; do not suggest skipping it."
     )
-    text = await _groq_text(sys_p, f"Query: {query}", temperature=0.1, max_tokens=64)
+    text = await _groq_text(sys_p, f"Query: {query}", temperature=0.1, max_tokens=64,
+                            kind="classify")
     if text and text.lower() in ("academic", "discussion", "general"):
         return text.lower()
     return "general"
