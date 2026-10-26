@@ -8,6 +8,8 @@ run
 build/
 dist/
 *.egg-info/
+# Local build output (.tmp/distNNNN/); never published, never committed
+.tmp/
 
 # Serena local state
 .serena/
