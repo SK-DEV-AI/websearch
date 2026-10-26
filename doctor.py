@@ -99,8 +99,21 @@ def _synth_note(synth_on: bool, local_ok: bool, groq_ok: bool, cfg: dict) -> str
         return ("not configured - search returns ranked results, and the "
                 "response carries synthesis.skipped explaining why there is no "
                 "written answer")
-    writer = ("the in-tool model" + (" with Groq as fallback" if groq_ok else "")
-              if local_ok else "Groq")
+    # Say what will actually happen, including the case where a fallback exists
+    # in config but was switched off on purpose. A report that says "with Groq as
+    # fallback" while the fallback is disabled is the kind of small lie that
+    # makes every other line in the report suspect.
+    strict = (os.environ.get("WEBSEARCH_MODEL_FALLBACK") or "on").strip().lower() \
+        in ("off", "none", "0", "false", "no")
+    if local_ok:
+        if groq_ok and not strict:
+            writer = "the in-tool model, with Groq as fallback"
+        elif groq_ok:
+            writer = "the in-tool model only (Groq configured but fallback disabled)"
+        else:
+            writer = "the in-tool model only"
+    else:
+        writer = "Groq only" if strict or groq_ok else "no endpoint"
     return (f"writing with {writer}; prompt {prompts.SYNTHESIS_VERSION}, "
             f"temperature 0, {cfg['max_tokens']} tokens, at most "
             f"{cfg['max_sources']} sources with {cfg['domain_cap']} per domain")
