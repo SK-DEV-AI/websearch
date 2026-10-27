@@ -21,5 +21,6 @@ export RERANKER_MODEL="Alibaba-NLP/gte-reranker-modernbert-base"
 # export WEBSEARCH_QUEUE_WAIT=20       # then the call is answered "busy" (retryable)
 # export WEBSEARCH_RERANK_TIMEOUT=60
 # export WEBSEARCH_RERANK_COOLDOWN=20
+# export WEBSEARCH_RERANK_QUEUE_WAIT=15
 # export WEBSEARCH_OCR_MIN_FREE_MB=900
 exec /home/sk/.local/share/venvs/mcp/bin/python3 "$(dirname "$0")/server.py" "$@"

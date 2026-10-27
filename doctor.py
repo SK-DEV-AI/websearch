@@ -37,6 +37,7 @@ import ops
 from pdf_extract import _OCR_IDLE_UNLOAD, _OCR_MIN_FREE_MB
 from reranker import _READ_TIMEOUT as _RERANK_TIMEOUT
 from reranker import _TIMEOUT_COOLDOWN as _RERANK_COOLDOWN
+from reranker import _QUEUE_WAIT as _RERANK_QUEUE_WAIT
 
 # Env vars that upgrade existing lanes. Names only, never values.
 _OPTIONAL_KEYS = {
@@ -380,6 +381,7 @@ async def preflight(probe_network: bool = True) -> dict[str, Any]:
                 "slow_call_s": ops.SLOW_CALL_S,
                 "rerank_timeout_s": _RERANK_TIMEOUT,
                 "rerank_cooldown_s": _RERANK_COOLDOWN,
+                "rerank_queue_wait_s": _RERANK_QUEUE_WAIT,
                 "ocr_idle_unload_s": _OCR_IDLE_UNLOAD,
                 "ocr_min_free_mb": _OCR_MIN_FREE_MB,
             },

@@ -148,7 +148,7 @@ async def run_tool(name: str, factory) -> dict | None:
     t0 = time.monotonic()
     sem = _semaphore()
     if sem is None:
-        return await _call(name, factory(), t0)
+        return await _call(name, factory, t0)
     waited = 0.0
     try:
         if QUEUE_WAIT > 0:
@@ -160,7 +160,7 @@ async def run_tool(name: str, factory) -> dict | None:
     waited = time.monotonic() - t0
     _in_flight += 1
     try:
-        return await _call(name, factory(), t0)
+        return await _call(name, factory, t0)
     finally:
         _in_flight -= 1
         sem.release()
@@ -168,11 +168,28 @@ async def run_tool(name: str, factory) -> dict | None:
             logger.info("%s waited %.1fs for a free slot", name, waited)
 
 
-async def _call(name: str, coro, t0: float) -> dict | None:
+async def _call(name: str, factory, t0: float) -> dict | None:
+    """Run ``factory()`` with the budget left after admission, not a full one.
+
+    The deadline must cover the whole call as the client sees it, so queue wait
+    counts against it. Charging the full deadline after a queue wait let one
+    call run QUEUE_WAIT + DEADLINE (20 + 240 = 260s, measured under 12-lane
+    load) and approach the 300s client timeout this module exists to avoid.
+    ``factory`` is called here rather than by the caller so a call that has no
+    budget left never builds a coroutine it would then abandon unawaited.
+    """
     if DEADLINE <= 0:
-        return await coro
+        return await factory()
+    budget = DEADLINE - (time.monotonic() - t0)
+    if budget <= 0:
+        elapsed = time.monotonic() - t0
+        payload = deadline_payload(name, elapsed, partial())
+        payload["queue_wait_exhausted"] = True
+        logger.warning("DEADLINE %s before it started after %.0fs (partial=%s)",
+                       name, elapsed, bool(payload.get("partial")))
+        return payload
     try:
-        return await asyncio.wait_for(coro, timeout=DEADLINE)
+        return await asyncio.wait_for(factory(), timeout=budget)
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
         payload = deadline_payload(name, elapsed, partial())

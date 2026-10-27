@@ -6,6 +6,7 @@ no double model-load and no mutual kills — whoever spawns owns _PROC; a
 borrower (connected to the sibling's worker) never kills or unlinks."""
 
 import asyncio
+import contextlib
 import contextvars
 import fcntl
 import json
@@ -52,6 +53,37 @@ _last_spawn_fail = 0.0
 _READ_TIMEOUT = float(os.environ.get("WEBSEARCH_RERANK_TIMEOUT", "60") or 60)
 _TIMEOUT_COOLDOWN = float(os.environ.get("WEBSEARCH_RERANK_COOLDOWN", "20") or 0)
 _last_timeout = 0.0
+
+# How long a call may wait for the single rerank worker before giving up and
+# answering with base ordering (2026-10-27, 12-lane burst). One socket, one
+# request at a time: with N concurrent searches the Nth waits for N-1
+# completions, and that queue is what pushed one search to 253 s. A caller
+# that cannot get the worker quickly is better off with slightly worse
+# ordering than with a 4-minute search.
+_QUEUE_WAIT = float(os.environ.get("WEBSEARCH_RERANK_QUEUE_WAIT", "15") or 0)
+
+
+@contextlib.asynccontextmanager
+async def _worker_slot():
+    """Hold the single rerank worker, but never wait longer than _QUEUE_WAIT.
+
+    Yields True when the worker is ours, False when the queue was too long.
+    """
+    acquired = False
+    try:
+        if _QUEUE_WAIT > 0:
+            await asyncio.wait_for(_LOCK.acquire(), timeout=_QUEUE_WAIT)
+        else:
+            await _LOCK.acquire()
+        acquired = True
+    except asyncio.TimeoutError:
+        pass
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            _LOCK.release()
+
 
 # Per-request outcome of the last rerank() call (contextvar: concurrent
 # requests must not read each other's verdict).
@@ -214,7 +246,12 @@ async def rerank(query: str, passages: list[dict], top_k: int = 20) -> list[dict
         # every other agent wait the full timeout behind it.
         _mark("degraded", "cooldown after timeout")
         return fallback_sort(passages, top_k)
-    async with _LOCK:
+    async with _worker_slot() as got_worker:
+        if not got_worker:
+            logger.info("reranker: worker busy for >%.0fs, using base order",
+                        _QUEUE_WAIT)
+            _mark("degraded", f"queued behind rerank >{_QUEUE_WAIT:.0f}s")
+            return fallback_sort(passages, top_k)
         global _READER, _WRITER, _PROC
         if not await _is_healthy() and not await _ensure_worker():
             _mark("degraded", "worker unavailable")

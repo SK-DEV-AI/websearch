@@ -171,6 +171,7 @@ its own work instead of hoping the client waits:
 | `WEBSEARCH_SLOW_CALL_S` | `30` | A successful call at or above this logs `SLOW <tool> took Ns` to stderr |
 | `WEBSEARCH_RERANK_TIMEOUT` | `60` | Reranker read timeout. On timeout the call degrades to engine ranking (see below) |
 | `WEBSEARCH_RERANK_COOLDOWN` | `20` | After a reranker timeout, skip it for this long instead of paying the timeout again |
+| `WEBSEARCH_RERANK_QUEUE_WAIT` | `15` | Longest a call waits behind other calls for the single rerank worker before answering with base order. `0` = wait without bound |
 | `WEBSEARCH_OCR_IDLE_UNLOAD` | `90` | Idle seconds before the cached OCR converter (and its ~1 GB of models) is dropped |
 | `WEBSEARCH_OCR_MIN_FREE_MB` | `900` | Refuse OCR below this much available memory (`ocr_skipped: "low_memory"`) instead of swap-thrashing the whole server |
 | `WEBSEARCH_DDG_TIMEOUT` | `0` | Optional per-call timeout for the blocking `ddgs` network work; `0` = no extra bound |
@@ -200,6 +201,13 @@ field only when ranking was not the requested path (worker unavailable, timeout,
 cooldown, bad reply), plus the ordering that was used instead. On this box the
 reranker's own p90 was 56 s, so a 60 s timeout trades ~10 % of reranked calls
 for never stalling a swarm call for the full timeout.
+
+The worker is one socket serving one request at a time, so a burst queues: with
+8 calls in flight the last one waits for seven completions. Measured on 12 lanes
+that queue alone pushed a search to 253 s, which is why the wait for the worker
+is now capped (`WEBSEARCH_RERANK_QUEUE_WAIT`, 15 s). A call that cannot get the
+worker in time answers with base order and says so, instead of turning a 4 s
+ranking step into a 4-minute search.
 
 OCR (scanned PDFs) runs on a dedicated single-slot pool with a cached converter
 and a memory guard, and reports `ocr_ms`. `asyncio.wait_for` cannot cancel a

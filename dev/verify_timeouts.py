@@ -13,6 +13,10 @@ Checks, in order:
 4. Live search: depth=1 search completes under the deadline and reports the
    reranker verdict it actually used.
 5. Legacy env: WEBSEARCH_TOOL_DEADLINE=0 disables the deadline entirely.
+6. Budget: a call that waited for a slot gets the remaining deadline, not a
+   fresh full one (QUEUE_WAIT + DEADLINE stacked to 260 s under load).
+7. Rerank queue: a call that cannot get the single rerank worker quickly
+   degrades to base ordering and releases the worker.
 """
 
 from __future__ import annotations
@@ -122,8 +126,57 @@ async def main() -> int:
     check("deadline=0 still runs tools", "connectivity" in r or r.get("success") is True)
     _ops.DEADLINE = real_deadline
 
+    # 6 ── queue wait is charged against the deadline ----------------------
+    # A call that waits for a slot must not then get a fresh full deadline:
+    # QUEUE_WAIT + DEADLINE stacked to 260s under load, near the 300s client
+    # timeout. Budget is now measured from arrival.
+    _ops.MAX_CONCURRENT = 1
+    _ops.QUEUE_WAIT = 10.0
+    _ops.DEADLINE = 2.0
+    slot = _ops._semaphore()
+    holder = asyncio.create_task(slot.acquire())
+    await holder                       # occupy the only slot
+    started = time.monotonic()
+    release = asyncio.create_task(_release_after(slot, 1.2))
+    r = payload(await srv.handle_call_tool(None, Params(
+        "search", {"query": "x", "depth": 1, "count": 1, "synthesize": False})))
+    total = time.monotonic() - started
+    await release
+    slot.release()
+    check("queue wait counts against the deadline", total < 2.6,
+          f"returned at {total:.1f}s with DEADLINE=2.0 and 1.2s queue wait")
+    check("starved call answers with a deadline payload, not a hang",
+          r.get("deadline_exceeded") is True or r.get("busy") is True
+          or r.get("success") is True, json.dumps({k: r.get(k) for k in
+          ("deadline_exceeded", "busy", "success")}))
+    _ops.MAX_CONCURRENT = 8
+    _ops.QUEUE_WAIT = 20.0
+    _ops.DEADLINE = real_deadline
+
+    # 7 ── rerank queue cap ------------------------------------------------
+    # One socket serves one request, so a burst queues. Unbounded, the queue
+    # alone pushed a 12-lane search to 253s; the worker wait is now capped and
+    # the call answers with base ordering instead.
+    import reranker as _rr
+    real_rr_wait = _rr._QUEUE_WAIT
+    _rr._QUEUE_WAIT = 0.3
+    async with _rr._worker_slot() as first:
+        async with _rr._worker_slot() as second:
+            pass
+    _rr._QUEUE_WAIT = real_rr_wait
+    check("rerank worker slot is granted when free", first is True)
+    check("a long rerank queue degrades instead of waiting", second is False)
+    check("rerank worker slot is released after the capped wait",
+          _rr._LOCK.locked() is False)
+
     print(f"\nverify_timeouts: {len(PASS)}/{len(PASS) + len(FAIL)} PASS")
     return 0 if not FAIL else 1
+
+
+async def _release_after(sem, delay: float) -> None:
+    """Free a held slot after ``delay`` so a waiter gets a partial budget."""
+    await asyncio.sleep(delay)
+    sem.release()
 
 
 if __name__ == "__main__":
