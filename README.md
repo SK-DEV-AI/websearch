@@ -155,6 +155,58 @@ destructive, `browser_session` changes local browser state only, and
 `browser_action` / `form_fill_submit` are marked destructive because a click or a
 form submit can have an effect that cannot be undone from here.
 
+### When a call takes too long (deadline, admission, partials)
+
+MCP clients cut a tool call at their own timeout (jcode: 300 s) and report a
+bare `Request timeout after 300s` with no payload. Measured over one day on a
+single busy server: 314 calls, median 2.7 s, p90 123 s, max 225 s, and 33 hard
+client timeouts — the tail is the problem, not the median. So the server bounds
+its own work instead of hoping the client waits:
+
+| Env | Default | Meaning |
+|---|---|---|
+| `WEBSEARCH_TOOL_DEADLINE` | `240` | Seconds one tool call may run. Keep it under the client timeout. `0` disables the bound |
+| `WEBSEARCH_MAX_CONCURRENT` | `8` | Simultaneous tool calls. Extra callers wait, then get `busy`. `0` = unlimited |
+| `WEBSEARCH_QUEUE_WAIT` | `20` | Seconds a call may wait for a free slot before being answered `busy` |
+| `WEBSEARCH_SLOW_CALL_S` | `30` | A successful call at or above this logs `SLOW <tool> took Ns` to stderr |
+| `WEBSEARCH_RERANK_TIMEOUT` | `60` | Reranker read timeout. On timeout the call degrades to engine ranking (see below) |
+| `WEBSEARCH_RERANK_COOLDOWN` | `20` | After a reranker timeout, skip it for this long instead of paying the timeout again |
+| `WEBSEARCH_OCR_IDLE_UNLOAD` | `90` | Idle seconds before the cached OCR converter (and its ~1 GB of models) is dropped |
+| `WEBSEARCH_OCR_MIN_FREE_MB` | `900` | Refuse OCR below this much available memory (`ocr_skipped: "low_memory"`) instead of swap-thrashing the whole server |
+| `WEBSEARCH_DDG_TIMEOUT` | `0` | Optional per-call timeout for the blocking `ddgs` network work; `0` = no extra bound |
+
+Three response shapes exist because of this, and each is deliberate:
+
+```json
+{"success": false, "deadline_exceeded": true, "deadline_s": 240,
+ "elapsed_s": 241.3, "retryable": true,
+ "partial": {"success": true, "results": [...]},
+ "partial_note": "Partial result captured before the deadline: ..."}
+```
+
+* `partial` — the stages that finished are still returned, because a cited
+  source list is worth more than an empty retry. `search` publishes its
+  snapshot as soon as ranking is done.
+* `deadline_exceeded` — the call was cut by us, not by the client, and it says
+  which knob to raise. Narrow the request (`depth`, `count`,
+  `synthesize=false`) before raising the deadline: the deadline protects the
+  server, it does not make the work cheaper.
+* `busy` + `retryable` — admission was full for `WEBSEARCH_QUEUE_WAIT`.
+  Retrying shortly is correct; queueing behind an unbounded swarm is what turns
+  one slow call into many timed-out ones.
+
+Reranking degrades honestly rather than failing: `search` returns a `reranker`
+field only when ranking was not the requested path (worker unavailable, timeout,
+cooldown, bad reply), plus the ordering that was used instead. On this box the
+reranker's own p90 was 56 s, so a 60 s timeout trades ~10 % of reranked calls
+for never stalling a swarm call for the full timeout.
+
+OCR (scanned PDFs) runs on a dedicated single-slot pool with a cached converter
+and a memory guard, and reports `ocr_ms`. `asyncio.wait_for` cannot cancel a
+thread, so a per-call `to_thread` build kept loading docling models after the
+request was abandoned; one cached converter plus one slot removes both the
+model reload and the pile-up.
+
 ### Why the answer is prose, not JSON
 
 The tool envelope is already structured: `answer`, `sources[]`, `citations_used`,

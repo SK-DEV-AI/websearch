@@ -33,6 +33,10 @@ import httpx
 from config import (HELIUM_CDP, default_depth, synthesis_settings,
                     DEPTH_MIN, DEPTH_MAX)
 import prompts
+import ops
+from pdf_extract import _OCR_IDLE_UNLOAD, _OCR_MIN_FREE_MB
+from reranker import _READ_TIMEOUT as _RERANK_TIMEOUT
+from reranker import _TIMEOUT_COOLDOWN as _RERANK_COOLDOWN
 
 # Env vars that upgrade existing lanes. Names only, never values.
 _OPTIONAL_KEYS = {
@@ -365,6 +369,19 @@ async def preflight(probe_network: bool = True) -> dict[str, Any]:
                 "depth_source": _depth_source,
                 "depth_range": [DEPTH_MIN, DEPTH_MAX],
                 "synthesis": synth_settings,
+            },
+            # The bounds that decide whether a slow call returns a partial
+            # result or a client-side timeout. Reported because "it timed out"
+            # is unanswerable without them.
+            "limits": {
+                "tool_deadline_s": ops.DEADLINE,
+                "max_concurrent": ops.MAX_CONCURRENT,
+                "queue_wait_s": ops.QUEUE_WAIT,
+                "slow_call_s": ops.SLOW_CALL_S,
+                "rerank_timeout_s": _RERANK_TIMEOUT,
+                "rerank_cooldown_s": _RERANK_COOLDOWN,
+                "ocr_idle_unload_s": _OCR_IDLE_UNLOAD,
+                "ocr_min_free_mb": _OCR_MIN_FREE_MB,
             },
             "prompts": {
                 "synthesis": prompts.SYNTHESIS_VERSION,

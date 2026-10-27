@@ -8,11 +8,13 @@ Note: docling 2.x removed export_to_tagged_pdf, so "tagged-pdf" is not offered.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -31,6 +33,71 @@ _OCR_MAX_PAGES = 25  # per-document OCR page cap; giant scans must not eat the b
 _PUA_FLOOR = 0.3  # PUA ratio above which a glyph stream is garbage (broken ToUnicode)
 _FORMATS = ("markdown", "json", "html")
 _EXT = {"markdown": "md", "json": "json", "html": "html"}
+
+# OCR resources (2026-10-27 incident). Three separate problems, one cause: the
+# docling stack (RT-DETR layout + RapidOCR) used to be built per call on the
+# event loop's shared default executor, so (a) every OCR reloaded the models,
+# (b) a long OCR occupied a thread every other tool queues behind, and (c) the
+# ~1 GB of models stayed resident with their threads. Now: one cached
+# converter, a dedicated single-slot executor, and an idle unload.
+_OCR_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr")
+_OCR_CONVERTER: Any = None
+_OCR_LAST_USE = 0.0
+_OCR_IDLE_UNLOAD = float(os.environ.get("WEBSEARCH_OCR_IDLE_UNLOAD", "90") or 0)
+_OCR_MIN_FREE_MB = int(os.environ.get("WEBSEARCH_OCR_MIN_FREE_MB", "900") or 0)
+_CONVERTER_LOCK = asyncio.Lock()
+
+
+def _mem_available_mb() -> int:
+    """MemAvailable from /proc/meminfo, or 0 when it cannot be read."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _drop_converter() -> None:
+    """Release the docling models so their RAM returns to the OS."""
+    global _OCR_CONVERTER
+    if _OCR_CONVERTER is None:
+        return
+    _OCR_CONVERTER = None
+    gc.collect()
+
+
+async def _ocr_converter() -> Any:
+    """Build the converter once, on the dedicated OCR thread."""
+    global _OCR_CONVERTER, _OCR_LAST_USE
+    async with _CONVERTER_LOCK:
+        if _OCR_CONVERTER is None:
+            loop = asyncio.get_running_loop()
+            _OCR_CONVERTER = await loop.run_in_executor(_OCR_EXEC, _docling_build)
+        _OCR_LAST_USE = time.monotonic()
+        return _OCR_CONVERTER
+
+
+def _schedule_ocr_unload() -> None:
+    """Drop the models once OCR has been idle for a while."""
+    if _OCR_IDLE_UNLOAD <= 0:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _later() -> None:
+        await asyncio.sleep(_OCR_IDLE_UNLOAD)
+        if time.monotonic() - _OCR_LAST_USE >= _OCR_IDLE_UNLOAD:
+            _drop_converter()
+
+    try:
+        loop.create_task(_later())
+    except RuntimeError:
+        pass
 
 
 async def _download_pdf(url: str, dst: Path) -> Path:
@@ -220,6 +287,7 @@ async def extract_pdf(
             path = Path(fp)
             t0 = time.monotonic()
             method = "pymupdf"
+            ocr_ms = 0
             try:
                 text, page_count = _pymupdf_extract(str(path), pages, password, "markdown")
                 # No usable text layer (empty, PUA-garbage) or forced OCR:
@@ -227,19 +295,46 @@ async def extract_pdf(
                 # broken encoding (garbage), not text, so it must be OCR'd.
                 if force_ocr or len(text) < 30 or _pua_ratio(text) > _PUA_FLOOR:
                     method = "docling-ocr"
+                    # Memory guard (2026-10-27 incident): docling brings RT-DETR
+                    # layout + RapidOCR into THIS process. On a box with ~1 GB
+                    # available and 5 GB already in zram swap, starting that
+                    # load turns every other request in the server into a
+                    # swap-thrash victim — searches that normally take 3 s hit
+                    # the client's 300 s timeout. Refuse and say why.
+                    free_mb = _mem_available_mb()
+                    if _OCR_MIN_FREE_MB > 0 and 0 < free_mb < _OCR_MIN_FREE_MB:
+                        return {"success": False,
+                                "ocr_skipped": "low_memory",
+                                "free_mb": free_mb,
+                                "need_mb": _OCR_MIN_FREE_MB,
+                                "error": (f"OCR skipped: {free_mb} MB RAM available, "
+                                          f"below WEBSEARCH_OCR_MIN_FREE_MB="
+                                          f"{_OCR_MIN_FREE_MB}. OCR loads ~1 GB of "
+                                          f"models into this process and would "
+                                          f"stall every other request. Free memory "
+                                          f"and retry, or set "
+                                          f"WEBSEARCH_OCR_MIN_FREE_MB=0 to force it.")}
                     # Init (import + converter build) has its own guard: ONNX
                     # Runtime C++ constructors can hang, and init failure should
-                    # not burn the whole OCR budget (donsetch ocr.rs).
+                    # not burn the whole OCR budget (donsetch ocr.rs). The
+                    # converter is cached and the work runs on a dedicated
+                    # single-slot executor: a long OCR must never occupy the
+                    # event loop's default pool, which every other tool shares.
+                    t_ocr = time.monotonic()
                     try:
                         conv = await asyncio.wait_for(
-                            asyncio.to_thread(_docling_build), timeout=_OCR_INIT_BUDGET)
+                            _ocr_converter(), timeout=_OCR_INIT_BUDGET)
                     except asyncio.TimeoutError:
                         return {"success": False,
                                 "error": f"OCR engine init timed out after {_OCR_INIT_BUDGET}s: {path.name}"}
+                    loop = asyncio.get_running_loop()
                     content = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _docling_extract, conv, str(path), fmts, _OCR_MAX_PAGES),
+                        loop.run_in_executor(
+                            _OCR_EXEC, _docling_extract, conv, str(path), fmts,
+                            _OCR_MAX_PAGES),
                         timeout=_OCR_PAGE_BUDGET - _OCR_INIT_BUDGET)
+                    ocr_ms = int((time.monotonic() - t_ocr) * 1000)
+                    _schedule_ocr_unload()
                 elif len(fmts) == 1:
                     if fmts[0] != "markdown":
                         text = (await asyncio.to_thread(
@@ -274,6 +369,10 @@ async def extract_pdf(
                 "truncated": truncated,
                 "truncated_at_chars": 50000 if truncated else 0,
             }
+            if method == "docling-ocr" and ocr_ms:
+                # How long the OCR actually took, so a slow scan is visible in
+                # the payload instead of only in the client's timeout.
+                r["ocr_ms"] = ocr_ms
 
         if output_dir.strip():
             out = Path(output_dir.strip())

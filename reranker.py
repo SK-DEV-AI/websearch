@@ -6,12 +6,14 @@ no double model-load and no mutual kills — whoever spawns owns _PROC; a
 borrower (connected to the sibling's worker) never kills or unlinks."""
 
 import asyncio
+import contextvars
 import fcntl
 import json
 import logging
 import os
 import signal
 import subprocess
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,32 @@ _WRITER = None
 _SPAWN_COOLDOWN = 120  # s: after a failed spawn (e.g. OOM-killed model load),
 # don't retry on every search — each attempt loads ~500MB into RAM before dying
 _last_spawn_fail = 0.0
+
+# Read timeout and cooldown (2026-10-27 incident). Measured worker latency over
+# one day: median 4 s, p90 56 s, max 119 s — under CPU contention (docling OCR
+# in-process, swarm agents, 1GB free RAM) a single rerank can eat 120 s and
+# blow a search's whole deadline on its own. A timeout now degrades to base
+# ordering instead of stalling, and repeated timeouts skip the worker for a
+# short cooldown so the next agent in the burst does not pay the same wait.
+_READ_TIMEOUT = float(os.environ.get("WEBSEARCH_RERANK_TIMEOUT", "60") or 60)
+_TIMEOUT_COOLDOWN = float(os.environ.get("WEBSEARCH_RERANK_COOLDOWN", "20") or 0)
+_last_timeout = 0.0
+
+# Per-request outcome of the last rerank() call (contextvar: concurrent
+# requests must not read each other's verdict).
+_STATUS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "rerank_status", default=None)
+
+
+def status() -> dict:
+    """How this request's most recent rerank() call ended."""
+    return dict(_STATUS.get() or {"status": "ok"})
+
+
+def _mark(state: str, reason: str = "") -> None:
+    _STATUS.set({"status": state, "reason": reason,
+                 "timeout_s": _READ_TIMEOUT} if reason else
+                {"status": state, "timeout_s": _READ_TIMEOUT})
 
 
 async def _close_connection():
@@ -175,12 +203,21 @@ def fallback_sort(passages: list[dict], top_k: int) -> list[dict]:
 async def rerank(query: str, passages: list[dict], top_k: int = 20) -> list[dict]:
     if not passages:
         return []
+    global _last_timeout
     if killswitch_active():
         await _close_connection()  # free VRAM if worker still running
+        _mark("disabled", "killswitch")
+        return fallback_sort(passages, top_k)
+    if _TIMEOUT_COOLDOWN > 0 and _last_timeout \
+            and (time.monotonic() - _last_timeout) < _TIMEOUT_COOLDOWN:
+        # A recent read timed out: the worker is wedged or starved. Do not make
+        # every other agent wait the full timeout behind it.
+        _mark("degraded", "cooldown after timeout")
         return fallback_sort(passages, top_k)
     async with _LOCK:
         global _READER, _WRITER, _PROC
         if not await _is_healthy() and not await _ensure_worker():
+            _mark("degraded", "worker unavailable")
             return fallback_sort(passages, top_k)
         normalized = []
         for p in passages:
@@ -195,24 +232,31 @@ async def rerank(query: str, passages: list[dict], top_k: int = 20) -> list[dict
         except (BrokenPipeError, OSError, asyncio.TimeoutError) as e:
             logger.warning(f"reranker: write failed: {e}")
             await _close_connection()
+            _mark("degraded", "write failed")
             return fallback_sort(passages, top_k)
         try:
-            r = await asyncio.wait_for(_READER.readuntil(b"\n"), timeout=120)
+            r = await asyncio.wait_for(_READER.readuntil(b"\n"), timeout=_READ_TIMEOUT)
         except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError) as e:
             logger.warning(f"reranker: read failed: {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                _last_timeout = time.monotonic()
             await _close_connection()
+            _mark("degraded", f"read failed: {type(e).__name__}")
             return fallback_sort(passages, top_k)
         try:
             result = json.loads(r)
         except json.JSONDecodeError:
             logger.warning("reranker: invalid JSON response from worker")
             await _close_connection()
+            _mark("degraded", "invalid JSON from worker")
             return fallback_sort(passages, top_k)
         if result.get("error"):
             logger.warning(f"reranker error: {result['error']}")
+            _mark("degraded", str(result["error"])[:120])
             return fallback_sort(passages, top_k)
         scored = result.get("scores", [])
         for s in scored:
             if "score" in s:
                 s["_rerank"] = s.pop("score")
+        _mark("ok")
         return scored

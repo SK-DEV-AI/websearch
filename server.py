@@ -28,6 +28,7 @@ import hashlib
 import time
 from cdp_actions import browser_action as _browser_action
 from errors import annotate as _err_annotate, classify_exception as _err_exc
+import ops as _ops
 from ghost_state import CHALLENGE, CONTENT_OK, classify, ghost
 from fetch import fetch_url, scrapling_stealthy_fetch, _is_junk_title
 from pdf_extract import extract_pdf
@@ -944,7 +945,7 @@ def _merge_round(base: dict, extra: dict) -> int:
     return added
 
 
-async def handle_call_tool(ctx, params) -> CallToolResult:
+async def _dispatch_tool(ctx, params) -> CallToolResult:
     name = params.name
     arguments = params.arguments or {}
     if not isinstance(arguments, dict):
@@ -1124,6 +1125,9 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 cdp_url=HELIUM_CDP,
                 depth=depth,
                 history=str(arguments.get("history", "")))
+            # Publish what we have: if this call hits the server deadline, the
+            # caller gets its sources instead of an empty error.
+            _ops.hold(r)
             if r.get("success") and depth >= 2 and r.get("results"):
                 try:
                     fetched = await enrich(r["results"], query, depth=depth,
@@ -1145,6 +1149,7 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
                 if not (x.get("content") or "").strip()]
             if unreadable:
                 r["unreadable"] = unreadable
+            _ops.hold(r)
             # Skip Groq synthesis when GAI already returned a full answer
             skip_synthesis = google_ai_only and r.get("ai_answer")
             if r.get("success") and bool(arguments.get("synthesize", True)) \
@@ -1582,6 +1587,32 @@ async def handle_call_tool(ctx, params) -> CallToolResult:
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": f"{type(e).__name__}: {e}", "errorKind": _err_exc(e)})))], is_error=True)
 
 
+async def handle_call_tool(ctx, params) -> CallToolResult:
+    """Admission control, deadline, and slow-call logging around the dispatcher.
+
+    The MCP host cuts a call at 300 s and reports a bare timeout with no data.
+    ops.run_tool keeps one runaway request from consuming that budget silently:
+    a call that cannot start within WEBSEARCH_QUEUE_WAIT is answered "busy",
+    and a call that runs past WEBSEARCH_TOOL_DEADLINE gets a structured error
+    plus whatever partial result the tool already published.
+    """
+    name = getattr(params, "name", "") or ""
+    t0 = time.perf_counter()
+
+    async def _run() -> CallToolResult:
+        return await _dispatch_tool(ctx, params)
+
+    out = await _ops.run_tool(name, _run)
+    if isinstance(out, CallToolResult):
+        _ops.note_slow(name, time.perf_counter() - t0)
+        return out
+    payload = out if isinstance(out, dict) else {"success": False, "error": str(out)}
+    return CallToolResult(
+        content=[TextContent(type="text",
+                             text=json.dumps(_err_annotate(payload), default=str))],
+        is_error=not payload.get("success", False))
+
+
 server = Server("websearch", instructions=INSTRUCTIONS,
     on_list_tools=handle_list_tools,
     on_call_tool=handle_call_tool,
@@ -1604,6 +1635,55 @@ async def _parent_watchdog():
             # parent died / reparented to init — opencode closed, exit with it
             import sys
             sys.exit(0)
+
+
+def _limits_selfcheck() -> None:
+    """Checks for the 2026-10-27 timeout fixes: deadline, admission, rerank
+    degradation, OCR guard. Plain function: it drives its own event loops."""
+    import reranker as _rer
+    import pdf_extract as _pdfx
+    import search_ddg as _ddg
+
+    checks: list[tuple[str, bool]] = []
+    checks.append(("tool deadline is below the 300s client timeout",
+                   _ops.DEADLINE == 0 or _ops.DEADLINE < 300))
+    checks.append(("admission limit defaults sane",
+                   _ops.MAX_CONCURRENT == 0 or 1 <= _ops.MAX_CONCURRENT <= 64))
+    checks.append(("busy payload says retryable", _ops.busy_payload("search", 20.0)["retryable"]))
+    d = _ops.deadline_payload("search", 240.0, {"results": [1]})
+    checks.append(("deadline payload carries the partial", d["partial"] == {"results": [1]}))
+    checks.append(("deadline payload names the knob", "WEBSEARCH_TOOL_DEADLINE" in d["error"]))
+
+    checks.append(("rerank status defaults to ok", _rer.status()["status"] == "ok"))
+
+    async def _isolated() -> tuple[dict, dict]:
+        # A degraded rerank in one request must not label another request.
+        async def _one(mark: bool) -> dict:
+            if mark:
+                _rer._mark("degraded", "read failed: TimeoutError")
+            await asyncio.sleep(0.01)
+            return _rer.status()
+        return tuple(await asyncio.gather(_one(True), _one(False)))  # type: ignore[return-value]
+
+    a, b = asyncio.run(_isolated())
+    checks.append(("rerank degradation is per request",
+                   a["status"] == "degraded" and b["status"] == "ok"))
+    checks.append(("rerank read timeout is configurable", 0 < _rer._READ_TIMEOUT <= 300))
+
+    checks.append(("ocr memory guard readable", _pdfx._mem_available_mb() > 0))
+    checks.append(("ocr runs on its own single-slot pool", _pdfx._OCR_EXEC._max_workers == 1))
+
+    async def _thread_name() -> str:
+        return await _ddg._off(lambda: __import__("threading").current_thread().name)
+
+    checks.append(("ddgs blocking calls use the ddg pool",
+                   str(asyncio.run(_thread_name())).startswith("ddg")))
+
+    for label, ok in checks:
+        print(("  ok   " if ok else "  FAIL ") + label)
+    print(f"limits selfcheck: {sum(1 for _, v in checks if v)}/{len(checks)} OK")
+    if not all(v for _, v in checks):
+        raise SystemExit(1)
 
 
 async def _synthesis_selfcheck() -> None:
@@ -1855,6 +1935,10 @@ async def main():
 if __name__ == "__main__":
     import sys
     if "--selfcheck" in sys.argv:
+        _ops.selfcheck()
+        print(f"ops selfcheck: ok (deadline={_ops.DEADLINE:.0f}s, "
+              f"concurrency={_ops.MAX_CONCURRENT or 'unlimited'})")
+        _limits_selfcheck()
         asyncio.run(_synthesis_selfcheck())
     else:
         asyncio.run(main())

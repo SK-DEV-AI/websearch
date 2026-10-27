@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import html
+import os
 import logging
 import urllib.parse
 import xml.etree.ElementTree as ET
 
 from typing import Any
+
+from concurrent.futures import ThreadPoolExecutor
 
 from ddgs import DDGS
 from scrapling_shim import AsyncFetcher
@@ -16,6 +19,31 @@ from config import GNEWS_RSS
 logger = logging.getLogger("ddg")
 
 DDGS.threads = 8  # parallelize across 8 metasearch engines
+
+# ddgs is a blocking Rust client: every call has to leave the event loop. It used
+# to leave via asyncio.to_thread, i.e. the loop's ONE shared default executor,
+# which every other blocking call in the server also uses (PDF work, reranker
+# spawn, file IO). Under a swarm that pool fills with 10-15 s network calls and
+# then everything queues behind them — one of the ways a search that normally
+# returns in 3 s ended up crossing the client's 300 s timeout. A dedicated pool
+# keeps flaky-network latency contained to search.
+_NET_EXEC = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ddg")
+_NET_TIMEOUT = float(os.environ.get("WEBSEARCH_DDG_TIMEOUT", "0") or 0)
+
+
+async def _off(fn, *args):
+    """Run a blocking ddgs call on the dedicated network pool."""
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(_NET_EXEC, fn, *args)
+    if _NET_TIMEOUT <= 0:
+        return await fut
+    try:
+        return await asyncio.wait_for(fut, timeout=_NET_TIMEOUT)
+    except asyncio.TimeoutError:
+        # The thread keeps running (Python cannot cancel it), but the request
+        # stops waiting on it. Bounded by WEBSEARCH_DDG_TIMEOUT.
+        logger.warning("ddg call exceeded %.0fs budget; abandoning wait", _NET_TIMEOUT)
+        return []
 
 
 async def search_ddg(
@@ -33,7 +61,7 @@ async def search_ddg(
         if search_type == "news":
             kw = dict(query=query, max_results=count, region=region, safesearch=safesearch,
                       timelimit=timelimit or None, backend=backend, page=page)
-            raw = await asyncio.to_thread(lambda: list(ddgs.news(**kw)))
+            raw = await _off(lambda: list(ddgs.news(**kw)))
             return [{"title": r.get("title", ""), "url": r.get("url", ""),
                      "snippet": r.get("body", ""),
                      "source": urllib.parse.urlparse(r.get("url", "")).netloc or "",
@@ -46,7 +74,7 @@ async def search_ddg(
                          ("layout", layout), ("license_image", license_image)]:
                 if v:
                     kw[k] = v
-            raw = await asyncio.to_thread(lambda: list(ddgs.images(**kw)))
+            raw = await _off(lambda: list(ddgs.images(**kw)))
             return [{"title": r.get("title", ""), "url": r.get("image", ""),
                      "snippet": r.get("source", ""),
                      "source": urllib.parse.urlparse(r.get("image", "")).netloc or "",
@@ -60,7 +88,7 @@ async def search_ddg(
                          ("license_videos", license_videos)]:
                 if v:
                     kw[k] = v
-            raw = await asyncio.to_thread(lambda: list(ddgs.videos(**kw)))
+            raw = await _off(lambda: list(ddgs.videos(**kw)))
             return [{"title": r.get("title", ""),
                      "url": r.get("content", "") or r.get("embed_url", ""),
                      "snippet": r.get("description", ""),
@@ -72,7 +100,7 @@ async def search_ddg(
                      "images": r.get("images", {})}
                     for r in raw if r.get("content") or r.get("embed_url")]
         elif search_type == "books":
-            raw = await asyncio.to_thread(
+            raw = await _off(
                 lambda: list(ddgs.books(query=query, max_results=count, backend=backend, page=page)))
             return [{"title": r.get("title", ""), "url": r.get("url", ""),
                      "snippet": r.get("info", "") or r.get("author", ""),
@@ -82,7 +110,7 @@ async def search_ddg(
         else:
             kw = dict(query=query, max_results=count, region=region, safesearch=safesearch,
                       timelimit=timelimit or None, backend=backend, page=page)
-            raw = await asyncio.to_thread(lambda: list(ddgs.text(**kw)))
+            raw = await _off(lambda: list(ddgs.text(**kw)))
             return [{"title": r.get("title", ""), "url": r.get("href", ""),
                      "snippet": r.get("body", ""),
                      "source": urllib.parse.urlparse(r.get("href", "")).netloc or ""}
@@ -101,7 +129,7 @@ async def ddgs_extract(url: str, extract_type: str = "markdown") -> dict | None:
         ddgs = DDGS(timeout=10)
         fmt_map = {"markdown": "text_markdown", "text_plain": "text", "raw": "text"}
         fmt = fmt_map.get(extract_type, "text_markdown")
-        result = await asyncio.to_thread(lambda: ddgs.extract(url, fmt=fmt))
+        result = await _off(lambda: ddgs.extract(url, fmt=fmt))
         if result:
             return {"url": url, "content": result.get("content", ""),
                     "title": result.get("title", ""), "description": result.get("description", ""),

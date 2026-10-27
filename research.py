@@ -22,7 +22,8 @@ from wikipedia import search_wikipedia
 from arxiv import search_arxiv
 from reddit import search_reddit
 from query_expand import expand_query
-from reranker import rerank as _rerank, killswitch_active as _reranker_disabled
+from reranker import (rerank as _rerank, status as _rerank_status,
+                      killswitch_active as _reranker_disabled)
 from merge import (merge_base, blend, apply_coverage, apply_authority, finalize,
                    detect_intent, is_weak, merged_total, norm_key, verticals_for,
                    apply_six_signal)
@@ -618,6 +619,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     # Track which engines were expected but didn't contribute
     engine_blocked = [] if google_ai_only else sorted(_ALL_ENGINES - set(engines_used))
 
+    rerank_state: dict = {"status": "ok"}
     if per_engine:
         intent = detect_intent(effective_query)
         if search_need == "academic" and intent != "paper":
@@ -640,6 +642,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                     m["snippet"] = s[:1200]
             with_idx = [dict(m, idx=i) for i, m in enumerate(merged)]
             semantic = await _rerank(query, with_idx, top_k=len(with_idx))
+            rerank_state = _rerank_status()
             if semantic:
                 by_idx = {}
                 for s in semantic:
@@ -694,6 +697,13 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     if _reranker_disabled():
         out["reranker"] = "disabled — results are engine-ranked only (not reranked). " \
             "Enable with: rm ~/.local/share/reranker-rust/disabled"
+    elif rerank_state.get("status") not in (None, "ok"):
+        # Say it out loud: when the cross-encoder did not score this batch the
+        # order is base-score only. A caller comparing relevance numbers
+        # across results deserves to know why they look flat.
+        out["reranker"] = (f"{rerank_state['status']} — "
+                           f"{rerank_state.get('reason', 'no scores')}; results "
+                           f"are base-score ordered, not cross-encoder scored")
     return out
 
 
