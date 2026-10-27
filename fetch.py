@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import datetime
 import re
@@ -335,7 +336,119 @@ async def _try_archive_today(original_url: str) -> dict | None:
         return None
 
 
-async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = True,
+async def _pdf_fetch_response(url: str, offset: int, max_chars: int,
+                              focus: str = "", data: bytes | None = None) -> dict:
+    """Shape a PDF fetch the same way for both the .pdf branch and the
+    content-type sniff (servers that serve PDFs at extension-less URLs).
+
+    `data` is the body already downloaded by the caller: used by the sniff path
+    so a mismatched URL does not cost a second download.
+    """
+    import tempfile
+    from pdf_extract import extract_pdf
+
+    tmp_path = ""
+    target = url
+    if data:
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix="pdfsniff_", suffix=".pdf")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            target = tmp_path
+        except Exception as e:
+            return {"success": False, "url": url,
+                    "error": f"PDF extraction failed: tempfile: {e}"}
+    try:
+        r = await extract_pdf(target, format="markdown")
+    except Exception as e:
+        r = {"success": False, "error": str(e)}
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    if not r.get("success"):
+        # A failed PDF used to fall out of this branch into the HTML pipeline,
+        # which happily parsed the raw PDF bytes as text and returned garbage
+        # as a successful page. Fail honestly instead.
+        err = str(r.get("error") or "unknown error")
+        if tmp_path:
+            # Never leak the scratch filename at the caller; it means nothing to
+            # them and hides the real URL.
+            err = err.replace(tmp_path, url).replace(os.path.basename(tmp_path), url)
+        if not err.startswith("PDF extraction failed"):
+            err = f"PDF extraction failed: {err}"
+        out = {"success": False, "url": url, "method": "pdf", "error": err}
+        if r.get("ocr_skipped"):
+            out.update(ocr_skipped=r["ocr_skipped"], free_mb=r.get("free_mb"),
+                       need_mb=r.get("need_mb"))
+        return out
+    full_content = "\n\n---\n\n".join(v["content"] for v in r["results"].values())
+    if focus:
+        full_content = focus_mod.filter_by_relevance(full_content, focus)
+    out = _build_paginated_response(url, full_content, 200,
+                                    url.split("/")[-1], {}, "",
+                                    offset, max_chars, method="pdf")
+    # A source-level cut (the per-document char cap) is NOT pagination: the
+    # agent must be able to tell "the document ends here" from "we stopped
+    # reading here".
+    for v in r["results"].values():
+        if v.get("truncated"):
+            out["source_truncated"] = True
+            out["source_truncated_at_chars"] = v.get("truncated_at_chars", 0)
+            break
+    return out
+
+
+def _looks_like_pdf(raw: str, resp) -> bool:
+    """True when the response is really a PDF despite its URL."""
+    try:
+        headers = getattr(resp, "headers", None) or {}
+        items = headers.items() if hasattr(headers, "items") else []
+        for k, v in items:
+            if str(k).lower() == "content-type" and "application/pdf" in str(v).lower():
+                return True
+    except Exception:
+        pass
+    return raw[:5] == "%PDF-"
+
+
+# ── Page-fetch concurrency ceiling ─────────────────────────────────
+# `ops.py` admits up to 8 whole tool calls, but each `research.enrich` fans out
+# to `depth*2` pages: at depth 5 that is 8 x 8 = 64 simultaneous downloads, each
+# allowed a 64 MiB decompressed body. That is the configuration that made the
+# machine crawl under concurrent searches (page cache + socket pressure + RSS
+# spikes), even though the event loop itself measured healthy. Slots cap the
+# in-flight download set without serialising whole calls; `0` disables the cap.
+_PAGE_FETCH_SLOTS = max(0, int(os.environ.get("WEBSEARCH_PAGE_FETCH_CONCURRENCY", "16") or 0))
+_PAGE_FETCH_SEM: asyncio.Semaphore | None = None
+
+
+def _page_sem() -> asyncio.Semaphore | None:
+    global _PAGE_FETCH_SEM
+    if _PAGE_FETCH_SLOTS <= 0:
+        return None
+    if _PAGE_FETCH_SEM is None:
+        _PAGE_FETCH_SEM = asyncio.Semaphore(_PAGE_FETCH_SLOTS)
+    return _PAGE_FETCH_SEM
+
+
+async def fetch_url(*args, **kwargs):
+    """Public fetch entry: bounded by the page-fetch slot pool.
+
+    Thin wrapper so every caller (search enrichment, extract, webtools,
+    site_mapper) shares one global ceiling — a per-caller limit would let 8
+    searches each open their own 8-wide fan-out and land right back at 64.
+    """
+    sem = _page_sem()
+    if sem is None:
+        return await _fetch_url(*args, **kwargs)
+    async with sem:
+        return await _fetch_url(*args, **kwargs)
+
+
+async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = True,
                     target_language: str = "", favor_precision: bool = False,
                     favor_recall: bool = False, fast: bool = False,
                     deduplicate: bool = True, output_format: str = "markdown",
@@ -454,21 +567,7 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
 
         # ── PDF / EPUB / DOCX ───────────────────────────────────────
         if url_lower.endswith('.pdf'):
-            from pdf_extract import extract_pdf
-            try:
-                r = await extract_pdf(url, format="markdown")
-                if r.get("success"):
-                    full_content = "\n\n---\n\n".join(
-                        v["content"] for v in r["results"].values())
-                else:
-                    full_content = f"[PDF extraction failed: {r.get('error')}]"
-                if focus:
-                    full_content = focus_mod.filter_by_relevance(full_content, focus)
-                return _build_paginated_response(url, full_content, 200,
-                                                  url.split("/")[-1], {}, "",
-                                                  offset, max_chars, method="pdf")
-            except Exception as e:
-                logger.warning("PDF extraction failed for %s: %s", url, e)
+            return await _pdf_fetch_response(url, offset, max_chars, focus)
         elif url_lower.endswith('.epub'):
             resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
             redir_err = await _revalidate_redirect(url, resp)
@@ -565,6 +664,21 @@ async def fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = T
                 _reval.store(url, resp.status, resp.headers, body)
                 raw_html = resp.body if isinstance(resp.body, str) else body.decode("utf-8", errors="replace")
                 status_used = resp.status
+
+        # A server can hand back a PDF at an extension-less URL (arxiv.org/pdf/
+        # 2201.xxxx). Before this check those bytes went through trafilatura and
+        # came back as mojibake that still looked like a successful fetch.
+        if status_used < 400 and raw_html and _looks_like_pdf(raw_html, resp):
+            body_bytes = None
+            if resp is not None and isinstance(getattr(resp, "body", None), (bytes, bytearray)):
+                body_bytes = bytes(resp.body)
+            elif status_used == 304:
+                stored_pdf = _reval.stored(url)
+                if stored_pdf:
+                    body_bytes = stored_pdf[0]
+            if body_bytes is None:
+                body_bytes = raw_html.encode("utf-8", errors="replace")
+            return await _pdf_fetch_response(url, offset, max_chars, focus, body_bytes)
 
         # If the page is dead (404, 410, 5xx), try Wayback
         if status_used in (404, 410) or status_used >= 500:

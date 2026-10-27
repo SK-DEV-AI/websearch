@@ -619,6 +619,59 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     # Track which engines were expected but didn't contribute
     engine_blocked = [] if google_ai_only else sorted(_ALL_ENGINES - set(engines_used))
 
+    def _engine_status() -> dict:
+        """Why each expected engine contributed or not.
+
+        ``engine_blocked`` only names absences; this says the reason, so a
+        caller (or a human reading a JSON dump) never has to guess whether
+        an engine was unconfigured, errored, returned nothing, or was
+        filtered. Diagnostic only — it never changes the result set.
+        """
+        key_for = {"google-news-rss": "rss", "wikipedia": "wiki",
+                   "tavily": "tavily", "reddit": "reddit", "arxiv": "arxiv",
+                   "anysearch": "anysearch", "tinyfish": "tinyfish",
+                   "bingrss": "bingrss", "brave": "brave"}
+        out_s: dict = {}
+        for name in sorted(_ALL_ENGINES):
+            if name == "duckduckgo":
+                vals = [done_map.get(k) for k in ddg_tasks] or [None]
+            else:
+                vals = [done_map.get(key_for.get(name, name))]
+            if any(v is None for v in vals) and not any(
+                    isinstance(v, (list, dict)) for v in vals):
+                out_s[name] = "skipped: no key configured or disabled for this call"
+                continue
+            errs, empties = [], 0
+            for v in vals:
+                if isinstance(v, BaseException):
+                    errs.append(f"{type(v).__name__}: {v}"[:160])
+                elif isinstance(v, dict):
+                    if v.get("error"):
+                        errs.append(str(v["error"])[:160])
+                    elif not [r for r in (v.get("results") or [])
+                              if isinstance(r, dict) and r.get("url")]:
+                        empties += 1
+                elif isinstance(v, list):
+                    if not [r for r in v
+                            if isinstance(r, dict) and r.get("url")
+                            and "error" not in r]:
+                        empties += 1
+            if errs:
+                out_s[name] = "error: " + "; ".join(errs[:3])
+            elif name in engines_used:
+                out_s[name] = "ok"
+            elif empties == len(vals):
+                out_s[name] = "no results returned"
+            else:
+                out_s[name] = ("results returned but none survived "
+                               "domain filtering")
+        return out_s
+
+    try:
+        engine_status = {} if google_ai_only else _engine_status()
+    except Exception as _st_err:  # diagnostics must never break a search
+        engine_status = {"_status_error": f"{type(_st_err).__name__}: {_st_err}"}
+
     rerank_state: dict = {"status": "ok"}
     if per_engine:
         intent = detect_intent(effective_query)
@@ -682,6 +735,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         related = []
     out: dict = {"success": True, "engines_used": engines_used,
                  "engine_blocked": engine_blocked,
+                 "engine_status": engine_status,
                  "engine_totals": engine_totals,
                  "ai_answer": ai_answer, "tavily_answer": tavily_answer,
                  "follow_up": follow_up,

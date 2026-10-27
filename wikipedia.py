@@ -10,7 +10,12 @@ from config import get_http_client
 
 _WIKI_BASE = "https://{lang}.wikipedia.org/w/api.php"
 _REST_BASE = "https://{lang}.wikipedia.org/api/rest_v1/"
-_UA = "mcp-codesearch/1.0"
+# Wikimedia's edge rejects short/bot-like agents with 403 + an HTML error page
+# (measured 2026-10-27: "mcp-codesearch/1.0" and a bare Chrome UA both 403,
+# while a descriptive agent with a contact URL returns 200 JSON). Their policy
+# asks for product/version plus a way to reach the operator, so keep both.
+_UA = ("websearch-mcp/1.15.5 (+https://github.com/1jehuang/jcode; "
+       "wikipedia-api-client) python-httpx")
 _ALLOWED_LANGS = {"en","de","fr","es","it","pt","ru","ja","zh","pl","nl","ar","ko","tr","sv","no","da","fi","hu","cs","ro","uk","th","vi","id","he","el","fa","hi","bn","ta","te","ur","ms","bg","hr","sr","sk","sl","lt","lv","et","is","mk"}
 def _lang(lang: str) -> str:
     return lang if lang in _ALLOWED_LANGS else "en"
@@ -39,7 +44,11 @@ async def search_wikipedia(query: str, count: int = 3, language: str = "en",
             params["srnamespace"] = namespace
         data = await _get(params, language)
         if not data:
-            return []
+            # Same shape as the success path: returning a bare list here would
+            # look identical to "no hits" and hide a blocked/failed request
+            # (a 403 from a bad User-Agent looked exactly like zero results).
+            return {"results": [], "total_available": 0,
+                    "error": "wikipedia request failed (non-200 or unparsable JSON)"}
         return {"results": [{"title": h.get("title", ""),
                  "url": _page_url(h.get("title", ""), language),
                  "snippet": _clean_snippet(h.get("snippet", "")),

@@ -59,12 +59,22 @@ async def _new_reddit_page():
         return None
 
 
+_LAST_FETCH_ERROR = ""
+
+
 async def _cdp_fetch(page, path: str) -> dict | None:
     """Execute fetch() from within the given CDP page context.
 
     The page must be on a same-origin URL (reddit.com) so CORS doesn't
     block credentialed requests. Session cookies are inherited from Helium.
+
+    On failure the reason is recorded in ``_LAST_FETCH_ERROR`` so the caller
+    can report WHY reddit returned nothing (measured 2026-10-27: reddit
+    answers 403 to anonymous /search.json requests, which used to look
+    exactly like "no results").
     """
+    global _LAST_FETCH_ERROR
+    _LAST_FETCH_ERROR = ""
     url = f"https://www.reddit.com{path}"
     try:
         result = await page.evaluate(f'''
@@ -92,6 +102,7 @@ async def _cdp_fetch(page, path: str) -> dict | None:
         parsed = json.loads(result) if isinstance(result, str) else result
         if isinstance(parsed, dict) and parsed.get("_error"):
             logger.warning("CDP fetch error for %s: %s", path, parsed["_error"])
+            _LAST_FETCH_ERROR = str(parsed["_error"])
             return None
         data_str = parsed.get("_data") if isinstance(parsed, dict) else None
         if data_str:
@@ -99,6 +110,7 @@ async def _cdp_fetch(page, path: str) -> dict | None:
         return None
     except Exception as e:
         logger.warning("CDP fetch exception for %s: %s", path, e)
+        _LAST_FETCH_ERROR = f"{type(e).__name__}: {e}"
         return None
 
 
@@ -330,7 +342,7 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
     async with _reddit_sem:
         page = await _new_reddit_page()
         if not page:
-            return []
+            return {"results": [], "error": "reddit: CDP page unavailable (is Helium running with remote debugging?)"}
         try:
             # --- Phase 1: AI summary (navigates the page for AI content) ------
             ai_summary_result = None
@@ -391,7 +403,7 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
                     })
 
             if not isinstance(data, dict):
-                return results
+                return {"results": results, "error": f"reddit: search fetch failed ({_LAST_FETCH_ERROR or 'no data'})"}
 
             children = data.get("data", {}).get("children", [])
             posts = []

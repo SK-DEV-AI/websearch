@@ -378,8 +378,14 @@ async def safe_stream(client: Any, url: str, *, max_bytes: int,
                     f"HTTP {resp.status_code}", request=resp.request, response=resp)
             body = b""
             async for chunk in resp.aiter_bytes():
-                body += chunk
-                if len(body) > max_bytes:
+                # Slice the overshooting chunk instead of keeping it whole: a
+                # stream that yields 8 MB chunks previously let a "50 MB" cap
+                # hold ~58 MB, and under concurrent searches that is real RAM.
+                remaining = max_bytes - len(body)
+                if remaining <= 0:
+                    break
+                body += chunk[:remaining]
+                if len(body) >= max_bytes:
                     break
             return body
     raise SecurityError(f"Too many redirects (> {max_hops}): {url}")
