@@ -11,4 +11,15 @@ export ANYSEARCH_KEY="as_sk_YOUR_KEY"
 # export OPENALEX_API_KEY="${OPENALEX_API_KEY:-}"
 
 export RERANKER_MODEL="Alibaba-NLP/gte-reranker-modernbert-base"
+
+# Server-side bounds. Defaults are tuned for a shared agent box: the deadline sits
+# under a 300s MCP client timeout, admission keeps a swarm from piling onto one
+# process, and the OCR guard refuses work the machine cannot afford. Uncomment to
+# change; doctor() reports whatever is in effect under env.limits.
+# export WEBSEARCH_TOOL_DEADLINE=240   # 0 disables the deadline entirely
+# export WEBSEARCH_MAX_CONCURRENT=8    # 0 = unlimited
+# export WEBSEARCH_QUEUE_WAIT=20       # then the call is answered "busy" (retryable)
+# export WEBSEARCH_RERANK_TIMEOUT=60
+# export WEBSEARCH_RERANK_COOLDOWN=20
+# export WEBSEARCH_OCR_MIN_FREE_MB=900
 exec /home/sk/.local/share/venvs/mcp/bin/python3 "$(dirname "$0")/server.py" "$@"
