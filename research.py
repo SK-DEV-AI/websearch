@@ -47,6 +47,18 @@ _STOPWORDS = {
 }
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'+-]{2,}")
 
+# Opinion/intent words that only add noise to a Wikipedia topic lookup
+# (see _wiki_query: they push MediaWiki into loose-OR garbage results).
+_WIKI_NOISE = frozenset({
+    "best", "top", "good", "great", "worst", "bad", "cheap", "cheapest",
+    "affordable", "budget", "review", "reviews", "recommendation",
+    "recommendations", "suggestion", "suggestions", "advice", "worth",
+    "reddit", "guide", "vs", "versus", "compare", "comparison",
+    "alternative", "alternatives", "anyone", "please", "help",
+    "complaint", "complaints", "problem", "problems", "issue", "issues",
+    "drawback", "drawbacks", "downside", "downsides", "negatives",
+})
+
 # Engines expected in a non-GAI-only search (for engine_blocked reporting)
 _ALL_ENGINES = {"google-news-rss", "tavily", "reddit", "wikipedia", "arxiv",
                 "anysearch", "tinyfish", "duckduckgo", "brave", "bingrss"}
@@ -68,6 +80,26 @@ def _netloc_of(url: str) -> str:
 
 def _query_tokens(query: str) -> set[str]:
     return {w.lower() for w in _WORD_RE.findall(query or "") if w.lower() not in _STOPWORDS}
+
+
+def _wiki_query(query: str, *, max_words: int = 4) -> str:
+    """Reduce a conversational query to topic keywords for the Wikipedia lane.
+
+    MediaWiki search treats a long query as a loose OR and drifts to noise,
+    measured 2026-10-27: "best manual coffee grinder recommendations Reddit"
+    -> 0 hits, "best manual coffee grinder recommendations" -> John Harvey
+    Kellogg / Bruxism, "best manual coffee grinder" -> Burr mill / Coffee
+    preparation / Drip coffee. So: drop filler and opinion words, cap the
+    length, keep the topic.
+    """
+    words = [w for w in _WORD_RE.findall(query or "")
+             if w.lower() not in _STOPWORDS
+             and w.lower() not in _WIKI_NOISE and len(w) > 2]
+    if not words:
+        return query
+    seen: set[str] = set()
+    uniq = [w for w in words if not (w.lower() in seen or seen.add(w.lower()))]
+    return " ".join(uniq[:max_words])
 
 
 def _related_queries(query: str, results: list[dict], *, n: int = 6) -> list[str]:
@@ -414,23 +446,37 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
             out = []
             total_available = 0
             tavily_answer = ""
+            errors: list[str] = []
             for r in results:
                 if isinstance(r, dict):
                     out.extend(r.get("results", []))
                     if r.get("total_available", 0) > total_available:
                         total_available = r["total_available"]
+                    # Engine-level failures (e.g. reddit's anonymous
+                    # /search.json returning 403) must reach engine_status,
+                    # otherwise a blocked engine looks like a quiet zero.
+                    if r.get("error"):
+                        errors.append(str(r["error"])[:160])
                     # Tavily's synthesized answer rides along here (first
                     # non-empty wins) — surfaced as a field, not an entry.
                     if not tavily_answer and r.get("answer"):
                         tavily_answer = r["answer"]
                 elif isinstance(r, list):
                     out.extend(r)
+                elif isinstance(r, BaseException):
+                    errors.append(f"{type(r).__name__}: {r}"[:160])
             merged_out: dict = {"results": out, "total_available": total_available}
+            if errors:
+                merged_out["error"] = "; ".join(errors[:3])
             if tavily_answer:
                 merged_out["tavily_answer"] = tavily_answer
             return merged_out
 
         multi_variants = queries[:2]  # original query + best expanded variant
+        # Wikipedia gets keyword queries: its search is literal and a
+        # conversational variant usually returns nothing there.
+        _wiki_variants = list(dict.fromkeys(
+            [_wiki_query(q) for q in multi_variants]))[:2]
 
         tr_map = {"d": "day", "w": "week", "m": "month", "y": "year"}
         tavily_tr = tr_map.get(timelimit, "")
@@ -453,8 +499,9 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 search_depth=tavily_depth, include_raw_content=True,
                 start_date=start_date, end_date=end_date,
                 include_domains=include_domains, exclude_domains=exclude_domains)),
-            "wiki": asyncio.create_task(_multi_search(search_wikipedia, multi_variants,
-                count=min(count, 8), language=language)),
+            "wiki": asyncio.create_task(_multi_search(
+                search_wikipedia, _wiki_variants, count=min(count, 8),
+                language=language)),
             "reddit": asyncio.create_task(_multi_search(
                 lambda q, **kw: _reddit_search(q, count, **kw), multi_variants,
                 subreddit=reddit_subreddit or None, include_comments=reddit_comments,
