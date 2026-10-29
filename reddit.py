@@ -1,12 +1,16 @@
-"""Reddit gatherer — CDP in-browser fetch + AI summary extraction.
+"""Reddit gatherer — DOM search + CDP comment fetch + AI summary extraction.
 
 Architecture (per-call page, like GAI):
-- Each ``search_reddit()`` call creates its own CDP page, navigates to
-  reddit.com (for same-origin CORS), then uses in-browser ``fetch()`` for
-  post/comment data and navigates the same page for the AI summary.
+- Each ``search_reddit()`` call creates its own CDP page and works inside it.
+- Posts come from scraping the RENDERED search page
+  (``div[data-testid="search-post-unit"]`` cards). Reddit's ``/search.json``
+  answers 403 to browser-origin requests even with a live session cookie, so
+  the JSON search path was removed (measured 2026-10-29).
+- Comments still use in-browser ``fetch()`` of ``/r/<sub>/comments/<id>.json``,
+  which is alive for some posts (best effort).
 - The page is closed in ``finally`` so multiple searches are independent.
 - Session cookies are shared at the browser level (Helium CDP), so every
-  page inherits the user's authenticated Reddit session automatically.
+  page inherits the user's Reddit session automatically.
 - Falls back gracefully (empty results) if CDP is unavailable.
 """
 
@@ -277,21 +281,6 @@ async def _get_ai_summary(page, query: str) -> dict | None:
 
 # ── Data model helpers ──────────────────────────────────────────────────────
 
-def _parse_post(p: dict) -> dict:
-    """Convert a Reddit API post object to our result format."""
-    return {
-        "id": p.get("id"),
-        "title": _html.unescape(p.get("title", "")),
-        "subreddit": p.get("subreddit", ""),
-        "author": p.get("author", ""),
-        "score": p.get("score", 0),
-        "num_comments": p.get("num_comments", 0),
-        "permalink": p.get("permalink", ""),
-        "selftext": _html.unescape(p.get("selftext", "") or ""),
-        "created_utc": p.get("created_utc", 0),
-    }
-
-
 def _parse_comment(c: dict) -> dict:
     """Convert a Reddit API comment object to our format."""
     return {
@@ -328,7 +317,9 @@ def _extract_comments(listing: dict, per_post: int) -> list[dict]:
 
 # ── DOM-based search (JSON API is 403 for browser-origin requests) ───────────
 
-async def _dom_search_posts(page, query: str, subreddit: str | None = None) -> list[dict]:
+async def _dom_search_posts(page, query: str, subreddit: str | None = None,
+                            sort: str = "relevance",
+                            time_filter: str = "all") -> list[dict]:
     """Scrape rendered Reddit search results from the DOM.
 
     Reddit's ``/search.json`` (and ``.rss``, pullpush) now answer 403 to
@@ -342,9 +333,11 @@ async def _dom_search_posts(page, query: str, subreddit: str | None = None) -> l
     num_comments. Empty list on any failure (caller reports honest error).
     """
     if subreddit:
-        search_url = f"https://www.reddit.com/r/{subreddit}/search/?q={_quote(query)}&restrict_sr=on"
+        search_url = (f"https://www.reddit.com/r/{subreddit}/search/?q={_quote(query)}"
+                      f"&restrict_sr=on&sort={_quote(sort)}&t={_quote(time_filter)}")
     else:
-        search_url = f"https://www.reddit.com/search/?q={_quote(query)}"
+        search_url = (f"https://www.reddit.com/search/?q={_quote(query)}"
+                      f"&sort={_quote(sort)}&t={_quote(time_filter)}")
     try:
         await page.goto(search_url, wait_until="domcontentloaded",
                         referrer="https://www.google.com/")
@@ -445,7 +438,8 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
             # Reddit's /search.json (and .rss, pullpush) now answer 403 to
             # browser-origin requests even with a live reddit_session, so the
             # JSON path is dead. Scrape the rendered search page instead.
-            dom_posts = await _dom_search_posts(page, query, subreddit)
+            dom_posts = await _dom_search_posts(page, query, subreddit,
+                                               sort=sort, time_filter=time_filter)
 
             # --- Phase 3: fetch comments (concurrent) ------------------------
             post_comments: dict[str, list[dict]] = {}
