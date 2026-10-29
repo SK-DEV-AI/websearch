@@ -326,6 +326,95 @@ def _extract_comments(listing: dict, per_post: int) -> list[dict]:
     return out[:per_post]
 
 
+# ── DOM-based search (JSON API is 403 for browser-origin requests) ───────────
+
+async def _dom_search_posts(page, query: str, subreddit: str | None = None) -> list[dict]:
+    """Scrape rendered Reddit search results from the DOM.
+
+    Reddit's ``/search.json`` (and ``.rss``, pullpush) now answer 403 to
+    browser-origin requests even with a live ``reddit_session`` cookie, so the
+    JSON path is dead. The rendered search page DOES contain real results in
+    ``div[data-testid="search-post-unit"]`` cards, with metadata in a
+    ``search-telemetry-tracker``'s ``data-faceplate-tracking-context`` JSON
+    and vote/comment counts in ``<faceplate-number number="N">``.
+
+    Returns a list of dicts: id, title, href, subreddit, author, score,
+    num_comments. Empty list on any failure (caller reports honest error).
+    """
+    if subreddit:
+        search_url = f"https://www.reddit.com/r/{subreddit}/search/?q={_quote(query)}&restrict_sr=on"
+    else:
+        search_url = f"https://www.reddit.com/search/?q={_quote(query)}"
+    try:
+        await page.goto(search_url, wait_until="domcontentloaded",
+                        referrer="https://www.google.com/")
+    except Exception as e:
+        logger.warning("DOM search navigation failed for %s: %s", query, e)
+        return []
+
+    # Poll for result cards (rendered lazily, typically 4-8s).
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            cnt = await page.evaluate(
+                'document.querySelectorAll(\'[data-testid="search-post-unit"]\').length')
+            if isinstance(cnt, int) and cnt >= 1:
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    js = r'''
+(() => {
+    const out = [];
+    const units = document.querySelectorAll('[data-testid="search-post-unit"]');
+    for (const u of units) {
+        let ctx = {};
+        try {
+            const t = u.querySelector('search-telemetry-tracker');
+            if (t) ctx = JSON.parse(t.getAttribute('data-faceplate-tracking-context') || '{}');
+        } catch (e) { ctx = {}; }
+        const titleEl = u.querySelector('[data-testid="post-title"]');
+        const title = (titleEl && (titleEl.getAttribute('aria-label') || titleEl.innerText || '')) || '';
+        const href = (titleEl && titleEl.getAttribute('href')) || '';
+        const nums = Array.from(u.querySelectorAll('faceplate-number'));
+        const parseNum = (el) => {
+            if (!el) return 0;
+            const n = el.getAttribute('number');
+            if (n !== null && n !== '') { const v = parseInt(n, 10); if (!isNaN(v)) return v; }
+            const v2 = parseInt((el.innerText || '').trim(), 10);
+            return isNaN(v2) ? 0 : v2;
+        };
+        out.push({
+            id: String(ctx.post && ctx.post.id ? ctx.post.id : '').replace(/^t3_/, ''),
+            title: String(title).trim(),
+            href: String(href).trim(),
+            subreddit: String((ctx.subreddit && ctx.subreddit.name) || ''),
+            author: String((ctx.profile && ctx.profile.name) || ''),
+            score: parseNum(nums[0]),
+            num_comments: parseNum(nums[1]),
+        });
+    }
+    return JSON.stringify(out);
+})()
+'''
+    try:
+        result = await page.evaluate(js)
+    except Exception as e:
+        logger.warning("DOM search evaluate failed: %s", e)
+        return []
+    if not result:
+        return []
+    try:
+        parsed = json.loads(result) if isinstance(result, str) else result
+    except Exception as e:
+        logger.warning("DOM search JSON parse failed: %s", e)
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [p for p in parsed if isinstance(p, dict) and (p.get("title") or p.get("href"))]
+
+
 # ── Main entry point ────────────────────────────────────────────────────────
 
 async def search_reddit(query: str, count: int = 10, subreddit: str | None = None,
@@ -352,24 +441,16 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
                 except Exception as e:
                     logger.warning("AI summary failed: %s", e)
 
-            # --- Phase 2: fetch search results via in-browser fetch -----------
-            limit = max(count, min(count * 5, 100))
-            params = {"q": query, "limit": str(limit), "sort": sort, "t": time_filter,
-                      "type": "link", "raw_json": "1"}
-            if subreddit:
-                params["restrict_sr"] = "on"
-                path = f"/r/{subreddit}/search.json"
-            else:
-                path = "/search.json"
-
-            qs = "&".join(f"{k}={_quote(v)}" for k, v in params.items())
-            data = await _cdp_fetch(page, f"{path}?{qs}")
+            # --- Phase 2: search results via DOM scraping -------------------
+            # Reddit's /search.json (and .rss, pullpush) now answer 403 to
+            # browser-origin requests even with a live reddit_session, so the
+            # JSON path is dead. Scrape the rendered search page instead.
+            dom_posts = await _dom_search_posts(page, query, subreddit)
 
             # --- Phase 3: fetch comments (concurrent) ------------------------
             post_comments: dict[str, list[dict]] = {}
-            if include_comments and isinstance(data, dict):
-                children = data.get("data", {}).get("children", [])
-                posts_raw = [c.get("data", {}) for c in children if isinstance(c, dict) and c.get("kind") == "t3"]
+            if include_comments and dom_posts:
+                posts_raw = dom_posts
 
                 async def _cmts(post: dict) -> None:
                     sub = post.get("subreddit") or ""
@@ -402,24 +483,22 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
                         "engine": "reddit-ai-summary",
                     })
 
-            if not isinstance(data, dict):
-                return {"results": results, "error": f"reddit: search fetch failed ({_LAST_FETCH_ERROR or 'no data'})"}
+            if not dom_posts:
+                return {"results": results, "error": f"reddit: DOM search returned no posts (page may not have rendered; last fetch err: {_LAST_FETCH_ERROR or 'none'})"}
 
-            children = data.get("data", {}).get("children", [])
-            posts = []
-            for c in children:
-                if not isinstance(c, dict) or c.get("kind") != "t3":
-                    continue
-                posts.append(_parse_post(c.get("data", {})))
+            posts = dom_posts
 
             for p in posts:
-                permalink = p.get("permalink", "")
-                url = f"https://www.reddit.com{permalink}" if permalink else ""
+                permalink = p.get("href", "")
+                if permalink and not permalink.startswith("http"):
+                    url = f"https://www.reddit.com{permalink}"
+                else:
+                    url = permalink or ""
                 sub = p.get("subreddit", "")
-                snippet = p.get("selftext", "").strip()
-                if not snippet:
-                    snippet = p.get("title", "")
-                snippet = f"[r/{sub}] {snippet}"
+                title = p.get("title", "")
+                snippet = title
+                if sub:
+                    snippet = f"[r/{sub}] {snippet}"
                 comments = post_comments.get(p.get("id"), [])
                 if comments:
                     lines = [f"\n\nTop comments:"]
@@ -428,7 +507,7 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
                     snippet = (snippet + "\n".join(lines))[:1600]
 
                 entry: dict[str, Any] = {
-                    "title": p.get("title", ""),
+                    "title": title,
                     "url": url,
                     "snippet": snippet,
                     "source": "reddit.com",
