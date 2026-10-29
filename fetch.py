@@ -180,7 +180,7 @@ async def _wait_cf_resolution(page, timeout: float = 120):
     return False
 
 
-def _extract_epub(content: bytes, max_chars: int = 50000) -> str:
+def _extract_epub(content: bytes, max_chars: int = 50000) -> tuple[str, bool]:
     try:
         import ebooklib
         from ebooklib import epub
@@ -203,23 +203,27 @@ def _extract_epub(content: bytes, max_chars: int = 50000) -> str:
                 parser = TextExtractor()
                 parser.feed(item.get_content().decode('utf-8', errors='replace'))
                 texts.append(parser.get_text())
-        return '\n\n'.join(texts)[:max_chars]
+        full = '\n\n'.join(texts)
+        truncated = len(full) > max_chars
+        return full[:max_chars], truncated
     except ImportError:
-        return "[EPUB support requires: pip install ebooklib]"
+        return "[EPUB support requires: pip install ebooklib]", False
     except Exception as e:
-        return f"[EPUB extraction error: {e}]"
+        return f"[EPUB extraction error: {e}]", False
 
 
-def _extract_docx(content: bytes, max_chars: int = 50000) -> str:
+def _extract_docx(content: bytes, max_chars: int = 50000) -> tuple[str, bool]:
     try:
         from docx import Document
         import io
         doc = Document(io.BytesIO(content))
-        return '\n\n'.join(p.text for p in doc.paragraphs if p.text.strip())[:max_chars]
+        full = '\n\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+        truncated = len(full) > max_chars
+        return full[:max_chars], truncated
     except ImportError:
-        return "[DOCX support requires: pip install python-docx]"
+        return "[DOCX support requires: pip install python-docx]", False
     except Exception as e:
-        return f"[DOCX extraction error: {e}]"
+        return f"[DOCX extraction error: {e}]", False
 
 
 def _archive_extract(content: str, original_url: str) -> tuple[str, str]:
@@ -460,7 +464,8 @@ async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = 
                     raw: bool = False, offset: int = 0, focus: str = "",
                     cache_ttl: int = 3600, cookies: dict | None = None,
                     quality_floor: float = 0.0, mineru: bool = False,
-                    cache_bust: bool = False) -> dict:
+                    cache_bust: bool = False,
+                    include_metadata: bool = False) -> dict:
     """Fetch a URL with cache, focus filtering, and pagination via httpx + trafilatura.
 
     Cache keyed by URL+extraction_type (focus and offset are NOT part of the key).
@@ -487,7 +492,8 @@ async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = 
                     url, content, cached.get("status", 200),
                     cached.get("title", ""), cached.get("metadata", {}),
                     cached.get("content_type", ""),
-                    offset, max_chars, method="cache")
+                    offset, max_chars, method="cache",
+                    include_metadata=include_metadata)
                 result["cache"] = _cache_state(cached, cache_ttl)
                 return result
 
@@ -512,7 +518,8 @@ async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = 
                 return _build_paginated_response(
                     url, fp["content"], 200, fp.get("title", ""),
                     fp.get("metadata") or {}, fp.get("content_type", ""),
-                    offset, max_chars, method=fp.get("method", "fast-path"))
+                    offset, max_chars, method=fp.get("method", "fast-path"),
+                    include_metadata=include_metadata)
 
         # ── Robots.txt politeness gate ──────────────────────────────
         # Runs before every unattended fetch path so a Disallowed URL
@@ -540,7 +547,8 @@ async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = 
                 return _build_paginated_response(
                     url, fp["content"], 200, fp.get("title", ""),
                     fp.get("metadata") or {}, fp.get("content_type", ""),
-                    offset, max_chars, method=fp.get("method", "fast-path"))
+                    offset, max_chars, method=fp.get("method", "fast-path"),
+                    include_metadata=include_metadata)
 
         # ── Raw mode ────────────────────────────────────────────────
         if raw or any(url_lower.startswith(p) for p in
@@ -575,14 +583,19 @@ async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = 
                 return {"success": False, "url": url, "error": redir_err}
             if _bomb_capped(resp.body):
                 return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
-            content = _extract_epub(
+            content, _epub_trunc = _extract_epub(
                 resp.body if isinstance(resp.body, bytes) else resp.body.encode(), 100000)
             full_content = content
             if focus:
                 full_content = focus_mod.filter_by_relevance(full_content, focus)
-            return _build_paginated_response(url, full_content, 200,
+            _out = _build_paginated_response(url, full_content, 200,
                                               url.split("/")[-1], {}, "",
                                               offset, max_chars, method="epub")
+            if _epub_trunc:
+                _out["truncated"] = True
+                _out["truncated_at_chars"] = 100000
+                _out["source_truncated"] = True
+            return _out
         elif url_lower.endswith(('.docx', '.doc')):
             resp = await AsyncFetcher.get(url, timeout=20, stealthy_headers=True)
             redir_err = await _revalidate_redirect(url, resp)
@@ -590,14 +603,19 @@ async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = 
                 return {"success": False, "url": url, "error": redir_err}
             if _bomb_capped(resp.body):
                 return {"success": False, "url": url, "error": "decompressed body exceeds 64 MiB cap"}
-            content = _extract_docx(
+            content, _docx_trunc = _extract_docx(
                 resp.body if isinstance(resp.body, bytes) else resp.body.encode(), 100000)
             full_content = content
             if focus:
                 full_content = focus_mod.filter_by_relevance(full_content, focus)
-            return _build_paginated_response(url, full_content, 200,
+            _out = _build_paginated_response(url, full_content, 200,
                                               url.split("/")[-1], {}, "",
                                               offset, max_chars, method="docx")
+            if _docx_trunc:
+                _out["truncated"] = True
+                _out["truncated_at_chars"] = 100000
+                _out["source_truncated"] = True
+            return _out
 
         # ── httpx + trafilatura (primary path) ──────────────────────
         # 304 revalidation + cookie jar (donsetch revalidate.rs/cookies.rs
@@ -695,7 +713,8 @@ async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = 
                 full_content = focus_mod.filter_by_relevance(full_content, focus)
             result = _build_paginated_response(url, full_content, resp.status,
                                               "", {}, "",
-                                              offset, max_chars, method="httpx")
+                                              offset, max_chars, method="httpx",
+                                          include_metadata=include_metadata)
             result["raw_size"] = len(raw_html)
             return result
 
@@ -952,7 +971,8 @@ async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = 
         result = _build_paginated_response(url, full_content, status_used,
                                           _best,
                                           {k: v for k, v in meta.items() if v}, "",
-                                          offset, max_chars, method="httpx")
+                                          offset, max_chars, method="httpx",
+                                          include_metadata=include_metadata)
         if changed_info:
             result["changed"] = changed_info
         result["raw_size"] = raw_len
@@ -978,7 +998,8 @@ async def _fetch_url(url: str, max_chars: int = 5000, main_content_only: bool = 
                         url, full_content, status_used,
                         _best,
                         {k: v for k, v in meta.items() if v}, "",
-                        offset, max_chars, method="mineru_html")
+                        offset, max_chars, method="mineru_html",
+                        include_metadata=include_metadata)
                     result["raw_size"] = raw_len
                     result["quality"] = _extraction_quality(full_content, title=title or "", url=url)
                     result["low_quality"] = result["quality"] < QUALITY_FLOOR
@@ -1349,14 +1370,20 @@ async def scrapling_stealthy_fetch(
             timeout=min(timeout, 15000) / 1000,
         )
         if result.get("success"):
-            return {
+            _scrap_content = (result.get("content", "") or "")
+            _scrap_trunc = len(_scrap_content) > 50000
+            _scrap_out = {
                 "success": True, "url": url,
                 "title": result.get("title", ""),
-                "content": (result.get("content", "") or "")[:50000],
+                "content": _scrap_content[:50000],
                 "method": "cdp", "attempt": 1,
                 "cookies": result.get("cookies", []),
                 "verdict": result.get("verdict", CONTENT_OK),
             }
+            if _scrap_trunc:
+                _scrap_out["truncated"] = True
+                _scrap_out["truncated_at_chars"] = 50000
+            return _scrap_out
         # CDP failed — fall through to scrapling
 
     # ── Scrapling AsyncStealthySession (last resort fallback) ──────
@@ -1432,10 +1459,13 @@ async def scrapling_stealthy_fetch(
                     content = _token_polish(content)
                 else:
                     content = p.get_all_text()
-            if isinstance(content, bytes):
-                content = content.decode("utf-8", errors="replace")
+            _stealth_content = content if isinstance(content, str) else content.decode("utf-8", errors="replace")
+            _stealth_trunc = len(_stealth_content) > 50000
             result: dict[str, Any] = {"success": True, "url": url, "status": p.status,
-                                      "content": content[:50000], "method": "scrapling"}
+                                      "content": _stealth_content[:50000], "method": "scrapling"}
+            if _stealth_trunc:
+                result["truncated"] = True
+                result["truncated_at_chars"] = 50000
             if captured:
                 result["captured_xhr"] = captured
             # terminal-verdict gate for the scrapling path too (same
@@ -1620,7 +1650,8 @@ def _cache_state(cached: dict, cache_ttl: int) -> dict:
 def _build_paginated_response(url: str, content: str, status: int | str,
                               title: str, metadata: dict, content_type: str,
                               offset: int, max_chars: int,
-                              method: str = "httpx") -> dict:
+                              method: str = "httpx",
+                              include_metadata: bool = False) -> dict:
     """Slice *content* at *offset* and return pagination metadata.
 
     The ``offset`` param is a 0-based char offset into the full content.
@@ -1631,18 +1662,56 @@ def _build_paginated_response(url: str, content: str, status: int | str,
 
     sliced, next_off = _paginate(content, offset, max_chars)
     is_truncated = next_off is not None
-    return {
+    # Default: withhold the heavy machine-readable metadata (RDFa/JSON-LD/
+    # microdata/opengraph) that can be ~10x the article text. Report what was
+    # withheld so the caller can opt in via include_metadata=True.
+    meta_in = dict(metadata or {})
+    omitted = None
+    if not include_metadata and meta_in.get("structured"):
+        val = meta_in.pop("structured")
+        # Keep a small useful subset: og basics merged back as top-level `og`.
+        try:
+            og_list = (val.get("opengraph") or []) if isinstance(val, dict) else []
+            basics = {}
+            for entry in og_list:
+                props = {}
+                for kv in (entry.get("properties") or []):
+                    if isinstance(kv, (list, tuple)) and len(kv) >= 2:
+                        props[str(kv[0])] = kv[1]
+                    elif isinstance(kv, dict):
+                        props.update(kv)
+                for key in ("og:title", "og:description", "og:image", "og:url",
+                            "og:site_name", "og:type", "og:locale"):
+                    if props.get(key) and key not in basics:
+                        basics[key] = props[key]
+            if basics and "og" not in meta_in:
+                meta_in["og"] = basics
+        except Exception:
+            pass
+        try:
+            size = len(json.dumps(val, default=str))
+        except Exception:
+            size = len(str(val))
+        subkeys = list(val.keys()) if isinstance(val, dict) else []
+        omitted = {"keys": ["structured"], "subkeys": subkeys,
+                   "approx_chars": size}
+    # Keep only truthy top-level fields.
+    filtered_meta = {k: v for k, v in meta_in.items() if v}
+    ret = {
         "success": True, "url": url, "status": status,
         "title": title, "content": sliced,
         # Default: this content was fetched now. A cache hit overrides it.
         "cache": {"hit": False},
-        "content_type": content_type, "metadata": metadata,
+        "content_type": content_type, "metadata": filtered_meta,
         "total_extracted_chars": total,
         "offset": offset,
         "is_truncated": is_truncated,
         "next_offset": next_off if is_truncated else 0,
         "method": method,
     }
+    if omitted:
+        ret["metadata_omitted"] = omitted
+    return ret
 
 
 def _selfcheck() -> None:

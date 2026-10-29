@@ -184,7 +184,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
             input_schema={"type": "object", "properties": {}},
         ),
         Tool(name="search",
-            description="Multi-engine web search with dedup, reranking, and synthesis. Use for open research questions; for a known URL use fetch, for papers use arxiv, for encyclopedic facts use wikipedia. depth=1 returns snippets with relevance_score+fetch_relevance per result. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns Groq answer with [N] citations. google_ai_only skips all engines for Google AI Mode. e.g. search(query='latest AI models', depth=1)",
+            description="Multi-engine web search with dedup, reranking, and synthesis. Use for open research questions; for a known URL use fetch, for papers use arxiv, for encyclopedic facts use wikipedia. depth=1 returns snippets with relevance_score+fetch_relevance per result. depth>=2 fetches full pages + re-ranks. synthesize=True (default) returns a cited answer with [N] citations. google_ai_only skips all engines for Google AI Mode. e.g. search(query='latest AI models', depth=1)",
             input_schema={"type": "object", "properties": {
                 "query": {"type": "string"}, "count": {"type": "integer", "default": 10},
                 "depth": {"type": "integer",
@@ -231,6 +231,7 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                     "end_line": {"type": "integer", "description": "1-based end line (inclusive). Use with start_line for targeted reading."},
                     "quality_floor": {"type": "number", "default": 0, "description": "Min acceptable extraction quality 0-1 (length+density+structure score); below it the result is flagged low_quality"},
                     "mineru": {"type": "boolean", "default": False, "description": "Opt-in MinerU-HTML SLM re-extraction for low-quality pages (heavy, CPU, seconds per page)"},
+                    "include_metadata": {"type": "boolean", "default": False, "description": "Opt-in: include the full machine-readable metadata (RDFa/JSON-LD/microdata/OpenGraph) in metadata. Off by default because it can be ~10x the article text; when off, metadata keeps a small useful subset (title + OG basics) and metadata_omitted reports the withheld keys and approximate size."},
                     "cookies": {"type": "array", "items": {"type": "object"}, "description": "Optional cookies injected into the request: [{name, value, domain?, path?}] (e.g. session cookie for a page behind login)"},
                     "distill": {"type": "boolean", "default": False, "description": "Opt-in: compress the page with a cheap local model before returning it, to save your context. Never on by default and never silent - the result carries distill.distilled, raw_chars and how_to_get_raw, and the untouched text is one call away with distill=false. Skipped automatically below the size threshold, where it would cost more than it saves."},
                     "distill_question": {"type": "string", "description": "What you are actually looking for. Gives the distiller something to focus on, which reduces the chance it drops the detail you needed."},
@@ -633,6 +634,54 @@ async def _chat(ep: dict, messages: list[dict], *, max_tokens: int,
     return text, finish, err, att
 
 
+def _source_title(x: dict) -> str:
+    """A usable title, or none. A fake subject is worse than no subject: the
+    model would then cite "markdown via Accept header for x" as the page."""
+    t = str((x or {}).get("title") or "").strip()
+    return "" if _is_junk_title(t) else t
+
+
+def _source_freshness(x: dict) -> str:
+    """How old the source is, stated precisely.
+
+    Publication and last-modified are both shown when both exist. Either one
+    alone is misleading: a wiki's "published" is its article creation date, so
+    a page edited today can read as twenty years old, while "modified" alone
+    makes a typo fix look like fresh reporting.
+    """
+    x = x or {}
+    pub = str(x.get("published") or "").strip()
+    mod = str(x.get("modified") or "").strip()
+    if pub and mod and mod != pub:
+        return f"{pub} (last modified {mod})"
+    if pub:
+        return pub
+    if mod:
+        return f"not stated (last modified {mod})"
+    return "not stated"
+
+
+def _source_block(index: int, x: dict, snippet_chars: int) -> str:
+    """Render one source as the block handed to the synthesis model.
+
+    A cut excerpt says so. Without the marker the model cannot tell a 1500-char
+    slice from a complete page, so "the source does not say X" becomes a claim
+    it has no evidence for - that is exactly how an invented absence gets into
+    an answer.
+    """
+    x = x or {}
+    title = _source_title(x) or "(no title given by the page)"
+    head = (f"[{index + 1}]\nSource: {x.get('url', '')}\nTitle: {title}"
+            f"\nPublished: {_source_freshness(x)}")
+    raw = x.get("content") or x.get("snippet") or ""
+    cap = int(snippet_chars)
+    body = raw[:cap]
+    if len(raw) > cap:
+        body += (f"\n\n[excerpt: first {cap} of {len(raw)} chars - the source "
+                 f"continues beyond this]")
+    return f"{head}\nContent: {body}"
+
+
 async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
                       use_cache: bool = True) -> dict:
     """Produce the answer the caller actually reads.
@@ -658,6 +707,8 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
     MIN_SOURCE_CHARS = 400
 
     def _unusable(x: dict) -> tuple[bool, str]:
+        if x.get("_pseudo") or x.get("pseudo") or str(x.get("url", "")).startswith("engine://"):
+            return False, ""
         status = x.get("status")
         if isinstance(status, int) and status >= 400:
             return True, f"HTTP {status}"
@@ -682,46 +733,44 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
     # source, and citing all five makes a single origin look corroborated.
     pool, dedup = drop_near_duplicates(pool)
     limit = max(3, min(depth * 2, s["max_sources"]))
+    # Engine-native answers (Google AI Mode, Tavily) are fed in as
+    # pseudo-sources with a non-page origin so [N] citations work and the
+    # sources appendix stays honest. They are added AFTER the real pool is
+    # capped, so they never displace real pages, and they are excluded from
+    # the diversity count (which describes pages, not engine answers).
+    _pseudo = []
+    _ai = str(r.get("ai_answer") or "").strip()
+    if _ai:
+        _pseudo.append({"url": "engine://google-ai-mode",
+                        "title": "Google AI Mode answer",
+                        "content": _ai, "snippet": _ai,
+                        "engine": "google-ai-mode", "_pseudo": True})
+    _tav = str(r.get("tavily_answer") or "").strip()
+    if _tav:
+        _pseudo.append({"url": "engine://tavily-answer",
+                        "title": "Tavily answer",
+                        "content": _tav, "snippet": _tav,
+                        "engine": "tavily", "_pseudo": True})
     top, div = cap_per_domain(pool, limit=limit, per_domain=s["domain_cap"],
                               min_sources=s["min_sources"])
-    if not top:
+    _pool_n = len(pool)
+    _dropped_pool = max(0, _pool_n - limit)
+    _dropped_domain = max(0, min(_pool_n, limit) - len(top))
+    _real_top = list(top)
+    if not _real_top and not _pseudo:
         return {"available": True, "skipped": "no results to synthesise on",
                 "diversity": div, "duplicates_removed": dedup["removed"],
                 "unreadable_sources": len(unreadable),
-                "unusable_sources": thin}
+                "unusable_sources": thin,
+                "sources_dropped_by_pool_cap": _dropped_pool,
+                "sources_dropped_by_domain_cap": _dropped_domain}
+    if not _real_top and _pseudo:
+        top = list(_pseudo)
+    else:
+        top = _real_top + _pseudo
 
-    def _title(x: dict) -> str:
-        """A usable title, or none. A fake subject is worse than no subject: the
-        model would then cite "markdown via Accept header for x" as the page."""
-        t = str(x.get("title") or "").strip()
-        return "" if _is_junk_title(t) else t
-
-    def _freshness(x: dict) -> str:
-        """How old the source is, stated precisely.
-
-        Publication and last-modified are both shown when both exist. Either one
-        alone is misleading: a wiki's "published" is its article creation date,
-        so a page edited today can read as twenty years old, while "modified"
-        alone makes a typo fix look like fresh reporting.
-        """
-        pub = str(x.get("published") or "").strip()
-        mod = str(x.get("modified") or "").strip()
-        if pub and mod and mod != pub:
-            return f"{pub} (last modified {mod})"
-        if pub:
-            return pub
-        if mod:
-            return f"not stated (last modified {mod})"
-        return "not stated"
-
-    def _line(i: int, x: dict) -> str:
-        title = _title(x) or "(no title given by the page)"
-        head = (f"[{i + 1}]\nSource: {x.get('url', '')}\nTitle: {title}"
-                f"\nPublished: {_freshness(x)}")
-        body = (x.get("content") or x.get("snippet") or "")[:s["snippet_chars"]]
-        return f"{head}\nContent: {body}"
-
-    ctx = "\n\n".join(_line(i, x) for i, x in enumerate(top))
+    ctx = "\n\n".join(_source_block(i, x, s["snippet_chars"])
+                      for i, x in enumerate(top))
 
     # The newest date among the sources. A caller asking "latest" needs to know
     # whether the freshest evidence is from last week or from 2023, and that is
@@ -756,7 +805,9 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
                 "skipped": "no model endpoint: set GROQ_API_KEYS for Groq, or "
                            "DISTILL_API_KEY (with DISTILL_BASE_URL/DISTILL_MODEL) "
                            "for any OpenAI-compatible endpoint",
-                "diversity": div}
+                "diversity": div,
+                "sources_dropped_by_pool_cap": _dropped_pool,
+                "sources_dropped_by_domain_cap": _dropped_domain}
 
     _t0 = time.perf_counter()
     system = prompts.synthesis_system(query, len(top), long=(length == "long"))
@@ -784,11 +835,16 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
         return {"available": True, "provider": ep["provider"],
                 "model": ep["model"], "error": err, "attempts": attempts,
                 "endpoints_tried": tried, "diversity": div,
+                "sources_dropped_by_pool_cap": _dropped_pool,
+                "sources_dropped_by_domain_cap": _dropped_domain,
                 "note": "Results are still returned below; only the written "
-                        "answer failed."}
+                        "answer failed.",
+                "raw_available_via": "search(..., synthesize=false)"}
 
-    sources = [{"n": i + 1, "title": _title(x) or x.get("url", ""),
-                "url": x.get("url", "")}
+    sources = [{"n": i + 1, "title": _source_title(x) or x.get("url", ""),
+                "url": x.get("url", ""),
+                "kind": "engine-answer" if x.get("_pseudo") else "page",
+                "engine": x.get("engine", "")}
                for i, x in enumerate(top)]
     truncated = finish == "length"
     # Which sources the answer actually leans on. Available sources are not
@@ -842,10 +898,13 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
         "max_tokens": s["max_tokens"],
         "finish_reason": finish,
         "truncated": truncated,
-        "sources_used": len(top),
+        "sources_used": len(_real_top),
+        "engine_answers_used": len(_pseudo),
         "duplicates_removed": dedup["removed"],
         "unreadable_sources": len(unreadable),
         "unusable_sources": thin,
+        "sources_dropped_by_pool_cap": _dropped_pool,
+        "sources_dropped_by_domain_cap": _dropped_domain,
         "citations_used": len(cited),
         "as_of": as_of,
         "as_of_kind": as_of_kind,
@@ -855,6 +914,9 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
         "grounded": grounded,
         "attempts": attempts,
         "endpoints_tried": tried,
+        # The unsynthesised rows are one argument away. Without this a caller
+        # reading a lossy answer has to know the schema to learn it can re-ask.
+        "raw_available_via": "search(..., synthesize=false)",
     }
     try:
         if use_cache:
@@ -1243,6 +1305,7 @@ async def _dispatch_tool(ctx, params) -> CallToolResult:
                         raw=bool(arguments.get("raw", False)),
                         cookies=cookies,
                         quality_floor=float(arguments.get("quality_floor", 0.0)),
+                        include_metadata=bool(arguments.get("include_metadata", False)),
                         mineru=bool(arguments.get("mineru", False)))
                 if r.get("success"):
                     if route == "warm":
@@ -1332,6 +1395,7 @@ async def _dispatch_tool(ctx, params) -> CallToolResult:
                             include_formatting=bool(arguments.get("include_formatting", True)),
                             include_links=bool(arguments.get("include_links", True)),
                             raw=bool(arguments.get("raw", False)),
+                            include_metadata=bool(arguments.get("include_metadata", False)),
                             cookies=cks)
 
                 # Turnstile widget solve first (cheap, no full render)

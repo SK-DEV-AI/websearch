@@ -462,6 +462,7 @@ async def extract_pdf(
     out_tmpdir = ""
     force_ocr = bool(hybrid) or bool(hybrid_mode)
     results: dict[str, Any] = {}
+    failed: dict[str, Any] = {}
     fmts = _formats_arg(format)
     try:
         for src in sources:
@@ -512,7 +513,8 @@ async def extract_pdf(
                     if _OCR_ENGINE != "docling":
                         run = await _ocr_fast(path, fmts, pages, password)
                         if not run["ok"]:
-                            return run["payload"]
+                            failed[path.name] = run["payload"]
+                            continue
                         method = run["method"]
                         ocr_meta = run["meta"]
                     if ((not run["ok"] or _ocr_chars(run["content"]) < 30)
@@ -522,7 +524,8 @@ async def extract_pdf(
                             if run["ok"] and _ocr_chars(run["content"]) > 0:
                                 pass  # keep the partial fast result below
                             else:
-                                return d["payload"]
+                                failed[path.name] = d["payload"]
+                                continue
                         elif run["ok"] and _ocr_chars(d["content"]) >= _ocr_chars(run["content"]):
                             # Fast engine saw almost nothing and docling found
                             # more: docling wins, but say we fell back.
@@ -537,11 +540,12 @@ async def extract_pdf(
                     if _ocr_chars(content) < 30:
                         # Honest failure: an empty OCR result must not be
                         # presented as a successful extraction.
-                        return {"success": False,
+                        failed[path.name] = {"success": False,
                                 "ocr_engine": ocr_meta.get("ocr_engine", method),
                                 "error": (f"OCR produced no readable text after "
                                           f"{ocr_ms} ms: {path.name}. The page is "
                                           f"probably a blank/photo scan.")}
+                        continue
                 elif len(fmts) == 1:
                     if fmts[0] != "markdown":
                         text = (await asyncio.to_thread(
@@ -554,9 +558,11 @@ async def extract_pdf(
                             _pymupdf_extract, str(path), pages, password, f))[0]
                     content = got
             except asyncio.TimeoutError:
-                return {"success": False, "error": f"OCR timed out after {_OCR_PAGE_BUDGET}s: {path.name}"}
+                failed[path.name] = {"success": False, "error": f"OCR timed out after {_OCR_PAGE_BUDGET}s: {path.name}"}
+                continue
             except Exception as e:
-                return {"success": False, "error": f"PDF extraction failed: {path.name}: {e}"}
+                failed[path.name] = {"success": False, "error": f"PDF extraction failed: {path.name}: {e}"}
+                continue
             truncated = False
             _cap = _PDF_TEXT_MAX
             if isinstance(content, str):
@@ -607,10 +613,15 @@ async def extract_pdf(
                     (out / f"{safe_stem}.{_EXT[f]}").write_text(c, encoding="utf-8")
 
         return {
-            "success": True,
+            "success": len(failed) == 0 and len(results) > 0,
             "files": str(out),
             "results": results,
+            "failed": failed,
+            "failed_files": list(failed.keys()),
+            "succeeded_files": list(results.keys()),
             "input_count": len(local_files),
+            "error": ("; ".join(f"{k}: {v.get('error')}" for k, v in failed.items())
+                      if failed else None),
         }
     except Exception as e:
         return {"success": False, "error": f"PDF extraction failed: {e}"}

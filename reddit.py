@@ -413,8 +413,13 @@ async def _dom_search_posts(page, query: str, subreddit: str | None = None,
 async def search_reddit(query: str, count: int = 10, subreddit: str | None = None,
                         comments_per_post: int = 4, include_comments: bool = True,
                         include_ai_summary: bool = True, sort: str = "relevance",
-                        time_filter: str = "all") -> list[dict]:
+                        time_filter: str = "all") -> dict:
     """Search Reddit posts + comments + AI summary via CDP.
+
+    Always returns a dict with a single, consistent shape:
+    ``{"results": [...], "engine": "reddit", "error": str | None,
+       "total_available": int}``. ``error`` is None on full success and a
+    short reason otherwise (CDP unavailable, no posts rendered, ...).
 
     Each call creates its own hidden CDP page, does all work, and closes it
     in ``finally`` — no shared state means concurrent searches are safe.
@@ -424,7 +429,9 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
     async with _reddit_sem:
         page = await _new_reddit_page()
         if not page:
-            return {"results": [], "error": "reddit: CDP page unavailable (is Helium running with remote debugging?)"}
+            return {"results": [], "engine": "reddit",
+                    "error": "reddit: CDP page unavailable (is Helium running with remote debugging?)",
+                    "total_available": 0}
         try:
             # --- Phase 1: AI summary (navigates the page for AI content) ------
             ai_summary_result = None
@@ -478,7 +485,9 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
                     })
 
             if not dom_posts:
-                return {"results": results, "error": f"reddit: DOM search returned no posts (page may not have rendered; last fetch err: {_LAST_FETCH_ERROR or 'none'})"}
+                return {"results": results, "engine": "reddit",
+                        "error": f"reddit: DOM search returned no posts (page may not have rendered; last fetch err: {_LAST_FETCH_ERROR or 'none'})",
+                        "total_available": len(results)}
 
             posts = dom_posts
 
@@ -528,7 +537,8 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
                         "subreddit": sub,
                     })
 
-            return results
+            return {"results": results, "engine": "reddit", "error": None,
+                    "total_available": len(results)}
         finally:
             try:
                 await page.close()
@@ -545,6 +555,7 @@ async def search_reddit(query: str, count: int = 10, subreddit: str | None = Non
 
 if __name__ == "__main__":
     r = asyncio.run(search_reddit("python programming", count=2, comments_per_post=1))
-    print(f"Results: {len(r)}")
-    for e in r[:6]:
+    results = r.get("results", []) if isinstance(r, dict) else (r or [])
+    print(f"Results: {len(results)} (error={r.get('error') if isinstance(r, dict) else None})")
+    for e in results[:6]:
         print(f"  [{e.get('engine','')}] {e.get('title','')[:70]}")

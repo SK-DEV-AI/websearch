@@ -378,8 +378,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 timeout=300)
             if r.get("success"):
                 return r
-        except (asyncio.TimeoutError, Exception):
-            pass
+        except (asyncio.TimeoutError, Exception) as e:
+            logging.getLogger("research").debug("engine google-ai-mode failed: %s", e)
         return None
 
     if google_ai_only:
@@ -423,14 +423,18 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
         async def _ddg_search(q, n, **kw):
             try:
                 return await search_ddg(q, n, **kw)
-            except Exception:
-                return []
+            except Exception as e:
+                logging.getLogger("research").debug("engine duckduckgo failed: %s", e)
+                return {"results": [], "total_available": 0,
+                        "error": f"duckduckgo: {type(e).__name__}: {e}"}
 
         async def _reddit_search(q, n, **kw):
             try:
                 return await search_reddit(q, n, **kw)
-            except Exception:
-                return []
+            except Exception as e:
+                logging.getLogger("research").debug("engine reddit failed: %s", e)
+                return {"results": [], "total_available": 0,
+                        "error": f"reddit: {type(e).__name__}: {e}"}
 
         # Run each engine with the best query variants for broader recall
         async def _multi_search(search_fn, variants, **kw):
@@ -533,8 +537,10 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                     _multi_search(search_brave, multi_variants[:1],
                                   count=min(count, 10), timelimit=timelimit),
                     timeout=20)
-            except Exception:
-                done_map["brave"] = []
+            except Exception as e:
+                logging.getLogger("research").debug("engine brave failed: %s", e)
+                done_map["brave"] = {"results": [], "total_available": 0,
+                                     "error": f"brave: {type(e).__name__}: {e}"}
         # D2 need-bias: academic need overrides the detected intent so the
         # scholarly vertical lanes fire; discussion keeps the detected intent
         # (reddit is always in the fan-out already).
