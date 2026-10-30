@@ -59,9 +59,13 @@ _WIKI_NOISE = frozenset({
     "drawback", "drawbacks", "downside", "downsides", "negatives",
 })
 
-# Engines expected in a non-GAI-only search (for engine_blocked reporting)
+# Engines expected in a non-GAI-only search (for engine_blocked reporting).
+# google-ai-mode belongs here: it is launched as a task in the combined pass
+# and silently vanished from every report when the CDP browser was closed,
+# which reads exactly like "the search worked fine" to a caller (#29).
 _ALL_ENGINES = {"google-news-rss", "tavily", "reddit", "wikipedia", "arxiv",
-                "anysearch", "tinyfish", "duckduckgo", "brave", "bingrss"}
+                "anysearch", "tinyfish", "duckduckgo", "brave", "bingrss",
+                "google-ai-mode"}
 
 
 def _host_of(url: str) -> str:
@@ -368,18 +372,32 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     tavily_answer = ""
     follow_up = ""
 
+    # Why google-ai-mode did or did not contribute. Written inside the lane so
+    # a closed browser, a timeout and an empty answer stay distinguishable.
+    gai_state: dict[str, str] = {"status": "not started"}
+
     async def _gai_search():
         gai = await get_gai_client(cdp_url)
         if not gai:
+            gai_state["status"] = (
+                f"no CDP browser at {cdp_url or HELIUM_CDP} "
+                "(start Chromium with --remote-debugging-port=9222)"
+            )
             return None
         try:
             r = await asyncio.wait_for(gai.search(effective_query, search_prompt=search_prompt,
                 gl=gl, hl=hl, tbs=tbs, pws=pws, upload_urls=upload_urls),
                 timeout=300)
             if r.get("success"):
+                gai_state["status"] = "ok"
                 return r
-        except (asyncio.TimeoutError, Exception) as e:
+            gai_state["status"] = "error: " + str(
+                r.get("error") or "no answer and no error given")[:160]
+        except asyncio.TimeoutError:
+            gai_state["status"] = "timed_out after 300s"
+        except Exception as e:
             logging.getLogger("research").debug("engine google-ai-mode failed: %s", e)
+            gai_state["status"] = f"error: {type(e).__name__}: {e}"[:160]
         return None
 
     if google_ai_only:
@@ -665,6 +683,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                                 "rank": len(per_engine.get("google-ai-mode", [])),
                             })
             else:
+                gai_state["status"] = "timed_out after 300s (lane cancelled)"
                 gai_future.cancel()
         finally:
             if not gai_future.done():
@@ -686,6 +705,9 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                    "bingrss": "bingrss", "brave": "brave"}
         out_s: dict = {}
         for name in sorted(_ALL_ENGINES):
+            if name == "google-ai-mode":
+                out_s[name] = gai_state["status"]
+                continue
             if name == "duckduckgo":
                 vals = [done_map.get(k) for k in ddg_tasks] or [None]
             else:
@@ -954,6 +976,14 @@ def _selfcheck() -> None:
     checks.append(("higher depth never fetches fewer pages",
                    min(config.ENRICH_MAX_PAGES, max(config.ENRICH_MIN_PAGES, 6))
                    >= min(config.ENRICH_MAX_PAGES, max(config.ENRICH_MIN_PAGES, 4))))
+    # Regression: google-ai-mode used to be absent from _ALL_ENGINES, so when
+    # the CDP browser was closed the lane vanished from engine_status AND from
+    # engine_blocked - a caller saw a clean search and never learned the lane
+    # was skipped. It must be an expected engine so its absence gets a reason.
+    checks.append(("google-ai-mode is an expected engine",
+                   "google-ai-mode" in _ALL_ENGINES))
+    checks.append(("a missing CDP lane is always reportable",
+                   "google-ai-mode" in sorted(_ALL_ENGINES - {"duckduckgo"})))
     for name, ok in checks:
         print(f"{'OK' if ok else 'FAIL'}  {name}")
     print(f"research selfcheck: {sum(1 for _, v in checks if v)}/{len(checks)} OK")
