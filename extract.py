@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 # crawl4ai is an OPTIONAL dependency (pip install websearch-mcp[extract]); it
 # pulls a browser stack. Import it lazily so the server starts without it and
@@ -52,6 +53,7 @@ async def extract_content(
     chunk_threshold: int = 2000,
     max_pages: int = 1,
     css_selector: str | None = None,
+    include_markdown: bool = False,
 ) -> dict:
     from security import SecurityError, validate_url as _validate_url
     # A caller that omits `provider` sends None explicitly, which would
@@ -69,22 +71,69 @@ async def extract_content(
          RegexExtractionStrategy, LLMConfig) = _crawl4ai()
 
         if strategy == "llm":
-            groq_key = await _groq_key()
-            if not groq_key:
-                return {"success": False, "error": "No GROQ_API_KEYS configured for LLM extraction"}
+            groq_key = None  # may be filled by fallback below
+            from fetch import fetch_url
+            md_fetch = await fetch_url(url, max_chars=100000,
+                                       output_format="markdown",
+                                       include_tables=True, cache_ttl=3600)
+            page_md = md_fetch.get("content", "") if md_fetch.get("success") else ""
             instruction_text = instruction or "Extract all important content from this page as structured JSON"
-            extraction_strategy = LLMExtractionStrategy(
-                llm_config=LLMConfig(provider=provider, api_token=groq_key),
-                instruction=instruction_text,
-                extraction_type="block",
-                chunk_token_threshold=chunk_threshold,
-                apply_chunking=True,
-                input_format="markdown",
-            )
-
+            raw = None
+            # Primary path: shared beam-first llm.chat (same model ladder as
+            # everything else). Returns JSON we parse directly.
+            try:
+                from llm import chat as _llm_chat
+                system_prompt = (
+                    "You are a structured data extractor. Given page content and an "
+                    "instruction, return ONLY valid JSON (object or array) matching "
+                    "the instruction. No prose, no markdown fences, no commentary."
+                )
+                user_prompt = (
+                    f"Instruction: {instruction_text}\n\n"
+                    f"Page content:\n{page_md[:20000]}"
+                )
+                text, _finish, _err, _att = await _llm_chat(
+                    [{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": user_prompt}],
+                    max_tokens=2000, attempts=2, timeout=60,
+                    kind="extract", temperature=0.0)
+                if text:
+                    t = text.strip()
+                    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.M)
+                    parsed = None
+                    try:
+                        parsed = json.loads(t)
+                    except json.JSONDecodeError:
+                        m = re.search(r"(\{.*\}|\[.*\])", t, re.S)
+                        if m:
+                            try:
+                                parsed = json.loads(m.group(1))
+                            except Exception:
+                                parsed = None
+                    if parsed is not None:
+                        raw = [json.dumps(parsed)]
+            except Exception:
+                raw = None
+            # Fallback: legacy crawl4ai LLMExtractionStrategy via Groq direct.
+            if not raw:
+                groq_key = await _groq_key()
+                if groq_key:
+                    try:
+                        extraction_strategy = LLMExtractionStrategy(
+                            llm_config=LLMConfig(provider=provider, api_token=groq_key),
+                            instruction=instruction_text,
+                            extraction_type="block",
+                            chunk_token_threshold=chunk_threshold,
+                            apply_chunking=True,
+                            input_format="markdown",
+                        )
+                        sections = [page_md[i:i + chunk_threshold * 4]
+                                    for i in range(0, len(page_md), chunk_threshold * 4)] or [page_md]
+                        raw = extraction_strategy.run(url, sections)
+                    except Exception:
+                        raw = None
         elif strategy == "css":
             if fields:
-                # Build simple field schema for common extraction patterns
                 schema = {
                     "baseSelector": css_selector or "body",
                     "fields": [
@@ -95,10 +144,8 @@ async def extract_content(
             else:
                 schema = {"baseSelector": css_selector or "body", "fields": []}
             extraction_strategy = JsonCssExtractionStrategy(schema=schema)
-
         elif strategy == "regex":
             extraction_strategy = RegexExtractionStrategy()
-
         else:
             return {"success": False, "error": f"Unknown strategy: {strategy}"}
 
@@ -116,18 +163,9 @@ async def extract_content(
 
         # Strategy .run() is SYNC (verified: not a coroutine) — call
         # directly, never await (awaiting a list = "can't be awaited").
-        if strategy == "llm":
-            # LLM strategy still needs markdown input for chunking — derive
-            # it from the same fetch (no second request).
-            md_fetch = await fetch_url(url, max_chars=100000,
-                                       output_format="markdown",
-                                       include_tables=True, cache_ttl=3600)
-            page_md = md_fetch.get("content", "") if md_fetch.get("success") else ""
-            sections = [page_md[i:i + chunk_threshold * 4]
-                        for i in range(0, len(page_md), chunk_threshold * 4)] or [page_md]
-            raw = extraction_strategy.run(url, sections)
-        else:
+        if strategy != "llm":
             raw = extraction_strategy.run(url, [page_html])
+        # For llm, raw was already produced above (possibly None).
 
         output: dict[str, object] = {
             "url": url,
@@ -150,8 +188,9 @@ async def extract_content(
                     output["truncated_at_chars"] = 10000
                 output["data"] = s[:10000] + ("\n\n[... truncated ...]" if len(s) > 10000 else "")
 
-        # Include markdown if short (reuse the fetched HTML->text; no crawler)
-        if strategy != "llm":
+        # Include markdown only when structured data is empty OR the caller
+        # opted in (include_markdown=True). Default no longer doubles payload.
+        if strategy != "llm" and (include_markdown or "data" not in output):
             text_fetch = await fetch_url(url, max_chars=5000,
                                          output_format="markdown",
                                          cache_ttl=3600)
@@ -162,6 +201,11 @@ async def extract_content(
                     output.setdefault("truncated_fields", []).append("markdown")
                     output["truncated_at_chars"] = 5000
                 output["markdown"] = text[:5000] + ("\n\n[... truncated ...]" if len(text) > 5000 else "")
+
+        # Never claim success when no data was extracted.
+        if "data" not in output:
+            output["success"] = False
+            output.setdefault("error", "no data extracted")
 
         return output
 

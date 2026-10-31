@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ from mcp.types import (CallToolResult, ListToolsResult, TextContent, Tool,
 
 from config import (MAX_RESULTS, HELIUM_CDP, get_http_client, close_http_client,
                     _KeyRotator, default_depth, synthesis_settings,
-                    DEPTH_MIN, DEPTH_MAX, GROQ_SMART_MODEL)
+                    DEPTH_MIN, DEPTH_MAX, GROQ_SMART_MODEL, _clamp_int)
 from diversity import cap_per_domain, drop_near_duplicates
 import prompts
 import llm as _llm
@@ -206,7 +207,12 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "anysearch_zone": {"type": "string", "enum": ["", "cn", "intl"], "description": "AnySearch geo zone (cn or intl)"},
                 "anysearch_language": {"type": "string", "description": "AnySearch content language (e.g. en, zh-CN)"},
                 "google_ai_only": {"type": "boolean", "description": "Skip all other search engines and answer only via Google AI Mode. Requires a signed-in Chromium session reachable over CDP (WEBSEARCH_CDP_URL); on a headless server or without a browser this returns an error, not results — call doctor() to check first"},
-                "history": {"type": "string", "description": "Conversation context for query rewriting (resolves pronouns like 'the second one')"}},
+                "history": {"type": "string", "description": "Conversation context for query rewriting (resolves pronouns like 'the second one')"},
+                "include_engine_answers": {"type": "boolean", "default": False, "description": "Opt-in: include the raw engine answers (Google AI Mode / Tavily) as separate `ai_answer`/`tavily_answer` fields. By default only the synthesized answer is shipped to save payload; engine answers are still used internally as context for synthesis."},
+                "content_chars": {"type": "integer", "default": 2500, "description": "Chars of each fetched source content to return (300-20000). Full text is still used for the answer; this only caps the shipped payload. Raise it, or pass accept_large_output, for deep reading."},
+                "include_metadata": {"type": "boolean", "default": False, "description": "Include per-source page metadata (og: tags, dates, authors). Off by default: it is ~2KB of non-evidence per search."},
+                "accept_large_output": {"type": "boolean", "default": False, "description": "Skip the payload slimming entirely: ship every source's full content, snippets and metadata. Costs 3-6x the tokens of a normal search; use only when you must read whole pages."},
+                },
                 "required": ["query"]}),
          Tool(name="fetch",
             description="URL to markdown/text. Auto-fallback: direct fetch → CDP for blocked/JS pages. Supports PDF, EPUB, DOCX. SSRF-protected. Use focus=\"query\" to filter content by relevance. Paginated via offset (response: next_offset). Results cached 1h; cache_ttl=0 fresh. For structured JSON extraction use `extract` instead. e.g. fetch(url='https://example.com')",
@@ -383,13 +389,14 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
             description="Discover all pages on a website via sitemap XML (primary) and HTML link extraction (fallback). Use to survey a site's pages before fetching individually. Returns the base domain, source type, total count, and an array of discovered URLs with metadata (last_modified, priority, changefreq when available). e.g. map_site(url='https://example.com')",
             input_schema={"type": "object", "properties": {
                 "url": {"type": "string", "description": "Full URL of the site to map (e.g. https://example.com)"},
-                "max_urls": {"type": "integer", "default": 1000, "description": "Cap on returned URLs"},
+                "max_urls": {"type": "integer", "default": 200, "description": "Cap on returned URLs"},
                 "max_depth": {"type": "integer", "default": 0, "description": "Recursive link extraction depth (0=homepage only). Only used when no sitemap exists."},
                 "include_sitemap": {"type": "boolean", "default": True, "description": "Try sitemap discovery first"},
                 "include_links": {"type": "boolean", "default": True, "description": "Fall back to HTML link extraction when no sitemap"},
                 "same_domain": {"type": "boolean", "default": True, "description": "Only include URLs from the same domain"},
                  "exclude_patterns": {"type": "array", "items": {"type": "string"}, "description": "Regex patterns to exclude matching URLs"},
-                 "rank": {"type": "boolean", "default": False, "description": "Score each URL by fetch quality + sitemap priority and return important-first with rank_score (costs one scored pass; use before deep-fetching a site)"}},
+                 "rank": {"type": "boolean", "default": False, "description": "Score each URL by fetch quality + sitemap priority and return important-first with rank_score (costs one scored pass; use before deep-fetching a site)"},
+                 "compact": {"type": "boolean", "default": False, "description": "URLs-only mode: return the url list as plain strings instead of objects with metadata, to keep the payload small."}},
                   "required": ["url"]}),
          Tool(name="extract",
             description="Extract structured JSON from a webpage using LLM, CSS, or regex strategies. Persistent cache — repeat calls free. For LLM strategy, describe what you want and get clean JSON back. For CSS strategy, provide field names (fastest, free). For raw page content, use `fetch` instead. Examples: extract(url='...', instruction='extract product name and price') or extract(url='...', fields=['name','price'], strategy='css')",
@@ -682,6 +689,108 @@ def _source_block(index: int, x: dict, snippet_chars: int) -> str:
     return f"{head}\nContent: {body}"
 
 
+def _sanitize_engine_answer(text: str) -> str:
+    """Strip engine UI chrome and trailing engine source/sign-off blocks.
+
+    Engine answers arrive as scraped rendered text. They carry clipboard
+    hints, caution banners, their own `## Sources` list and a sign-off
+    prompt, none of which is evidence and all of which leak into the
+    synthesis context if pasted raw.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # Drop clipboard/caution chrome lines.
+    lines = []
+    for ln in t.splitlines():
+        low = ln.lower()
+        if "copied to clipboard" in low or "failed to copy" in low:
+            continue
+        if "use code with caution" in low:
+            continue
+        lines.append(ln)
+    t = "\n".join(lines)
+    # Cut the engine's own trailing Sources block.
+    for marker in ("\n## Sources", "\n### Sources", "\n## References"):
+        idx = t.find(marker)
+        if idx != -1:
+            t = t[:idx]
+    # Cut sign-off prompts (engine asks the user a follow-up question).
+    t = re.sub(r"\n\nIf you (are|would|want|have|need|like).*", "", t,
+               flags=re.IGNORECASE | re.DOTALL)
+    t = re.sub(r"\n\nFeel free to .*", "", t,
+               flags=re.IGNORECASE | re.DOTALL)
+    return t.strip()
+
+
+def _slim_search_payload(r: dict, arguments: dict) -> None:
+    """Shrink a search payload in place without dropping evidence.
+
+    A measured depth-2 call shipped 42,266 bytes, of which 30,915 was
+    `fetched_content` and 16,000 of that was the same text twice per source: a
+    4,000-char `snippet` alongside the 4,000-5,000-char `content` it is
+    truncated from. Full page metadata added another ~2,000. Nothing here is
+    evidence, so the default payload stops carrying it; `content`, `url`,
+    `title` and the truncation markers all survive.
+
+    Bypassed by `accept_large_output` (the caller asked for everything) and
+    configurable through `content_chars` / WEBSEARCH_SEARCH_CONTENT_CHARS.
+    """
+    if arguments.get("accept_large_output"):
+        return
+    cap = _clamp_int(arguments.get("content_chars"), 300, 20000,
+                     _clamp_int(os.environ.get("WEBSEARCH_SEARCH_CONTENT_CHARS"),
+                                300, 20000, 2500))
+    # Results carry a short excerpt for judging; fetched_content carries the full
+    # text. The results snippet cap is deliberately much smaller than `cap`.
+    result_snippet_cap = _clamp_int(arguments.get("result_snippet_chars"), 100, 4000,
+                                   _clamp_int(os.environ.get("WEBSEARCH_SEARCH_RESULT_SNIPPET_CHARS"),
+                                              100, 4000, 400))
+    include_metadata = bool(arguments.get("include_metadata", False))
+    fetched_urls = {str(x.get("url") or "") for x in (r.get("fetched_content") or [])
+                    if isinstance(x, dict)}
+    for x in (r.get("fetched_content") or []):
+        if not isinstance(x, dict):
+            continue
+        content = x.get("content") or ""
+        if content:
+            # `snippet` is the same text truncated: pure duplication.
+            x.pop("snippet", None)
+        else:
+            snip = x.get("snippet") or ""
+            if len(snip) > cap:
+                x["snippet"] = snip[:cap]
+                x["snippet_truncated"] = True
+        if len(content) > cap:
+            x["content"] = content[:cap]
+            x["is_truncated"] = True
+            x["content_truncated_at_chars"] = cap
+        if not include_metadata:
+            x.pop("metadata", None)
+
+    for x in (r.get("results") or []):
+        if not isinstance(x, dict):
+            continue
+        url = str(x.get("url") or "")
+        # Pure noise: internal scoring/debug fields never needed by a caller.
+        for k in list(x.keys()):
+            if k.startswith("_"):
+                x.pop(k, None)
+        if not include_metadata:
+            x.pop("metadata", None)
+        if url and url in fetched_urls:
+            # Full text is already shipped in fetched_content: drop the duplicate
+            # snippet and leave a tiny marker so the caller knows where to look.
+            x.pop("snippet", None)
+            x["content_in_fetched_content"] = True
+        else:
+            snip = x.get("snippet")
+            if isinstance(snip, str) and len(snip) > result_snippet_cap:
+                x["snippet"] = snip[:result_snippet_cap]
+                x["snippet_truncated"] = True
+                x["snippet_truncated_at_chars"] = result_snippet_cap
+
+
 async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
                       use_cache: bool = True) -> dict:
     """Produce the answer the caller actually reads.
@@ -738,19 +847,36 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
     # sources appendix stays honest. They are added AFTER the real pool is
     # capped, so they never displace real pages, and they are excluded from
     # the diversity count (which describes pages, not engine answers).
+    def _engine_answer_dupe(candidate: str, texts: list[str]) -> bool:
+        """True when candidate is a near-duplicate of an existing text."""
+        c = " ".join(candidate.lower().split())
+        if not c:
+            return True
+        head = c[:120]
+        for txt in texts:
+            t = " ".join((txt or "").lower().split())
+            if not t:
+                continue
+            if head and (head in t or t[:120] in c):
+                return True
+        return False
+
     _pseudo = []
-    _ai = str(r.get("ai_answer") or "").strip()
-    if _ai:
-        _pseudo.append({"url": "engine://google-ai-mode",
-                        "title": "Google AI Mode answer",
-                        "content": _ai, "snippet": _ai,
-                        "engine": "google-ai-mode", "_pseudo": True})
-    _tav = str(r.get("tavily_answer") or "").strip()
-    if _tav:
-        _pseudo.append({"url": "engine://tavily-answer",
-                        "title": "Tavily answer",
-                        "content": _tav, "snippet": _tav,
-                        "engine": "tavily", "_pseudo": True})
+    # Dedup target: real page text plus each engine answer already accepted.
+    # An engine answer that restates a page (or the other engine) adds no
+    # evidence and only costs prompt tokens.
+    _seen_texts = [str(x.get("content") or x.get("snippet") or "")
+                   for x in pool]
+    for _key, _title, _engine in (("ai_answer", "Google AI Mode answer", "google-ai-mode"),
+                                  ("tavily_answer", "Tavily answer", "tavily")):
+        _ans = _sanitize_engine_answer(str(r.get(_key) or ""))
+        if not _ans or _engine_answer_dupe(_ans, _seen_texts):
+            continue
+        _pseudo.append({"url": f"engine://{_engine}",
+                        "title": _title,
+                        "content": _ans, "snippet": _ans,
+                        "engine": _engine, "_pseudo": True})
+        _seen_texts.append(_ans)
     top, div = cap_per_domain(pool, limit=limit, per_domain=s["domain_cap"],
                               min_sources=s["min_sources"])
     _pool_n = len(pool)
@@ -764,13 +890,21 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
                 "unusable_sources": thin,
                 "sources_dropped_by_pool_cap": _dropped_pool,
                 "sources_dropped_by_domain_cap": _dropped_domain}
-    if not _real_top and _pseudo:
-        top = list(_pseudo)
-    else:
-        top = _real_top + _pseudo
+    # Engine answers are context-only: they inform the answer but are not
+    # citable pseudo-sources, so they never receive a [N] and never appear in
+    # the `sources` list. This stops the verifier from judging a sentence
+    # against an engine summary that does not contain the phrasing.
+    top = list(_real_top)
 
     ctx = "\n\n".join(_source_block(i, x, s["snippet_chars"])
                       for i, x in enumerate(top))
+    if _pseudo:
+        _engine_ctx = ("Background context (engine-generated summaries; NOT "
+                       "citable as sources - do not assign [N] citations to "
+                       "them):\n\n"
+                       + "\n\n".join(f"[{p['engine']}] {p['content']}"
+                                       for p in _pseudo))
+        ctx = (ctx + "\n\n" + _engine_ctx) if ctx else _engine_ctx
 
     # The newest date among the sources. A caller asking "latest" needs to know
     # whether the freshest evidence is from last week or from 2023, and that is
@@ -782,12 +916,23 @@ async def _synthesize(query: str, r: dict, depth: int, length: str = "short",
     as_of = (_pubs or _mods or [""])[-1]
     as_of_kind = "published" if _pubs else ("modified" if _mods else "")
 
-    excerpts = [(x.get("content") or x.get("snippet") or "") for x in top]
+    # Capped exactly like the prompt blocks above: the verifier must judge a
+    # claim against the text the model was shown, not against text it never
+    # saw. With full excerpts here, a figure that exists only past the snippet
+    # cut could be marked "supported" - a citation the answer cannot be
+    # checked against.
+    excerpts = [(_t := (x.get("content") or x.get("snippet") or ""))[:s["snippet_chars"]]
+                for x in top]
+    # Engine answers are NOT evidence: they feed the prompt as background but
+    # stay out of `excerpts`, so neither the grounding check nor the verifier
+    # can count a figure that only appears in an engine summary as supported.
+    _pseudo_texts = [p.get("content", "") for p in _pseudo]
     # Key includes the source text itself, not just the URLs: an answer cached
     # against an old revision of a page would otherwise be served as current.
+    # It also covers the engine context, which now reaches the prompt.
     _h = hashlib.sha256(
         (prompts.SYNTHESIS_VERSION + "|" + query + "|" + length + "|"
-         + "|".join(excerpts)).encode()).hexdigest()[:20]
+         + "|".join(excerpts + _pseudo_texts)).encode()).hexdigest()[:20]
     cache_key = "synthesis://" + _h
     try:
         hit = (await _cache_mod.get_cached(cache_key, extraction_type="synthesis",
@@ -1148,7 +1293,11 @@ async def _dispatch_tool(ctx, params) -> CallToolResult:
                     results[target] = {"reachable": True, "status": r.status_code, "ms": int(r.elapsed.total_seconds() * 1000)}
                 except Exception as e:
                     results[target] = {"reachable": False, "error": str(e)[:60]}
-            return _res({"success": True, "connectivity": results})
+            # `success` means the probe reached something. Reporting true with
+            # every target down made a dead network look healthy.
+            _any = any(v.get("reachable") for v in results.values())
+            return _res({"success": _any, "all_reachable": all(v.get("reachable") for v in results.values()),
+                         "connectivity": results})
 
         if name == "search":
             _t_search = time.perf_counter()
@@ -1169,6 +1318,7 @@ async def _dispatch_tool(ctx, params) -> CallToolResult:
             count = min(max(safe_int(arguments.get("count",10)), depth * 3), MAX_RESULTS)
             lang = str(arguments.get("language","en"))
             google_ai_only = bool(arguments.get("google_ai_only", False))
+            include_engine_answers = bool(arguments.get("include_engine_answers", False))
             r = await search_multi(query, count=count,
                 google_ai_only=google_ai_only,
                 search_type=str(arguments.get("search_type","auto")),
@@ -1269,6 +1419,11 @@ async def _dispatch_tool(ctx, params) -> CallToolResult:
             elif r.get("success") and skip_synthesis:
                 r["synthesis"] = {"skipped": "google_ai_only returned its own "
                                              "answer; not synthesising over it"}
+            if not include_engine_answers:
+                r.pop("ai_answer", None)
+                r.pop("tavily_answer", None)
+            # Runs after synthesis/verification, which need the full text.
+            _slim_search_payload(r, arguments)
             _calls = _llm.counts()
             if _calls:
                 r["model_calls"] = _calls
@@ -1276,7 +1431,15 @@ async def _dispatch_tool(ctx, params) -> CallToolResult:
         elif name == "fetch":
             url = arguments["url"]
             offset = safe_int(arguments.get("offset", 0))
+            _accept_large = bool(arguments.get("accept_large_output", False))
             max_chars = safe_int(arguments.get("max_chars", 5000))
+            # Ceiling unless the caller opts into the large-output path. Keeps a
+            # single fetch from blowing the context budget by default.
+            _fetch_ceiling = 200000 if _accept_large else 20000
+            if max_chars > _fetch_ceiling:
+                max_chars = _fetch_ceiling
+            if max_chars < 1:
+                max_chars = 5000
 
             host = ghost.host_of(url)
             route = ghost.route_for(host)
@@ -1628,14 +1791,29 @@ async def _dispatch_tool(ctx, params) -> CallToolResult:
                 hybrid=hy, hybrid_mode=hm)
             return _res(r)
         elif name == "map_site":
+            _ms_max_urls = safe_int(arguments.get("max_urls", 200), 200)
             r = await map_site(url=str(arguments.get("url","")),
-                max_urls=safe_int(arguments.get("max_urls",1000)),
+                max_urls=_ms_max_urls,
                 max_depth=safe_int(arguments.get("max_depth",0)),
                 include_sitemap=bool(arguments.get("include_sitemap",True)),
                 include_links=bool(arguments.get("include_links",True)),
                 same_domain=bool(arguments.get("same_domain",True)),
                 exclude_patterns=arguments.get("exclude_patterns"),
                 rank=bool(arguments.get("rank", False)))
+            if isinstance(r, dict) and r.get("success"):
+                _urls = r.get("urls") or []
+                _total = r.get("total", len(_urls))
+                # site_mapper stops walking once it has `max_urls` entries, so
+                # `total` equals `len(urls)` and a plain `len < total` compare
+                # is always False - the cap silently dropped URLs with no
+                # signal. Trust the crawler's own flag as well.
+                r["truncated"] = bool(r.get("truncated")) or len(_urls) < _total
+                if r["truncated"]:
+                    r["dropped"] = max(0, _total - len(_urls))
+                    r.setdefault("truncated_at_urls", len(_urls))
+                if bool(arguments.get("compact", False)):
+                    r["urls"] = [ (u.get("url") if isinstance(u, dict) else u) for u in _urls ]
+                    r["compact"] = True
             return _res(r)
         else:
             return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": f"Unknown tool: {name}"})))], is_error=True)
@@ -1742,6 +1920,76 @@ def _limits_selfcheck() -> None:
 
     checks.append(("ddgs blocking calls use the ddg pool",
                    str(asyncio.run(_thread_name())).startswith("ddg")))
+
+    # Payload slimming: a measured depth-2 search shipped 42,266 bytes of which
+    # 16,000 was the same source text twice (`snippet` is `content` truncated).
+    _sl = {"fetched_content": [
+        {"url": "https://a.example/1", "title": "A", "snippet": "s" * 4000,
+         "content": "c" * 4000, "metadata": {"og": "x" * 500}},
+        {"url": "https://b.example/2", "title": "B", "snippet": "q" * 4000},
+    ]}
+    _sl_copy = copy.deepcopy(_sl)
+    _slim_search_payload(_sl, {})
+    _b0, _b1 = _sl["fetched_content"]
+    checks.append(("slim drops the duplicate snippet", "snippet" not in _b0))
+    checks.append(("slim keeps content and its truncation marker",
+                   _b0["content"] == "c" * 2500 and _b0.get("is_truncated") is True))
+    checks.append(("slim drops page metadata by default", "metadata" not in _b0))
+    checks.append(("slim keeps a snippet when there is no content",
+                   _b1.get("snippet") == "q" * 2500))
+    checks.append(("slim never touches the source url or title",
+                   _b0["url"] == "https://a.example/1" and _b0["title"] == "A"))
+    _slim_search_payload(_sl_copy, {"accept_large_output": True})
+    checks.append(("slim is bypassed by accept_large_output",
+                   _sl_copy == {"fetched_content": [
+                       {"url": "https://a.example/1", "title": "A",
+                        "snippet": "s" * 4000, "content": "c" * 4000,
+                        "metadata": {"og": "x" * 500}},
+                       {"url": "https://b.example/2", "title": "B",
+                        "snippet": "q" * 4000}]}))
+    _sl2 = copy.deepcopy(_sl_copy)
+    _slim_search_payload(_sl2, {"content_chars": 1000, "include_metadata": True})
+    checks.append(("slim honours content_chars and include_metadata",
+                   _sl2["fetched_content"][0]["content"] == "c" * 1000
+                   and "metadata" in _sl2["fetched_content"][0]))
+
+    # Payload slimming of the ranked `results` list...
+    # shipped with full text in `fetched_content` drops its (duplicate) snippet
+    # and carries a marker; the rest keep a short capped snippet; internal
+    # scoring fields are dropped.
+    _rl = {"fetched_content": [
+        {"url": "https://a.example/1", "title": "A", "content": "c" * 4000},
+    ], "results": [
+        {"url": "https://a.example/1", "title": "A", "snippet": "s" * 4000,
+         "score": 0.9, "_consensus": 2, "_six": {"C": 0.1}, "metadata": {"og": "x"}},
+        {"url": "https://b.example/2", "title": "B", "snippet": "q" * 4000,
+         "score": 0.5, "_consensus": 1},
+    ]}
+    _rl_copy = copy.deepcopy(_rl)
+    _slim_search_payload(_rl, {})
+    _ra, _rb = _rl["results"]
+    checks.append(("slim drops results snippet when url is fetched",
+                   "snippet" not in _ra and _ra.get("content_in_fetched_content") is True))
+    checks.append(("slim caps results snippet otherwise",
+                   _rb.get("snippet") == "q" * 400 and _rb.get("snippet_truncated") is True))
+    checks.append(("slim drops internal scoring fields from results",
+                   "_consensus" not in _ra and "_six" not in _ra and "_consensus" not in _rb))
+    checks.append(("slim drops results metadata by default",
+                   "metadata" not in _ra))
+    checks.append(("slim keeps url, title and score on results",
+                   _ra["url"] == "https://a.example/1" and _ra["title"] == "A"
+                   and _ra["score"] == 0.9 and _rb["score"] == 0.5))
+    checks.append(("slim keeps the results count", len(_rl["results"]) == 2))
+    _slim_search_payload(_rl_copy, {"accept_large_output": True})
+    checks.append(("slim leaves results untouched on accept_large_output",
+                   _rl_copy["results"][0].get("snippet") == "s" * 4000
+                   and "content_in_fetched_content" not in _rl_copy["results"][0]
+                   and "_consensus" in _rl_copy["results"][0]))
+    _rl2 = copy.deepcopy(_rl_copy)
+    _slim_search_payload(_rl2, {"result_snippet_chars": 200, "include_metadata": True})
+    checks.append(("slim honours result_snippet_chars and include_metadata",
+                   _rl2["results"][1]["snippet"] == "q" * 200
+                   and "metadata" in _rl2["results"][0]))
 
     for label, ok in checks:
         print(("  ok   " if ok else "  FAIL ") + label)
@@ -1981,6 +2229,32 @@ async def _synthesis_selfcheck() -> None:
     checks.append(("merge adds only new urls", added == 1))
     checks.append(("merge keeps both result sets", len(base["results"]) == 2))
     checks.append(("merge keeps both fetched sets", len(base["fetched_content"]) == 2))
+
+    # Regression: engine answers are sanitized and demoted to context-only.
+    _raw_ea = ("Real answer.\nCopied to clipboard\nUse code with caution\n\n"
+               "## Sources\n- x\n\nIf you are considering learning, tell me:")
+    _clean_ea = _sanitize_engine_answer(_raw_ea)
+    checks.append(("engine answer chrome is stripped",
+                   "Copied to clipboard" not in _clean_ea
+                   and "Use code with caution" not in _clean_ea
+                   and "## Sources" not in _clean_ea
+                   and "tell me" not in _clean_ea))
+    checks.append(("engine answer body survives sanitization",
+                   _clean_ea == "Real answer."))
+
+    _ea_pool = {"results": [
+        {"url": "https://a.com/1", "title": "A1", "snippet": "alpha",
+         "content": "y" * 500}]}
+    _ea_r = dict(_ea_pool)
+    _ea_r["ai_answer"] = _raw_ea
+    globals()["_endpoints"] = lambda: one
+    globals()["_chat"] = ok_chat
+    globals()["verify_grounding"] = stub_verify
+    _ea_out = await _synthesize("selfcheck-q", _ea_r, 2, use_cache=False)
+    checks.append(("engine answer is not a citable source",
+                   all(s.get("kind") != "engine-answer" for s in _ea_out.get("sources", []))))
+    checks.append(("engine answer still counted",
+                   _ea_out.get("engine_answers_used") == 1))
 
     for name, ok in checks:
         print(f"{'OK' if ok else 'FAIL'}  {name}")

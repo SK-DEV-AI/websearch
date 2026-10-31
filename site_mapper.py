@@ -168,6 +168,7 @@ async def map_site(
         "source": source,
         "total": len(results),
         "urls": results[:max_urls],
+        "truncated": len(results) >= max_urls,
     }
 
 

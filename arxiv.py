@@ -36,7 +36,9 @@ async def search_arxiv(query: str, count: int = 3, search_field: str = "all",
         results = []
         for entry in root.findall("atom:entry", ns)[:count]:
             title = entry.findtext("atom:title", "", ns).replace("\n", " ").strip()
-            summary_text = entry.findtext("atom:summary", "", ns).replace("\n", " ").strip()[:500]
+            summary_raw = entry.findtext("atom:summary", "", ns).replace("\n", " ").strip()
+            summary_len = len(summary_raw)
+            summary_text = summary_raw[:500]
             url = ""
             for link in entry.findall("atom:link", ns):
                 if link.get("title") == "pdf":
@@ -55,13 +57,22 @@ async def search_arxiv(query: str, count: int = 3, search_field: str = "all",
             primary_cat = pc.get("term", "") if pc is not None else ""
             id_text = entry.findtext("atom:id", "", ns)
             arxiv_id = id_text.split("/abs/")[-1] if "/abs/" in id_text else ""
-            results.append({
+            entry_dict = {
                 "title": title, "url": url, "snippet": summary_text,
                 "authors": authors, "published": published, "updated": updated,
                 "source": "arxiv", "arxiv_id": arxiv_id,
                 "categories": categories, "primary_category": primary_cat,
-                "comment": comment, "journal_ref": journal_ref, "doi": doi,
-            })
+            }
+            if comment:
+                entry_dict["comment"] = comment
+            if journal_ref:
+                entry_dict["journal_ref"] = journal_ref
+            if doi:
+                entry_dict["doi"] = doi
+            if summary_len > 500:
+                entry_dict["snippet_truncated"] = True
+                entry_dict["original_chars"] = summary_len
+            results.append(entry_dict)
         return {"results": results, "total_available": int(total)}
     except Exception:
         return {"results": [], "total_available": 0}

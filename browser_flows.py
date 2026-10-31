@@ -338,6 +338,7 @@ async def paginate(
     session_id: str = "",
     url: str = "",
     max_pages: int = 5,
+    max_chars: int = 2000,
     read_selector: str = "",
     wait_state: str = "networkidle",
     wait_ms: int = DEFAULT_WAIT_MS,
@@ -348,6 +349,7 @@ async def paginate(
     if not str(next_selector or "").strip():
         return _err("next_selector is required", kind="permanent")
     pages_wanted = max(1, min(int(max_pages or 5), MAX_PAGES))
+    page_max_chars = max(1, min(int(max_chars or 2000), MAX_TEXT_CHARS))
 
     page, sid, owns, err = await _acquire(session_id)
     if page is None:
@@ -362,9 +364,19 @@ async def paginate(
 
         for i in range(pages_wanted):
             rd = await _read(page, read_selector, as_text=True)
+            raw_value = rd.get("value", "") or ""
+            orig_chars = rd.get("chars", len(raw_value))
+            if len(raw_value) > page_max_chars or orig_chars > page_max_chars:
+                page_value = raw_value[:page_max_chars]
+                page_truncated = True
+            else:
+                page_value = raw_value
+                page_truncated = False
             collected.append({"page": i + 1, "url": page.url,
                               "found": rd.get("found", False),
-                              "value": rd.get("value", "")})
+                              "value": page_value,
+                              "truncated": page_truncated,
+                              "original_chars": orig_chars})
             if i == pages_wanted - 1:
                 stop_reason = f"max_pages cap ({pages_wanted}) reached"
                 break
@@ -389,13 +401,19 @@ async def paginate(
 
             if stop_when_unchanged:
                 prev = (collected[-1].get("value") or "")[:400]
-                cur = (await _read(page, read_selector, as_text=True)).get("value", "")[:400]
-                if not (page.url != url_before or cur != prev):
+                cur_rd = await _read(page, read_selector, as_text=True)
+                cur = cur_rd.get("value", "") or ""
+                cur_orig = cur_rd.get("chars", len(cur))
+                cur_val = cur[:page_max_chars] if (len(cur) > page_max_chars or cur_orig > page_max_chars) else cur
+                cur_trunc = (len(cur) > page_max_chars or cur_orig > page_max_chars)
+                if not (page.url != url_before or cur[:400] != prev):
                     # Neither the URL nor the collected value moved: the click was
                     # accepted but had no effect. Reporting "cap reached" here
                     # would be a false success.
                     collected.append({"page": i + 2, "url": page.url,
-                                      "found": bool(cur), "value": cur})
+                                      "found": bool(cur), "value": cur_val,
+                                      "truncated": cur_trunc,
+                                      "original_chars": cur_orig})
                     stop_reason = ("next control had no effect: URL and content were "
                                    "unchanged after clicking, so pagination stopped")
                     break

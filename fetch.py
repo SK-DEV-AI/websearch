@@ -388,7 +388,7 @@ async def _pdf_fetch_response(url: str, offset: int, max_chars: int,
             out.update(ocr_skipped=r["ocr_skipped"], free_mb=r.get("free_mb"),
                        need_mb=r.get("need_mb"))
         return out
-    full_content = "\n\n---\n\n".join(v["content"] for v in r["results"].values())
+    full_content = "\n\n---\n\n".join(v["content"] for v in r["results"])
     if focus:
         full_content = focus_mod.filter_by_relevance(full_content, focus)
     out = _build_paginated_response(url, full_content, 200,
@@ -397,7 +397,7 @@ async def _pdf_fetch_response(url: str, offset: int, max_chars: int,
     # A source-level cut (the per-document char cap) is NOT pagination: the
     # agent must be able to tell "the document ends here" from "we stopped
     # reading here".
-    for v in r["results"].values():
+    for v in r["results"]:
         if v.get("truncated"):
             out["source_truncated"] = True
             out["source_truncated_at_chars"] = v.get("truncated_at_chars", 0)
@@ -1025,7 +1025,8 @@ async def _cdp_extract_content(page, css_selector: str | None, extraction_type: 
         """)
         if text:
             return text.strip()
-        return await page.inner_text()
+        # No clean node matched: do NOT fall back to raw inner_text (chrome).
+        return ""
     if extraction_type == "html":
         return await page.document_html()
     if extraction_type == "markdown":
@@ -1038,8 +1039,13 @@ async def _cdp_extract_content(page, css_selector: str | None, extraction_type: 
             content = _strip_trackers_md(content)
             content = _drop_citation_markers(content)
             content = _token_polish(content)
-        return content or await page.inner_text()
-    return await page.inner_text()
+        return content or ""
+    # `txt` / unknown mode: plain text, but filtered. Raw inner_text() here was
+    # the chrome leak this wave removed; returning "" instead would have made a
+    # valid JS-rendered page read as empty, so run the same extractor chain and
+    # emit its plain-text output.
+    html_c = await page.document_html()
+    return md_convert.extract_to_text(html_c, url=page_url or "", fast=True)
 
 
 # UI furniture that metadata extractors pick up as a page title on some sites.

@@ -76,16 +76,22 @@ async def fetch_wikipedia_summary(query: str, language: str = "en",
         for pid, page in pages.items():
             if pid == "-1":
                 continue
+            extract_raw = (page.get("extract", "") or "")
+            extract_original = len(extract_raw)
+            extract_text = extract_raw[:5000]
             sections = page.get("sections", [])
             result: dict = {
                 "title": page.get("title", ""),
                 "url": page.get("fullurl", ""),
-                "extract": (page.get("extract", "") or "")[:5000],
+                "extract": extract_text,
                 "page_id": pid,
                 "sections": [{"index": s.get("index", ""), "level": s.get("level", ""),
                               "title": s.get("toclevel", s.get("line", ""))}
                              for s in sections[:20]],
             }
+            if extract_original > 5000:
+                result["truncated"] = True
+                result["original_chars"] = extract_original
             if include_images and page.get("thumbnail"):
                 result["thumbnail"] = page["thumbnail"].get("source", "")
             return result
@@ -104,13 +110,20 @@ async def fetch_wikipedia_summary_rest(title: str, language: str = "en") -> dict
         if r.status_code != 200:
             return None
         d = r.json()
-        return {
+        extract_raw = (d.get("extract", "") or "")
+        extract_original = len(extract_raw)
+        extract_text = extract_raw[:5000]
+        result = {
             "title": d.get("title", ""), "url": d.get("content_urls", {}).get("desktop", {}).get("page", ""),
-            "extract": (d.get("extract", "") or "")[:5000],
-            "extract_html": d.get("extract_html", ""), "page_id": d.get("pageid"),
+            "extract": extract_text,
+            "page_id": d.get("pageid"),
             "thumbnail": (d.get("thumbnail", {}) or {}).get("source", ""),
             "description": d.get("description", ""), "source": "wikipedia-rest",
         }
+        if extract_original > 5000:
+            result["truncated"] = True
+            result["original_chars"] = extract_original
+        return result
     except Exception:
         return None
 

@@ -19,6 +19,7 @@ import contextlib
 import gc
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -461,7 +462,7 @@ async def extract_pdf(
     tmpdir = ""
     out_tmpdir = ""
     force_ocr = bool(hybrid) or bool(hybrid_mode)
-    results: dict[str, Any] = {}
+    results: list[dict[str, Any]] = []
     failed: dict[str, Any] = {}
     fmts = _formats_arg(format)
     try:
@@ -570,11 +571,21 @@ async def extract_pdf(
                     truncated = True
                     content = content[:_cap] + f"\n\n[... truncated at {_cap} chars ...]"
             else:
-                for f, c in content.items():
-                    if len(c) > _cap:
+                for f, c in (content.items() if isinstance(content, dict) else []):
+                    if isinstance(c, str) and len(c) > _cap:
                         truncated = True
                         content[f] = c[:_cap] + f"\n\n[... truncated at {_cap} chars ...]"
-            results[path.name] = {
+            # Normalize page-break artifact blank lines: collapse 3+ newlines
+            # to a single blank line (paragraph structure preserved).
+            if isinstance(content, str):
+                content = re.sub(r"\n{3,}", "\n\n", content)
+            elif isinstance(content, dict):
+                for _f, _c in list(content.items()):
+                    if isinstance(_c, str):
+                        content[_f] = re.sub(r"\n{3,}", "\n\n", _c)
+            entry = {
+                "filename": path.name,
+                "name": path.name,
                 "content": content,
                 "method": method,
                 "pages": page_count,
@@ -586,13 +597,14 @@ async def extract_pdf(
             if method in ("docling-ocr", "pymupdf-ocr") and ocr_ms:
                 # How long the OCR actually took, so a slow scan is visible in
                 # the payload instead of only in the client's timeout.
-                results[path.name]["ocr_ms"] = ocr_ms
-                results[path.name]["ocr_engine"] = ocr_meta.get(
+                entry["ocr_ms"] = ocr_ms
+                entry["ocr_engine"] = ocr_meta.get(
                     "ocr_engine", "docling" if method == "docling-ocr" else "pymupdf-tesseract")
                 for _k in ("pages_ocr", "pages_total", "dpi", "lang",
                            "ocr_stopped_at", "ocr_fallback_from"):
                     if ocr_meta.get(_k) not in (None, ""):
-                        results[path.name][_k] = ocr_meta[_k]
+                        entry[_k] = ocr_meta[_k]
+            results.append(entry)
 
         if output_dir.strip():
             out = Path(output_dir.strip())
@@ -600,7 +612,8 @@ async def extract_pdf(
         else:
             out_tmpdir = tempfile.mkdtemp(prefix="pdfx_out_")
             out = Path(out_tmpdir)
-        for name, r in results.items():
+        for r in results:
+            name = r.get("filename", "")
             # H1-para: contain writes inside `out` — `name` derives from a remote
             # URL path basename which can carry `..` and escape output_dir.
             safe_stem = Path(name).stem
@@ -618,7 +631,7 @@ async def extract_pdf(
             "results": results,
             "failed": failed,
             "failed_files": list(failed.keys()),
-            "succeeded_files": list(results.keys()),
+            "succeeded_files": [r.get("filename", "") for r in results],
             "input_count": len(local_files),
             "error": ("; ".join(f"{k}: {v.get('error')}" for k, v in failed.items())
                       if failed else None),

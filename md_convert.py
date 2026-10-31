@@ -29,6 +29,41 @@ _NOISE_SELECTORS = [
 ]
 
 
+_LINK_ITEM_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+\.)\s*\[[^\]]*\]\([^)]*\)\s*$"
+)
+
+
+def strip_link_runs(md: str, min_run: int = 5) -> str:
+    """Remove runs of >=min_run consecutive link-only markdown list items.
+
+    These are the residual footer/nav link dumps that survive inside
+    trafilatura's main-content container (e.g. geeksforgeeks course lists).
+    Only consecutive *link-only* list items are touched; tables and code
+    fences are never affected.
+    """
+    if not md:
+        return md
+    lines = md.split("\n")
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if _LINK_ITEM_RE.match(lines[i]):
+            j = i
+            while j < n and _LINK_ITEM_RE.match(lines[j]):
+                j += 1
+            if j - i >= min_run:
+                i = j
+                continue
+            out.extend(lines[i:j])
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
 def to_markdown(
     html: str,
     *,
@@ -50,9 +85,12 @@ def to_markdown(
         exclude_selectors=_NOISE_SELECTORS,
     )
     try:
-        return convert(html, opts).content.strip()
+        result = convert(html, opts).content.strip()
     except Exception:
         return ""
+    if include_links:
+        result = strip_link_runs(result)
+    return result
 
 
 def _harvest_links(html: str, url: str = "", cap: int = 300) -> list[tuple[str, str]]:
@@ -86,13 +124,27 @@ def _ensure_links(md: str, html: str, url: str) -> str:
     """Guarantee link coverage: trafilatura's link support is experimental
     and dies on forum layouts (refs stripped during wild-text recovery,
     verified 2.1.0 on phpBB — 455 anchors → 0 in output). When extraction
-    keeps less than half the page's links, append the full inventory."""
+    keeps less than half the page's links, append a capped inventory.
+
+    Conservative: never dump an entire site's navigation. Skip when the
+    harvested set looks like a nav/footer dump (many short labels), and
+    cap the appended list to 30 entries.
+    """
     have = len(re.findall(r"\]\(", md))
     links = _harvest_links(html, url)
     if not links or have * 2 >= len(links):
         return md
+    # Skip nav/footer dumps: lots of links with very short labels.
+    if len(links) > 40:
+        avg_len = sum(len(t) for t, _ in links) / len(links)
+        if avg_len < 15:
+            return md
+    extra_links = links[have:have + 30]
+    if not extra_links:
+        return md
     extra = "\n\n## Page links\n" + "\n".join(
-        f"- [{t}]({h})" for t, h in links[have:])
+        f"- [{t}]({h})" for t, h in extra_links
+    )
     return md + extra
 
 
@@ -145,5 +197,29 @@ def extract_and_convert(html: str, url: str = "", *, fast: bool = False,
     try:
         return (trafilatura.extract(html, output_format="txt",
                                     with_metadata=False, url=url or None) or "").strip()
+    except Exception:
+        return ""
+
+
+def extract_to_text(html: str, url: str = "", *, fast: bool = False,
+                    **traf_kw) -> str:
+    """trafilatura main content as clean plain text.
+
+    The `txt` output mode used to fall back to the browser's `inner_text()`
+    when the CDP extractor ran, which returns nav, cookie banners and footer
+    boilerplate as if it were page content. This is the filtered equivalent:
+    main content only, markdown syntax stripped, so the mode keeps returning
+    data without laundering chrome into it.
+    """
+    import trafilatura
+
+    kw: dict = dict(traf_kw)
+    kw.update(output_format="txt", with_metadata=False)
+    if fast:
+        kw["fast"] = True
+    if url:
+        kw["url"] = url
+    try:
+        return (trafilatura.extract(html, **kw) or "").strip()
     except Exception:
         return ""
