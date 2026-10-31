@@ -42,6 +42,11 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 # the reasoning preamble, and keep the caller's intent as a lower bound only.
 MIN_USEFUL_TOKENS = int(os.environ.get("WEBSEARCH_MIN_MODEL_TOKENS") or 512)
 
+# Reasoning depth asked of the model. Beam spends reasoning tokens before it
+# emits content; "low" keeps that preamble short, which is the difference
+# between a one-line answer and a 2000-token essay for the same question.
+REASONING_EFFORT = (os.environ.get("WEBSEARCH_REASONING_EFFORT") or "low").strip().lower()
+
 # Per-request counter. The question "how many model calls did that search
 # cost me?" was unanswerable from outside, and it is the first question anyone
 # asks about a tool that spends a model on every call. A contextvar keeps
@@ -54,6 +59,44 @@ _COUNTS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
 def begin() -> None:
     """Start a fresh count for the current request context."""
     _COUNTS.set({})
+
+
+def set_use_model(on: bool) -> None:
+    """Allow or forbid model calls for the current request context.
+
+    Default is OFF: a tool that returns real data is worth more to a caller than
+    a model's paraphrase of it, and it costs nothing. Callers opt in per call.
+    """
+    try:
+        import distill
+        distill.set_use_model(on)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def use_model() -> bool:
+    try:
+        import distill
+        return distill.use_model()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def set_prefer(name: str) -> None:
+    """Pin this request to one gateway or lane: local, proxy, groq (or "")."""
+    try:
+        import distill
+        distill.set_prefer(name)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def prefer_lane() -> str:
+    try:
+        import distill
+        return distill.prefer()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def counts() -> dict[str, int]:
@@ -87,6 +130,40 @@ def local_endpoint() -> dict:
         return {}
 
 
+def proxy_endpoint() -> dict:
+    """The same Beam model behind the local opencode proxy, or {} when off.
+
+    Same model, different gateway: the cmdcode2api gateway has a daily quota and
+    answers 429 once it is spent, the proxy does not. Configuration lives in
+    distill (DISTILL_PROXY / DISTILL_PROXY_BASE_URL / _MODEL / _API_KEY).
+    """
+    try:
+        import distill
+        ep = distill.proxy_endpoint()
+        if not ep:
+            return {}
+        return {**ep, "rotate": False}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _cooled(ep: dict) -> bool:
+    try:
+        import distill
+        return distill.cooled_down(ep)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _retire(ep: dict) -> None:
+    """Retire an endpoint that answered 429 (best effort)."""
+    try:
+        import distill
+        distill.mark_rate_limited(ep)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def endpoints() -> list[dict]:
     """Candidate endpoints, best first.
 
@@ -96,10 +173,16 @@ def endpoints() -> list[dict]:
 
     WEBSEARCH_SYNTH_PROVIDER: local (default) | groq | auto
     WEBSEARCH_MODEL_FALLBACK: on (default) | off
-      off - only the preferred endpoint is tried. "Use the in-tool model" then
-      means exactly that: a failing local endpoint reports an error instead of
-      silently spending a keyed cloud lane. Set this when the model choice is a
-      requirement (cost, privacy, compliance), not a preference.
+      off - never fall through to the keyed cloud lane. "Use the in-tool model"
+      then means exactly that: a failing in-tool endpoint reports an error
+      instead of silently spending a keyed lane. Set this when the model choice
+      is a requirement (cost, privacy, compliance), not a preference.
+    DISTILL_ORDER: comma-separated preference, e.g. "proxy,local,groq".
+
+    Beam is reachable through two local gateways (cmdcode2api and the opencode
+    proxy). They are the same model, so both count as the in-tool lane; a spent
+    daily quota on one must not stop summarisation. An endpoint that just
+    answered 429 is moved to the back, and dropped when another is still fresh.
     """
     prefer = (os.environ.get("WEBSEARCH_SYNTH_PROVIDER") or "local").strip().lower()
     keys = groq_keys()
@@ -108,11 +191,33 @@ def endpoints() -> list[dict]:
              "api_key": "", "rotate": True}
             if keys else None)
     local = local_endpoint() or None
-    order = [groq, local] if prefer == "groq" else [local, groq]
-    eps = [e for e in order if e]
+    proxy = proxy_endpoint() or None
+    chain = {"local": local, "proxy": proxy, "groq": groq}
+    # A per-call pin (the `model` argument) is a requirement: that lane only,
+    # and its error if it has no keys or fails, rather than a silent substitute.
+    pinned = prefer_lane()
+    if pinned in chain and chain[pinned]:
+        return [chain[pinned]]
+    default_order = ["local", "proxy", "groq"]
+    if prefer == "groq":
+        default_order = ["groq", "local", "proxy"]
+    elif prefer == "proxy":
+        default_order = ["proxy", "local", "groq"]
+    wanted = [n.strip().lower() for n in
+              (os.environ.get("DISTILL_ORDER") or "").split(",") if n.strip()]
+    names = list(wanted or default_order)
+    # A preference reorders the chain, it does not truncate it: anything not
+    # named keeps its usual place at the end.
+    names += [n for n in ("local", "proxy", "groq") if n not in names]
+    eps = [chain[n] for n in names if chain.get(n)]
+    fresh = [e for e in eps if not _cooled(e)]
+    if fresh:
+        eps = fresh + [e for e in eps if _cooled(e)]
     strict = (os.environ.get("WEBSEARCH_MODEL_FALLBACK") or "on").strip().lower()
     if strict in ("off", "none", "0", "false", "no"):
-        return eps[:1]
+        if prefer == "groq":
+            return eps[:1]
+        return [e for e in eps if e.get("provider") != "groq"]
     return eps
 
 
@@ -123,7 +228,7 @@ def _next_groq_key(offset: int = 0) -> str:
     return keys[offset % len(keys)]
 
 
-async def chat(messages: list[dict], *, max_tokens: int = 1200,
+async def chat(messages: list[dict], *, max_tokens: int | None = None,
                attempts: int = 2, timeout: float = 30,
                kind: str = "chat", temperature: float = 0.0,
                model: str | None = None,
@@ -133,6 +238,8 @@ async def chat(messages: list[dict], *, max_tokens: int = 1200,
     Returns (text, finish_reason, error, attempts). `kind` labels the call in the
     counter so a response can say where the tokens went.
     """
+    if not use_model():
+        return "", "", "model disabled for this call; pass use_model=true", 0
     eps = endpoints()
     if not eps:
         return "", "", "no model endpoint configured", 0
@@ -152,30 +259,47 @@ async def chat(messages: list[dict], *, max_tokens: int = 1200,
             return text, finish, "", total
         last = err
         logger.warning("llm: %s call failed on %s: %s", kind, ep.get("provider"), err)
+        if "HTTP 429" in err:
+            # A spent quota stays spent: do not pay this round trip again.
+            _retire(ep)
     return "", "", last, total
 
 
-async def _one(ep: dict, messages: list[dict], *, max_tokens: int,
+async def _one(ep: dict, messages: list[dict], *, max_tokens: int | None,
                attempts: int, timeout: float,
                temperature: float, client: Any = None) -> tuple[str, str, str, int]:
     url = ep["base_url"].rstrip("/") + "/chat/completions"
     last = "no attempt made"
-    # A reasoning model spends tokens on reasoning_content BEFORE emitting
-    # content, so a budget that is right for the answer alone comes back as a 200
-    # with empty content. Escalate instead of reporting a mystery failure.
-    budget = max(max_tokens, MIN_USEFUL_TOKENS)
-    ceiling = min(max(budget * 4, 4096), 32_000)
+    # No budget means the endpoint decides: a hand-picked cap was a guess about
+    # how much reasoning the model needs, and a wrong guess bought a truncated
+    # answer. A caller that does pass one gets a reasoning-surviving floor
+    # (MIN_USEFUL_TOKENS) and escalation on empty content.
+    budget = max(int(max_tokens), MIN_USEFUL_TOKENS) if max_tokens else None
+    ceiling = min(max((budget or 0) * 4, 4096), 32_000)
+    effort = REASONING_EFFORT
+    send_effort = bool(effort)
+    # The proxy advertises its own tools regardless of what we send, and a model
+    # holding `bash` answers a question with a tool call instead of prose. Ban
+    # it in the payload; a gateway that rejects the field gets one retry without.
+    send_no_tools = True
     for attempt in range(1, max(1, attempts) + 1):
         key = (_next_groq_key(attempt - 1) if ep.get("rotate")
                else ep.get("api_key", ""))
+        body = {"model": ep["model"], "messages": messages,
+                "temperature": temperature}
+        if budget:
+            body["max_tokens"] = budget
+        if send_effort:
+            body["reasoning_effort"] = effort
+        if send_no_tools:
+            body["tool_choice"] = "none"
         try:
             if client is not None:
                 resp = await client.post(
                     url,
                     headers={"Authorization": f"Bearer {key}",
                              "Content-Type": "application/json"},
-                    json={"model": ep["model"], "messages": messages,
-                          "temperature": temperature, "max_tokens": budget},
+                    json=body,
                     timeout=timeout)
             else:
                 async with httpx.AsyncClient(timeout=timeout) as c:
@@ -183,14 +307,33 @@ async def _one(ep: dict, messages: list[dict], *, max_tokens: int,
                         url,
                         headers={"Authorization": f"Bearer {key}",
                                  "Content-Type": "application/json"},
-                        json={"model": ep["model"], "messages": messages,
-                              "temperature": temperature, "max_tokens": budget})
+                        json=body)
         except Exception as e:  # noqa: BLE001
-            last = f"{type(e).__name__}: {e}"
+            # httpx.ReadTimeout carries no message, which used to render as
+            # "ReadTimeout: " - a dangling colon that teaches the caller nothing.
+            detail = str(e).strip()
+            last = (f"{type(e).__name__}: {detail}" if detail
+                    else f"{type(e).__name__} (no message)")
+            continue
+        if resp.status_code == 400 and send_effort and "reasoning" in resp.text.lower():
+            send_effort = False
+            last = f"HTTP 400 on reasoning_effort: {resp.text[:120]}"
+            logger.info("llm: %s rejected reasoning_effort, retrying without it",
+                        ep.get("provider"))
+            continue
+        if resp.status_code == 400 and send_no_tools:
+            send_no_tools = False
+            last = f"HTTP 400 on tool_choice: {resp.text[:120]}"
+            logger.info("llm: %s rejected tool_choice, retrying without it",
+                        ep.get("provider"))
             continue
         if resp.status_code != 200:
             last = f"HTTP {resp.status_code}: {resp.text[:200]}"
             if resp.status_code in (429, 500, 502, 503, 504):
+                # 429 is usually a spent quota: one retry here, then chat()
+                # hands the request to the next gateway.
+                if resp.status_code == 429 and attempt >= 2:
+                    break
                 continue
             return "", "", last, attempt
         try:
@@ -203,10 +346,11 @@ async def _one(ep: dict, messages: list[dict], *, max_tokens: int,
             continue
         if text:
             return text, finish, "", attempt
-        last = (f"empty content (finish_reason={finish}, max_tokens={budget})"
-                if finish else f"empty content (max_tokens={budget})")
-        if budget < ceiling:
+        last = (f"empty content (finish_reason={finish}, max_tokens="
+                f"{budget or 'unset'})")
+        if budget and budget < ceiling:
             budget = min(budget * 2, ceiling)
+            body["max_tokens"] = budget
             logger.info("llm: empty content, raising max_tokens to %d", budget)
     return "", "", last, max(1, attempts)
 
@@ -230,9 +374,16 @@ def _selfcheck() -> None:
     # ── endpoint ordering ────────────────────────────────────────
     saved = {k: os.environ.get(k) for k in
              ("WEBSEARCH_SYNTH_PROVIDER", "GROQ_API_KEYS", "DISTILL_API_KEY",
-              "WEBSEARCH_MODEL_FALLBACK")}
+              "WEBSEARCH_MODEL_FALLBACK", "DISTILL_PROXY", "DISTILL_ORDER",
+              "DISTILL_RATE_LIMIT_COOLDOWN")}
+    # The selfcheck drives the model path on purpose, so it opts in the same way
+    # a caller does; the gate itself is proven below.
+    set_use_model(True)
     orig_local = globals()["local_endpoint"]
+    orig_proxy = globals()["proxy_endpoint"]
     try:
+        # Keep the proxy out of the way until its own checks below.
+        globals()["proxy_endpoint"] = lambda: {}
         globals()["local_endpoint"] = lambda: {"provider": "local", "base_url": "x",
                                                "model": "m", "api_key": "k",
                                                "rotate": False}
@@ -264,6 +415,34 @@ def _selfcheck() -> None:
         check("fallback returns when re-enabled",
               len(endpoints()) == 2)
         os.environ.pop("WEBSEARCH_MODEL_FALLBACK", None)
+
+        # The proxy is a second gateway for the same model, so it belongs to the
+        # in-tool lane: strict mode must keep it (it spends no keyed quota).
+        globals()["proxy_endpoint"] = orig_proxy
+        os.environ.pop("WEBSEARCH_SYNTH_PROVIDER", None)
+        os.environ.pop("DISTILL_ORDER", None)
+        os.environ.pop("DISTILL_PROXY", None)
+        check("proxy sits behind local by default",
+              [e["provider"] for e in endpoints()] == ["local", "proxy", "groq"])
+        os.environ["WEBSEARCH_MODEL_FALLBACK"] = "off"
+        check("strict mode keeps both in-tool gateways",
+              [e["provider"] for e in endpoints()] == ["local", "proxy"])
+        os.environ.pop("WEBSEARCH_MODEL_FALLBACK", None)
+        os.environ["DISTILL_ORDER"] = "proxy,local"
+        check("DISTILL_ORDER overrides preference",
+              [e["provider"] for e in endpoints()] == ["proxy", "local", "groq"])
+        os.environ["DISTILL_PROXY"] = "off"
+        check("DISTILL_PROXY=off removes it",
+              "proxy" not in [e["provider"] for e in endpoints()])
+        os.environ.pop("DISTILL_PROXY", None)
+        os.environ.pop("DISTILL_ORDER", None)
+        proxy_ep = [e for e in endpoints() if e["provider"] == "proxy"][0]
+        _retire(proxy_ep)
+        check("a 429'd endpoint moves to the back",
+              [e["provider"] for e in endpoints()] == ["local", "groq", "proxy"])
+        import distill as _distill
+        _distill.reset_cooldowns()
+        globals()["proxy_endpoint"] = lambda: {}
 
         os.environ.pop("GROQ_API_KEYS", None)
         globals()["local_endpoint"] = lambda: {}
@@ -389,8 +568,25 @@ def _selfcheck() -> None:
                                            "model": "m", "api_key": "k", "rotate": False}]
         c3 = asyncio.run(counted_ep())
         check("successful chat bumps its kind", c3 == {"synthesis": 1})
+
+        # ── the model is off unless the call asked for it ────────
+        globals().pop("endpoints", None)
+        set_use_model(False)
+        text, _f, err, _a = asyncio.run(
+            chat([{"role": "user", "content": "x"}]))
+        check("model is off by default",
+              text == "" and "model disabled" in err and "use_model" in err)
+        set_use_model(True)
+        check("use_model turns it back on", use_model() is True)
     finally:
+        set_use_model(False)
         globals()["local_endpoint"] = orig_local
+        globals()["proxy_endpoint"] = orig_proxy
+        try:
+            import distill as _d
+            _d.reset_cooldowns()
+        except Exception:  # noqa: BLE001
+            pass
         globals().pop("endpoints", None)
         for k, v in saved.items():
             if v is None:

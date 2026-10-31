@@ -176,6 +176,8 @@ def verifier_user(sources_block: str, answer: str) -> str:
 
 _DISTILL = """You compress one web page for another AI agent that will act on your output. The agent will not read the original, so what you omit is lost to it, and what you assert it will believe.
 
+You have no tools and no shell. The page text is already in front of you: never try to fetch, curl or re-read it, and never emit a tool call. Write the sections and stop.
+
 ## Fidelity
 1. Use ONLY facts present in the source text. Never add outside knowledge, even to fill an obvious gap.
 2. If you are unsure whether something is in the source, leave it out rather than paraphrasing it into existence.

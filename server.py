@@ -199,7 +199,9 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                 "end_date": {"type": "string", "description": "Tavily date filter end (YYYY-MM-DD)"},
                 "include_domains": {"type": "array", "items": {"type": "string"}, "description": "Tavily domain include filter"},
                 "exclude_domains": {"type": "array", "items": {"type": "string"}, "description": "Tavily domain exclude filter"},
-                "synthesize": {"type": "boolean", "default": True, "description": "Synthesize a cited answer from the top results. The answer is deliberately short and says so when it is truncated."},
+                "use_model": {"type": "boolean", "default": False, "description": "Allow model calls for this request (query rewriting, rerank helpers, synthesis, follow-up). OFF by default: you get real results and pay no model tokens, which is what a swarm wants. Turn it on when you want a cited answer instead of material to read."},
+                "model": {"type": "string", "enum": ["", "local", "proxy", "groq"], "description": "Which lane serves this call: local = cmdcode2api gateway (reflection/beam:free, daily quota), proxy = local opencode proxy (beam-free, no quota), groq = keyed fallback. Omit to use the configured order and fall through on failure; naming one pins it, so its error surfaces instead of being silently substituted."},
+                "synthesize": {"type": "boolean", "default": True, "description": "Synthesize a cited answer from the top results. Only happens when use_model=true; with the model off the search returns the sources and says synthesis was skipped. The answer is deliberately short and says so when it is truncated."},
                 "synthesize_length": {"type": "string", "enum": ["short","long"], "default": "short", "description": "short = at most 6 sentences; long = up to 12, for genuinely multi-part questions"},
                 "follow_up": {"type": "boolean", "default": True, "description": "Allow ONE extra retrieval round when the first answer admits a gap (rests on a single source, a claim could not be tied to its source, or it says part of the question is unanswered). Adds 20-40s when it triggers; the response records it in follow_ups and marks synthesis.round=2."},
                 "domain": {"type": "string", "description": "AnySearch vertical: finance, code, academic, health, travel, legal, security. Guessed from query via simple heuristic — may be wrong, omit for general search."},
@@ -239,7 +241,9 @@ async def handle_list_tools(ctx, params) -> ListToolsResult:
                     "mineru": {"type": "boolean", "default": False, "description": "Opt-in MinerU-HTML SLM re-extraction for low-quality pages (heavy, CPU, seconds per page)"},
                     "include_metadata": {"type": "boolean", "default": False, "description": "Opt-in: include the full machine-readable metadata (RDFa/JSON-LD/microdata/OpenGraph) in metadata. Off by default because it can be ~10x the article text; when off, metadata keeps a small useful subset (title + OG basics) and metadata_omitted reports the withheld keys and approximate size."},
                     "cookies": {"type": "array", "items": {"type": "object"}, "description": "Optional cookies injected into the request: [{name, value, domain?, path?}] (e.g. session cookie for a page behind login)"},
-                    "distill": {"type": "boolean", "default": False, "description": "Opt-in: compress the page with a cheap local model before returning it, to save your context. Never on by default and never silent - the result carries distill.distilled, raw_chars and how_to_get_raw, and the untouched text is one call away with distill=false. Skipped automatically below the size threshold, where it would cost more than it saves."},
+                    "use_model": {"type": "boolean", "default": False, "description": "Allow model calls for this request. OFF by default: fetch returns the page text it actually extracted. Needed for distill=true."},
+                    "model": {"type": "string", "enum": ["", "local", "proxy", "groq"], "description": "Which lane distils this page: local, proxy or groq. Omit for the configured order with fall-through."},
+                    "distill": {"type": "boolean", "default": False, "description": "Compress the page with the in-tool model before returning it, to save your context. Requires use_model=true (passing distill=true also enables it). Never silent - the result carries distill.distilled, raw_chars, the serving provider and how_to_get_raw, and the untouched text is one call away with distill=false. Skipped automatically below the size threshold, where it would cost more than it saves."},
                     "distill_question": {"type": "string", "description": "What you are actually looking for. Gives the distiller something to focus on, which reduces the chance it drops the detail you needed."},
                     },
                 "required": ["url"]}),
@@ -1169,6 +1173,22 @@ async def _dispatch_tool(ctx, params) -> CallToolResult:
     if not isinstance(arguments, dict):
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(_err_annotate({"error": "arguments must be a dict"})))], is_error=True)
 
+    # ── per-call model policy ────────────────────────────────────────
+    # The model is OFF unless this call asked for it. A tool that returns the
+    # pages it actually fetched is cheaper and more trustworthy than one that
+    # returns a paraphrase, and a swarm pays for every token it reads. Tools
+    # whose entire purpose is a model call turn it on for themselves below.
+    _use_model = bool(arguments.get("use_model", False))
+    # `distill: true` predates `use_model` and still means "spend a model call".
+    if arguments.get("distill") is True:
+        _use_model = True
+    if name == "extract" and str(arguments.get("strategy", "")).strip().lower() == "llm":
+        _use_model = True
+    _distill.set_use_model(_use_model)
+    # `model` names the lane for THIS call: local, proxy or groq. Anything else
+    # (empty, "auto") keeps the env-configured order.
+    _distill.set_prefer(str(arguments.get("model") or ""))
+
     def safe_int(v, default=0):
         try:
             return int(v)
@@ -1375,7 +1395,12 @@ async def _dispatch_tool(ctx, params) -> CallToolResult:
             _ops.hold(r)
             # Skip Groq synthesis when GAI already returned a full answer
             skip_synthesis = google_ai_only and r.get("ai_answer")
-            if r.get("success") and bool(arguments.get("synthesize", True)) \
+            if not _use_model:
+                # Say it once, where the answer would have been, instead of
+                # leaving a hole the caller has to interpret.
+                r["synthesis_skipped"] = ("model disabled for this call; pass "
+                                          "use_model=true for a cited answer")
+            elif r.get("success") and bool(arguments.get("synthesize", True)) \
                     and (r.get("results") or r.get("fetched_content")) \
                     and not skip_synthesis:
                 r["synthesis"] = await _synthesize(
