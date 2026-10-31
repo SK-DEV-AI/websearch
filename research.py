@@ -367,7 +367,11 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     engines_used: list[str] = []
     per_engine: dict[str, list[dict]] = {}
     _seen_urls: set[str] = set()
-    engine_totals: dict[str, int] = {}
+    # What each engine says it has IN TOTAL (arxiv: 750k hits) is a different
+    # number from what it contributed here. Mixing them made the per-engine
+    # counts look like they disagreed with `total`, so the reported figure gets
+    # its own key and `engine_totals` counts only delivered results.
+    engine_reported_totals: dict[str, int] = {}
     ai_answer = ""
     tavily_answer = ""
     follow_up = ""
@@ -606,7 +610,7 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
                 eng_name = "duckduckgo" if key.startswith("ddg") else (
                     "google-news-rss" if key == "rss" else (
                         "wikipedia" if key == "wiki" else key))
-                engine_totals[eng_name] = ta
+                engine_reported_totals[eng_name] = int(ta)
             for r in results_list:
                 if isinstance(r, dict) and "error" not in r and r.get("url"):
                     # Post-merge domain scoping (landscape 🥉): tavily filters
@@ -811,7 +815,8 @@ async def search_multi(query: str, count: int = 10, cdp_url: str | None = None,
     out: dict = {"success": True, "engines_used": engines_used,
                  "engine_blocked": engine_blocked,
                  "engine_status": engine_status,
-                 "engine_totals": engine_totals,
+                 "engine_totals": {k: len(v) for k, v in per_engine.items() if v},
+                 "engine_reported_totals": engine_reported_totals,
                  "ai_answer": ai_answer, "tavily_answer": tavily_answer,
                  "follow_up": follow_up,
                  "related_queries": related,

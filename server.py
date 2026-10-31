@@ -762,9 +762,20 @@ def _slim_search_payload(r: dict, arguments: dict) -> None:
                 x["snippet"] = snip[:cap]
                 x["snippet_truncated"] = True
         if len(content) > cap:
+            # The shipped text ends at offset+cap, so next_offset must point
+            # there. A stale value from the fetch layer (0, or a number past
+            # the shipped slice) makes a caller either loop forever or skip
+            # the middle of the page.
+            _off = x.get("offset")
+            _off = int(_off) if isinstance(_off, (int, float)) else 0
             x["content"] = content[:cap]
             x["is_truncated"] = True
             x["content_truncated_at_chars"] = cap
+            _next = _off + cap
+            _total = x.get("total_extracted_chars")
+            if isinstance(_total, int) and _total > 0:
+                _next = min(_next, _total)
+            x["next_offset"] = _next
         if not include_metadata:
             x.pop("metadata", None)
 
@@ -1937,6 +1948,21 @@ def _limits_selfcheck() -> None:
     checks.append(("slim drops page metadata by default", "metadata" not in _b0))
     checks.append(("slim keeps a snippet when there is no content",
                    _b1.get("snippet") == "q" * 2500))
+    # Truncation must stay paginate-able: the shipped slice ends at
+    # offset+cap, so next_offset points there instead of keeping a stale
+    # value from the fetch layer (observed next_offset 0 and 32452 live).
+    _offchk = {"fetched_content": [
+        {"url": "https://c.example/3", "content": "z" * 9000,
+         "offset": 0, "next_offset": 0, "total_extracted_chars": 14247},
+        {"url": "https://d.example/4", "content": "z" * 9000,
+         "offset": 2000, "next_offset": 32452, "total_extracted_chars": 14247},
+    ]}
+    _slim_search_payload(_offchk, {})
+    _o0, _o1 = _offchk["fetched_content"]
+    checks.append(("slim points next_offset at the end of the shipped slice",
+                   _o0["next_offset"] == 2500 and _o1["next_offset"] == 4500))
+    checks.append(("slim never points next_offset past the page end",
+                   _o1["next_offset"] <= _o1["total_extracted_chars"]))
     checks.append(("slim never touches the source url or title",
                    _b0["url"] == "https://a.example/1" and _b0["title"] == "A"))
     _slim_search_payload(_sl_copy, {"accept_large_output": True})
